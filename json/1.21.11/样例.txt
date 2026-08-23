@@ -1,0 +1,641 @@
+文件名: attributes.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "name": "armor",
+    "resource": "minecraft:armor",
+    "min": 0.0,
+    "max": 30.0,
+    "default": 0.0
+  },
+  {
+    "name": "armorToughness",
+    "resource": "minecraft:armor_toughness",
+    "min": 0.0,
+    "max": 20.0,
+    "default": 0.0
+  },
+  {
+    "name": "attackDamage",
+    "resource": "minecraft:attack_damage",
+    "min": 0.0,
+    "max": 2048.0,
+    "default": 2.0
+  },
+  {
+    "name": "attackKnockback",
+    "resource": "minecraft:attack_knockback",
+    "min": 0.0,
+    "max": 5.0,
+    "default": 0.0
+  },
+  {
+----------------------------------------
+
+文件名: biomes.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "id": 0,
+    "name": "badlands",
+    "category": "mesa",
+    "temperature": 2.0,
+    "has_precipitation": false,
+    "dimension": "overworld",
+    "displayName": "Badlands",
+    "color": 7254527
+  },
+  {
+    "id": 1,
+    "name": "bamboo_jungle",
+    "category": "jungle",
+    "temperature": 0.95,
+    "has_precipitation": true,
+    "dimension": "overworld",
+    "displayName": "Bamboo Jungle",
+    "color": 7842047
+  },
+  {
+    "id": 2,
+    "name": "basalt_deltas",
+    "category": "nether",
+    "temperature": 2.0,
+    "has_precipitation": false,
+    "dimension": "nether",
+    "displayName": "Basalt Deltas",
+    "color": 0
+----------------------------------------
+
+文件名: blockCollisionShapes.json
+前30行内容:
+----------------------------------------
+{
+  "blocks": {
+    "air": 0,
+    "stone": 1,
+    "granite": 1,
+    "polished_granite": 1,
+    "diorite": 1,
+    "polished_diorite": 1,
+    "andesite": 1,
+    "polished_andesite": 1,
+    "grass_block": 1,
+    "dirt": 1,
+    "coarse_dirt": 1,
+    "podzol": 1,
+    "cobblestone": 1,
+    "oak_planks": 1,
+    "spruce_planks": 1,
+    "birch_planks": 1,
+    "jungle_planks": 1,
+    "acacia_planks": 1,
+    "cherry_planks": 1,
+    "dark_oak_planks": 1,
+    "pale_oak_wood": 1,
+    "pale_oak_planks": 1,
+    "mangrove_planks": 1,
+    "bamboo_planks": 1,
+    "bamboo_mosaic": 1,
+    "oak_sapling": 0,
+    "spruce_sapling": 0,
+    "birch_sapling": 0,
+----------------------------------------
+
+文件名: blocks.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "id": 0,
+    "name": "air",
+    "displayName": "Air",
+    "hardness": 0.0,
+    "resistance": 0.0,
+    "stackSize": 64,
+    "diggable": false,
+    "material": "default",
+    "transparent": true,
+    "emitLight": 0,
+    "filterLight": 0,
+    "defaultState": 0,
+    "minStateId": 0,
+    "maxStateId": 0,
+    "states": [],
+    "drops": [],
+    "boundingBox": "empty"
+  },
+  {
+    "id": 1,
+    "name": "stone",
+    "displayName": "Stone",
+    "hardness": 1.5,
+    "resistance": 6.0,
+    "stackSize": 64,
+    "diggable": true,
+    "material": "mineable/pickaxe",
+    "transparent": false,
+----------------------------------------
+
+文件名: effects.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "id": 0,
+    "name": "Speed",
+    "displayName": "Speed",
+    "type": "good"
+  },
+  {
+    "id": 1,
+    "name": "Slowness",
+    "displayName": "Slowness",
+    "type": "bad"
+  },
+  {
+    "id": 2,
+    "name": "Haste",
+    "displayName": "Haste",
+    "type": "good"
+  },
+  {
+    "id": 3,
+    "name": "MiningFatigue",
+    "displayName": "Mining Fatigue",
+    "type": "bad"
+  },
+  {
+    "id": 4,
+    "name": "Strength",
+    "displayName": "Strength",
+    "type": "good"
+----------------------------------------
+
+文件名: enchantments.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "id": 0,
+    "name": "aqua_affinity",
+    "displayName": "Aqua Affinity",
+    "maxLevel": 1,
+    "minCost": {
+      "a": 0,
+      "b": 1
+    },
+    "maxCost": {
+      "a": 0,
+      "b": 1
+    },
+    "treasureOnly": false,
+    "curse": false,
+    "exclude": [],
+    "category": "head_armor",
+    "weight": 2,
+    "tradeable": true,
+    "discoverable": true
+  },
+  {
+    "id": 1,
+    "name": "bane_of_arthropods",
+    "displayName": "Bane of Arthropods",
+    "maxLevel": 5,
+    "minCost": {
+      "a": 4,
+      "b": 1
+----------------------------------------
+
+文件名: entities.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "id": 0,
+    "internalId": 0,
+    "name": "acacia_boat",
+    "displayName": "Acacia Boat",
+    "width": 1.375,
+    "height": 0.5625,
+    "type": "other",
+    "category": "Vehicles",
+    "metadataKeys": [
+      "shared_flags",
+      "air_supply",
+      "custom_name",
+      "custom_name_visible",
+      "silent",
+      "no_gravity",
+      "pose",
+      "ticks_frozen",
+      "hurt",
+      "hurtdir",
+      "damage",
+      "paddle_left",
+      "paddle_right",
+      "bubble_time"
+    ]
+  },
+  {
+    "id": 1,
+    "internalId": 1,
+----------------------------------------
+
+文件名: foods.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "id": 893,
+    "name": "apple",
+    "stackSize": 64,
+    "displayName": "Apple",
+    "foodPoints": 4.0,
+    "saturation": 19.2,
+    "effectiveQuality": 23.2,
+    "saturationRatio": 4.8
+  },
+  {
+    "id": 947,
+    "name": "mushroom_stew",
+    "stackSize": 1,
+    "displayName": "Mushroom Stew",
+    "foodPoints": 6.0,
+    "saturation": 86.4,
+    "effectiveQuality": 92.4,
+    "saturationRatio": 14.400001
+  },
+  {
+    "id": 953,
+    "name": "bread",
+    "stackSize": 64,
+    "displayName": "Bread",
+    "foodPoints": 5.0,
+    "saturation": 60.0,
+    "effectiveQuality": 65.0,
+    "saturationRatio": 12.0
+----------------------------------------
+
+文件名: instruments.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "id": 0,
+    "name": "harp"
+  },
+  {
+    "id": 1,
+    "name": "basedrum"
+  },
+  {
+    "id": 2,
+    "name": "snare"
+  },
+  {
+    "id": 3,
+    "name": "hat"
+  },
+  {
+    "id": 4,
+    "name": "bass"
+  },
+  {
+    "id": 5,
+    "name": "flute"
+  },
+  {
+    "id": 6,
+    "name": "bell"
+  },
+  {
+----------------------------------------
+
+文件名: items.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "id": 0,
+    "name": "air",
+    "displayName": "Air",
+    "stackSize": 64
+  },
+  {
+    "id": 1,
+    "name": "stone",
+    "displayName": "Stone",
+    "stackSize": 64
+  },
+  {
+    "id": 2,
+    "name": "granite",
+    "displayName": "Granite",
+    "stackSize": 64
+  },
+  {
+    "id": 3,
+    "name": "polished_granite",
+    "displayName": "Polished Granite",
+    "stackSize": 64
+  },
+  {
+    "id": 4,
+    "name": "diorite",
+    "displayName": "Diorite",
+    "stackSize": 64
+----------------------------------------
+
+文件名: language.json
+前30行内容:
+----------------------------------------
+{
+  "accessibility.onboarding.accessibility.button": "Accessibility Settings...",
+  "accessibility.onboarding.screen.narrator": "Press enter to enable the narrator",
+  "accessibility.onboarding.screen.title": "Welcome to Minecraft!\n\nWould you like to enable the Narrator or visit the Accessibility Settings?",
+  "addServer.add": "Done",
+  "addServer.enterIp": "Server Address",
+  "addServer.enterName": "Server Name",
+  "addServer.resourcePack": "Server Resource Packs",
+  "addServer.resourcePack.disabled": "Disabled",
+  "addServer.resourcePack.enabled": "Enabled",
+  "addServer.resourcePack.prompt": "Prompt",
+  "addServer.title": "Edit Server Info",
+  "advancement.advancementNotFound": "Unknown advancement: %s",
+  "advancements.adventure.adventuring_time.description": "Discover every biome",
+  "advancements.adventure.adventuring_time.title": "Adventuring Time",
+  "advancements.adventure.arbalistic.description": "Kill five unique mobs with one crossbow shot",
+  "advancements.adventure.arbalistic.title": "Arbalistic",
+  "advancements.adventure.avoid_vibration.description": "Sneak near a Sculk Sensor or Warden to prevent it from detecting you",
+  "advancements.adventure.avoid_vibration.title": "Sneak 100",
+  "advancements.adventure.blowback.description": "Kill a Breeze with a deflected Breeze-shot Wind Charge",
+  "advancements.adventure.blowback.title": "Blowback",
+  "advancements.adventure.brush_armadillo.description": "Get Armadillo Scutes from an Armadillo using a Brush",
+  "advancements.adventure.brush_armadillo.title": "Isn't It Scute?",
+  "advancements.adventure.bullseye.description": "Hit the bullseye of a Target block from at least 30 meters away",
+  "advancements.adventure.bullseye.title": "Bullseye",
+  "advancements.adventure.craft_decorated_pot_using_only_sherds.description": "Make a Decorated Pot out of 4 Pottery Sherds",
+  "advancements.adventure.craft_decorated_pot_using_only_sherds.title": "Careful Restoration",
+  "advancements.adventure.crafters_crafting_crafters.description": "Be near a Crafter when it crafts a Crafter",
+  "advancements.adventure.crafters_crafting_crafters.title": "Crafters Crafting Crafters",
+  "advancements.adventure.fall_from_world_height.description": "Free fall from the top of the world (build limit) to the bottom of the world and survive",
+----------------------------------------
+
+文件名: loginPacket.json
+前30行内容:
+----------------------------------------
+{
+  "entityId": 1,
+  "isHardcore": false,
+  "worldNames": [
+    "minecraft:overworld",
+    "minecraft:the_nether",
+    "minecraft:the_end"
+  ],
+  "maxPlayers": 120,
+  "viewDistance": 10,
+  "simulationDistance": 10,
+  "reducedDebugInfo": false,
+  "enableRespawnScreen": true,
+  "doLimitedCrafting": false,
+  "worldState": {
+    "dimension": 0,
+    "name": "minecraft:overworld",
+    "hashedSeed": [
+      250352255,
+      -614684143
+    ],
+    "gamemode": "survival",
+    "previousGamemode": 255,
+    "isDebug": false,
+    "isFlat": true,
+    "portalCooldown": 0,
+    "seaLevel": -63
+  },
+  "enforcesSecureChat": false,
+  "dimensionCodec": {
+----------------------------------------
+
+文件名: materials.json
+前30行内容:
+----------------------------------------
+{
+  "default": {},
+  "leaves": {
+    "1105": 1.0,
+    "911": 1.5,
+    "916": 1.5,
+    "921": 1.5,
+    "926": 1.5,
+    "931": 1.5,
+    "936": 1.5,
+    "941": 1.5
+  },
+  "coweb": {
+    "1105": 15.0,
+    "911": 15.0,
+    "916": 15.0,
+    "921": 15.0,
+    "926": 15.0,
+    "931": 15.0,
+    "936": 15.0,
+    "941": 15.0
+  },
+  "plant": {
+    "911": 1.5,
+    "916": 1.5,
+    "921": 1.5,
+    "926": 1.5,
+    "931": 1.5,
+    "936": 1.5,
+    "941": 1.5
+----------------------------------------
+
+文件名: particles.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "id": 0,
+    "name": "angry_villager"
+  },
+  {
+    "id": 1,
+    "name": "block"
+  },
+  {
+    "id": 2,
+    "name": "block_marker"
+  },
+  {
+    "id": 3,
+    "name": "bubble"
+  },
+  {
+    "id": 4,
+    "name": "cloud"
+  },
+  {
+    "id": 5,
+    "name": "copper_fire_flame"
+  },
+  {
+    "id": 6,
+    "name": "crit"
+  },
+  {
+----------------------------------------
+
+文件名: protocol.json
+前30行内容:
+----------------------------------------
+{
+  "types": {
+    "varint": "native",
+    "varlong": "native",
+    "optvarint": "varint",
+    "pstring": "native",
+    "buffer": "native",
+    "u8": "native",
+    "u16": "native",
+    "u32": "native",
+    "u64": "native",
+    "i8": "native",
+    "i16": "native",
+    "i32": "native",
+    "i64": "native",
+    "bool": "native",
+    "f32": "native",
+    "f64": "native",
+    "UUID": "native",
+    "option": "native",
+    "entityMetadataLoop": "native",
+    "topBitSetTerminatedArray": "native",
+    "bitfield": "native",
+    "bitflags": "native",
+    "container": "native",
+    "switch": "native",
+    "void": "native",
+    "array": "native",
+    "restBuffer": "native",
+    "anonymousNbt": "native",
+----------------------------------------
+
+文件名: recipes.json
+前30行内容:
+----------------------------------------
+{
+  "871": [
+    {
+      "inShape": [
+        [
+          40,
+          null,
+          40
+        ],
+        [
+          40,
+          40,
+          40
+        ]
+      ],
+      "result": {
+        "id": 871,
+        "count": 1
+      }
+    }
+  ],
+  "784": [
+    {
+      "inShape": [
+        [
+          40,
+          40
+        ],
+        [
+          40,
+----------------------------------------
+
+文件名: sounds.json
+前30行内容:
+----------------------------------------
+[
+  {
+    "id": 1,
+    "name": "entity.allay.ambient_with_item"
+  },
+  {
+    "id": 2,
+    "name": "entity.allay.ambient_without_item"
+  },
+  {
+    "id": 3,
+    "name": "entity.allay.death"
+  },
+  {
+    "id": 4,
+    "name": "entity.allay.hurt"
+  },
+  {
+    "id": 5,
+    "name": "entity.allay.item_given"
+  },
+  {
+    "id": 6,
+    "name": "entity.allay.item_taken"
+  },
+  {
+    "id": 7,
+    "name": "entity.allay.item_thrown"
+  },
+  {
+----------------------------------------
+
+文件名: tints.json
+前30行内容:
+----------------------------------------
+{
+  "grass": {
+    "data": [
+      {
+        "keys": [
+          "badlands",
+          "eroded_badlands",
+          "wooded_badlands"
+        ],
+        "color": -7306931
+      },
+      {
+        "keys": [
+          "bamboo_jungle",
+          "basalt_deltas",
+          "beach",
+          "birch_forest",
+          "cold_ocean",
+          "crimson_forest",
+          "deep_cold_ocean",
+          "deep_dark",
+          "deep_frozen_ocean",
+          "deep_lukewarm_ocean",
+          "deep_ocean",
+          "desert",
+          "dripstone_caves",
+          "end_barrens",
+          "end_highlands",
+          "end_midlands",
+          "flower_forest",
+----------------------------------------
+
+文件名: version.json
+前30行内容:
+----------------------------------------
+{
+  "version": 774,
+  "minecraftVersion": "1.21.11",
+  "majorVersion": "1.21",
+  "releaseType": "release"
+}
+----------------------------------------
+

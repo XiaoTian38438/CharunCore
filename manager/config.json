@@ -1,0 +1,16 @@
+{
+  "port": 25566,
+  "serverRoot": "..",
+  "javaCmd": "",
+  "autoStartServer": true,
+  "auth": {
+    "enabled": true,
+    "users": [
+      { "user": "admin",  "pass": "admin",  "role": "admin" },
+      { "user": "viewer", "pass": "viewer", "role": "viewer" }
+    ]
+  },
+  "maxFileEditSize": 5242880,
+  "maxUploadSize": 20971520,
+  "opLogSize": 500
+}

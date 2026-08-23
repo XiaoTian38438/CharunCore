@@ -1,0 +1,57 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  org.jspecify.annotations.Nullable
+ *  org.slf4j.Logger
+ */
+package net.minecraft.network.protocol;
+
+import com.mojang.logging.LogUtils;
+import net.minecraft.CrashReport;
+import net.minecraft.CrashReportCategory;
+import net.minecraft.ReportedException;
+import net.minecraft.network.PacketListener;
+import net.minecraft.network.PacketProcessor;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.server.RunningOnDifferentThreadException;
+import net.minecraft.server.level.ServerLevel;
+import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+
+public class PacketUtils {
+    private static final Logger LOGGER = LogUtils.getLogger();
+
+    public static <T extends PacketListener> void ensureRunningOnSameThread(Packet<T> packet, T t, ServerLevel serverLevel) throws RunningOnDifferentThreadException {
+        PacketUtils.ensureRunningOnSameThread(packet, t, serverLevel.getServer().packetProcessor());
+    }
+
+    public static <T extends PacketListener> void ensureRunningOnSameThread(Packet<T> packet, T t, PacketProcessor packetProcessor) throws RunningOnDifferentThreadException {
+        if (!packetProcessor.isSameThread()) {
+            packetProcessor.scheduleIfPossible(t, packet);
+            throw RunningOnDifferentThreadException.RUNNING_ON_DIFFERENT_THREAD;
+        }
+    }
+
+    public static <T extends PacketListener> ReportedException makeReportedException(Exception exception, Packet<T> packet, T t) {
+        if (exception instanceof ReportedException) {
+            ReportedException reportedException = (ReportedException)exception;
+            PacketUtils.fillCrashReport(reportedException.getReport(), t, packet);
+            return reportedException;
+        }
+        CrashReport crashReport = CrashReport.forThrowable(exception, "Main thread packet handler");
+        PacketUtils.fillCrashReport(crashReport, t, packet);
+        return new ReportedException(crashReport);
+    }
+
+    public static <T extends PacketListener> void fillCrashReport(CrashReport crashReport, T t, @Nullable Packet<T> packet) {
+        if (packet != null) {
+            CrashReportCategory crashReportCategory = crashReport.addCategory("Incoming Packet");
+            crashReportCategory.setDetail("Type", () -> packet.type().toString());
+            crashReportCategory.setDetail("Is Terminal", () -> Boolean.toString(packet.isTerminal()));
+            crashReportCategory.setDetail("Is Skippable", () -> Boolean.toString(packet.isSkippable()));
+        }
+        t.fillCrashReport(crashReport);
+    }
+}
+

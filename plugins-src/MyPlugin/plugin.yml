@@ -1,0 +1,11 @@
+name: MyPlugin            # 必需, 唯一
+version: 1.0.0
+main: com.example.MyPlugin  # 必需, Plugin 子类全名
+api-version: '1.0'
+author: YourName
+depend: [OtherPlugin]       # 硬依赖(缺失则不加载)
+softdepend: [SoftPlugin]    # 软依赖(仅影响加载顺序)
+commands:
+  mycmd:
+    description: 示例命令
+    aliases: [mc]

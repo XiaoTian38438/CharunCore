@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YanRong 服务器管理面板</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- 登录遮罩 -->
+  <div id="login-overlay" class="overlay">
+    <div class="login-box">
+      <h2>管理面板登录</h2>
+      <p class="hint">默认账号 <code>admin / admin</code>（可在 config.json 修改）</p>
+      <input id="login-user" type="text" placeholder="用户名" autofocus />
+      <input id="login-pwd" type="password" placeholder="密码" />
+      <button id="login-btn">登录</button>
+      <div id="login-err" class="err"></div>
+    </div>
+  </div>
+
+  <!-- 顶栏 -->
+  <header id="topbar">
+    <div class="brand">YanRong 管理面板 <span class="port">:25566</span></div>
+    <div id="status" class="status">
+      <span id="status-dot" class="dot off"></span>
+      <span id="status-text">25565: 检测中...</span>
+      <span id="status-mem" class="mem"></span>
+    </div>
+    <div class="controls">
+      <span id="role-badge" class="role-badge hidden"></span>
+      <button id="btn-start">启动</button>
+      <button id="btn-stop">停止</button>
+      <button id="btn-restart">重启</button>
+      <button id="btn-logout" class="ghost">退出</button>
+    </div>
+  </header>
+
+  <main id="layout">
+    <!-- 左侧文件管理 -->
+    <aside id="filepanel">
+      <div class="panel-head">
+        <span>文件管理</span>
+        <span class="roots">
+          <button class="root-btn" data-root="players">players</button>
+          <button class="root-btn" data-root="world">world</button>
+        </span>
+      </div>
+      <div id="breadcrumb" class="breadcrumb"></div>
+      <div id="filelist" class="filelist"></div>
+      <div class="upload-row">
+        <input type="file" id="upload-input" hidden />
+        <button id="btn-upload">上传到当前目录</button>
+      </div>
+    </aside>
+
+    <!-- 右侧终端 -->
+    <section id="termpanel">
+      <div class="panel-head">
+        <span>终端 (25565 实时输出 / 可输入指令)</span>
+        <span id="ws-state" class="ws-state">连接中...</span>
+      </div>
+      <div id="terminal" class="terminal"></div>
+      <div class="term-input-row">
+        <span class="prompt">&gt;</span>
+        <input id="term-input" type="text" placeholder="输入指令后回车发送到 25565（如 help / stop）" autocomplete="off" />
+      </div>
+    </section>
+  </main>
+
+  <!-- 文件编辑弹窗 -->
+  <div id="edit-overlay" class="overlay hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <span id="edit-title">编辑文件</span>
+        <button id="edit-close" class="ghost">关闭</button>
+      </div>
+      <textarea id="edit-area" spellcheck="false"></textarea>
+      <div class="modal-foot">
+        <span id="edit-info" class="hint"></span>
+        <button id="edit-save">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 操作日志弹窗 -->
+  <div id="ops-overlay" class="overlay hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <span>操作日志</span>
+        <button id="ops-close" class="ghost">关闭</button>
+      </div>
+      <div id="ops-list" class="ops-list"></div>
+    </div>
+  </div>
+
+  <button id="btn-ops" class="fab">操作日志</button>
+
+  <script src="app.js"></script>
+</body>
+</html>

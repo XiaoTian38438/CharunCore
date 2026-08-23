@@ -1,0 +1,40 @@
+{"ts":"2026-08-10T03:54:16.122Z","ip":"","action":"START","detail":"pid=26892"}
+{"ts":"2026-08-10T03:54:34.790Z","ip":"::1","action":"LOGIN","detail":"fail"}
+{"ts":"2026-08-10T03:54:57.714Z","ip":"::1","action":"LOGIN","detail":"fail"}
+{"ts":"2026-08-10T03:54:58.648Z","ip":"::1","action":"LOGIN","detail":"fail"}
+{"ts":"2026-08-10T03:55:02.184Z","ip":"::1","action":"LOGIN","detail":"success"}
+{"ts":"2026-08-10T03:55:25.930Z","ip":"","action":"STOP","detail":"pid=26892"}
+{"ts":"2026-08-10T03:55:27.546Z","ip":"","action":"START","detail":"pid=48912"}
+{"ts":"2026-08-10T03:56:41.204Z","ip":"","action":"STOP","detail":"pid=48912"}
+{"ts":"2026-08-10T03:57:01.611Z","ip":"::1","action":"DELETE","detail":"world"}
+{"ts":"2026-08-10T03:57:03.859Z","ip":"::1","action":"DELETE","detail":"players"}
+{"ts":"2026-08-10T03:58:00.611Z","ip":"","action":"START","detail":"pid=16592"}
+{"ts":"2026-08-10T04:00:26.413Z","ip":"::1","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-10T04:00:53.384Z","ip":"::1","action":"DELETE","detail":"players"}
+{"ts":"2026-08-10T04:00:55.786Z","ip":"::1","action":"DELETE","detail":"world"}
+{"ts":"2026-08-10T04:08:32.844Z","ip":"","action":"START","detail":"pid=4016"}
+{"ts":"2026-08-10T04:09:21.573Z","ip":"::1","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-10T04:13:48.969Z","ip":"","action":"START","detail":"pid=6568"}
+{"ts":"2026-08-10T04:13:56.674Z","ip":"::1","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-10T04:14:01.145Z","ip":"","action":"STOP","detail":"pid=6568"}
+{"ts":"2026-08-10T04:14:11.407Z","ip":"::1","action":"DELETE","detail":"players"}
+{"ts":"2026-08-10T04:14:13.265Z","ip":"::1","action":"DELETE","detail":"world"}
+{"ts":"2026-08-10T04:15:52.993Z","ip":"::1","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-10T05:28:51.809Z","ip":"::1","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-10T05:28:58.382Z","ip":"::1","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-10T05:30:12.172Z","ip":"::1","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-10T05:37:16.679Z","ip":"::1","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-10T05:46:32.605Z","ip":"::ffff:26.80.165.106","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-10T05:46:39.672Z","ip":"","action":"START","detail":"pid=43000"}
+{"ts":"2026-08-10T05:50:17.722Z","ip":"","action":"STOP","detail":"pid=43000"}
+{"ts":"2026-08-10T05:53:37.892Z","ip":"","action":"START","detail":"pid=15468"}
+{"ts":"2026-08-10T05:54:38.014Z","ip":"::1","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-10T05:55:05.442Z","ip":"::1","action":"EDIT","detail":"players/94f6248b-2d26-3d67-ac3c-8f3d3d59f589.json"}
+{"ts":"2026-08-15T12:59:43.217Z","ip":"","action":"START","detail":"pid=28788"}
+{"ts":"2026-08-15T12:59:51.286Z","ip":"::1","action":"LOGIN","detail":"success user=admin"}
+{"ts":"2026-08-15T12:59:54.868Z","ip":"","action":"STOP","detail":"pid=28788"}
+{"ts":"2026-08-15T13:00:00.087Z","ip":"::1","action":"DELETE","detail":"players"}
+{"ts":"2026-08-15T13:00:01.708Z","ip":"::1","action":"DELETE","detail":"world"}
+{"ts":"2026-08-15T13:00:07.956Z","ip":"","action":"START","detail":"pid=30180"}
+{"ts":"2026-08-15T13:04:43.014Z","ip":"::1","action":"DELETE","detail":"players"}
+{"ts":"2026-08-15T13:04:45.211Z","ip":"::1","action":"DELETE","detail":"world"}

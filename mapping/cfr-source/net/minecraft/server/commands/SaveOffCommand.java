@@ -1,0 +1,28 @@
+/*
+ * Decompiled with CFR 0.152.
+ */
+package net.minecraft.server.commands;
+
+import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.mojang.brigadier.exceptions.SimpleCommandExceptionType;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.Commands;
+import net.minecraft.network.chat.Component;
+
+public class SaveOffCommand {
+    private static final SimpleCommandExceptionType ERROR_ALREADY_OFF = new SimpleCommandExceptionType(Component.translatable("commands.save.alreadyOff"));
+
+    public static void register(CommandDispatcher<CommandSourceStack> commandDispatcher) {
+        commandDispatcher.register((LiteralArgumentBuilder)((LiteralArgumentBuilder)Commands.literal("save-off").requires(Commands.hasPermission(Commands.LEVEL_OWNERS))).executes(commandContext -> {
+            CommandSourceStack commandSourceStack = (CommandSourceStack)commandContext.getSource();
+            boolean bl = commandSourceStack.getServer().setAutoSave(false);
+            if (!bl) {
+                throw ERROR_ALREADY_OFF.create();
+            }
+            commandSourceStack.sendSuccess(() -> Component.translatable("commands.save.disabled"), true);
+            return 1;
+        }));
+    }
+}
+

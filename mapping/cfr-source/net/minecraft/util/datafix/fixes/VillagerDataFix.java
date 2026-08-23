@@ -1,0 +1,74 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  com.google.common.collect.ImmutableMap
+ */
+package net.minecraft.util.datafix.fixes;
+
+import com.google.common.collect.ImmutableMap;
+import com.mojang.datafixers.DSL;
+import com.mojang.datafixers.DataFixUtils;
+import com.mojang.datafixers.Typed;
+import com.mojang.datafixers.schemas.Schema;
+import com.mojang.serialization.Dynamic;
+import java.util.Map;
+import net.minecraft.util.datafix.fixes.NamedEntityFix;
+import net.minecraft.util.datafix.fixes.References;
+
+public class VillagerDataFix
+extends NamedEntityFix {
+    public VillagerDataFix(Schema schema, String string) {
+        super(schema, false, "Villager profession data fix (" + string + ")", References.ENTITY, string);
+    }
+
+    @Override
+    protected Typed<?> fix(Typed<?> typed) {
+        Dynamic<?> dynamic = typed.get(DSL.remainderFinder());
+        return typed.set(DSL.remainderFinder(), dynamic.remove("Profession").remove("Career").remove("CareerLevel").set("VillagerData", dynamic.createMap((Map<Dynamic<?>, Dynamic<?>>)ImmutableMap.of(dynamic.createString("type"), dynamic.createString("minecraft:plains"), dynamic.createString("profession"), dynamic.createString(VillagerDataFix.upgradeData(dynamic.get("Profession").asInt(0), dynamic.get("Career").asInt(0))), dynamic.createString("level"), DataFixUtils.orElse(dynamic.get("CareerLevel").result(), dynamic.createInt(1))))));
+    }
+
+    private static String upgradeData(int n, int n2) {
+        if (n == 0) {
+            if (n2 == 2) {
+                return "minecraft:fisherman";
+            }
+            if (n2 == 3) {
+                return "minecraft:shepherd";
+            }
+            if (n2 == 4) {
+                return "minecraft:fletcher";
+            }
+            return "minecraft:farmer";
+        }
+        if (n == 1) {
+            if (n2 == 2) {
+                return "minecraft:cartographer";
+            }
+            return "minecraft:librarian";
+        }
+        if (n == 2) {
+            return "minecraft:cleric";
+        }
+        if (n == 3) {
+            if (n2 == 2) {
+                return "minecraft:weaponsmith";
+            }
+            if (n2 == 3) {
+                return "minecraft:toolsmith";
+            }
+            return "minecraft:armorer";
+        }
+        if (n == 4) {
+            if (n2 == 2) {
+                return "minecraft:leatherworker";
+            }
+            return "minecraft:butcher";
+        }
+        if (n == 5) {
+            return "minecraft:nitwit";
+        }
+        return "minecraft:none";
+    }
+}
+

@@ -1,0 +1,60 @@
+/*
+ * Decompiled with CFR 0.152.
+ */
+package net.minecraft.util.datafix.fixes;
+
+import com.mojang.datafixers.DSL;
+import com.mojang.datafixers.DataFix;
+import com.mojang.datafixers.TypeRewriteRule;
+import com.mojang.datafixers.schemas.Schema;
+import com.mojang.serialization.Dynamic;
+import net.minecraft.util.Mth;
+import net.minecraft.util.datafix.fixes.References;
+
+public class GameRuleRegistryFix
+extends DataFix {
+    public GameRuleRegistryFix(Schema schema) {
+        super(schema, false);
+    }
+
+    @Override
+    protected TypeRewriteRule makeRule() {
+        return this.fixTypeEverywhereTyped("GameRuleRegistryFix", this.getInputSchema().getType(References.LEVEL), typed -> typed.update(DSL.remainderFinder(), dynamic -> dynamic.renameAndFixField("GameRules", "game_rules", dynamic2 -> {
+            boolean bl = Boolean.parseBoolean(dynamic2.get("doFireTick").asString("true"));
+            boolean bl2 = Boolean.parseBoolean(dynamic2.get("allowFireTicksAwayFromPlayer").asString("false"));
+            int n = !bl ? 0 : (!bl2 ? 128 : -1);
+            if (n != 128) {
+                dynamic2 = dynamic2.set("minecraft:fire_spread_radius_around_player", dynamic2.createInt(n));
+            }
+            return dynamic2.remove("spawnChunkRadius").remove("entitiesWithPassengersCanUsePortals").remove("doFireTick").remove("allowFireTicksAwayFromPlayer").renameAndFixField("allowEnteringNetherUsingPortals", "minecraft:allow_entering_nether_using_portals", GameRuleRegistryFix::convertBoolean).renameAndFixField("announceAdvancements", "minecraft:show_advancement_messages", GameRuleRegistryFix::convertBoolean).renameAndFixField("blockExplosionDropDecay", "minecraft:block_explosion_drop_decay", GameRuleRegistryFix::convertBoolean).renameAndFixField("commandBlockOutput", "minecraft:command_block_output", GameRuleRegistryFix::convertBoolean).renameAndFixField("enableCommandBlocks", "minecraft:command_blocks_work", GameRuleRegistryFix::convertBoolean).renameAndFixField("commandBlocksEnabled", "minecraft:command_blocks_work", GameRuleRegistryFix::convertBoolean).renameAndFixField("commandModificationBlockLimit", "minecraft:max_block_modifications", dynamic -> GameRuleRegistryFix.convertInteger(dynamic, 1)).renameAndFixField("disableElytraMovementCheck", "minecraft:elytra_movement_check", GameRuleRegistryFix::convertBooleanInverted).renameAndFixField("disablePlayerMovementCheck", "minecraft:player_movement_check", GameRuleRegistryFix::convertBooleanInverted).renameAndFixField("disableRaids", "minecraft:raids", GameRuleRegistryFix::convertBooleanInverted).renameAndFixField("doDaylightCycle", "minecraft:advance_time", GameRuleRegistryFix::convertBoolean).renameAndFixField("doEntityDrops", "minecraft:entity_drops", GameRuleRegistryFix::convertBoolean).renameAndFixField("doImmediateRespawn", "minecraft:immediate_respawn", GameRuleRegistryFix::convertBoolean).renameAndFixField("doInsomnia", "minecraft:spawn_phantoms", GameRuleRegistryFix::convertBoolean).renameAndFixField("doLimitedCrafting", "minecraft:limited_crafting", GameRuleRegistryFix::convertBoolean).renameAndFixField("doMobLoot", "minecraft:mob_drops", GameRuleRegistryFix::convertBoolean).renameAndFixField("doMobSpawning", "minecraft:spawn_mobs", GameRuleRegistryFix::convertBoolean).renameAndFixField("doPatrolSpawning", "minecraft:spawn_patrols", GameRuleRegistryFix::convertBoolean).renameAndFixField("doTileDrops", "minecraft:block_drops", GameRuleRegistryFix::convertBoolean).renameAndFixField("doTraderSpawning", "minecraft:spawn_wandering_traders", GameRuleRegistryFix::convertBoolean).renameAndFixField("doVinesSpread", "minecraft:spread_vines", GameRuleRegistryFix::convertBoolean).renameAndFixField("doWardenSpawning", "minecraft:spawn_wardens", GameRuleRegistryFix::convertBoolean).renameAndFixField("doWeatherCycle", "minecraft:advance_weather", GameRuleRegistryFix::convertBoolean).renameAndFixField("drowningDamage", "minecraft:drowning_damage", GameRuleRegistryFix::convertBoolean).renameAndFixField("enderPearlsVanishOnDeath", "minecraft:ender_pearls_vanish_on_death", GameRuleRegistryFix::convertBoolean).renameAndFixField("fallDamage", "minecraft:fall_damage", GameRuleRegistryFix::convertBoolean).renameAndFixField("fireDamage", "minecraft:fire_damage", GameRuleRegistryFix::convertBoolean).renameAndFixField("forgiveDeadPlayers", "minecraft:forgive_dead_players", GameRuleRegistryFix::convertBoolean).renameAndFixField("freezeDamage", "minecraft:freeze_damage", GameRuleRegistryFix::convertBoolean).renameAndFixField("globalSoundEvents", "minecraft:global_sound_events", GameRuleRegistryFix::convertBoolean).renameAndFixField("keepInventory", "minecraft:keep_inventory", GameRuleRegistryFix::convertBoolean).renameAndFixField("lavaSourceConversion", "minecraft:lava_source_conversion", GameRuleRegistryFix::convertBoolean).renameAndFixField("locatorBar", "minecraft:locator_bar", GameRuleRegistryFix::convertBoolean).renameAndFixField("logAdminCommands", "minecraft:log_admin_commands", GameRuleRegistryFix::convertBoolean).renameAndFixField("maxCommandChainLength", "minecraft:max_command_sequence_length", dynamic -> GameRuleRegistryFix.convertInteger(dynamic, 0)).renameAndFixField("maxCommandForkCount", "minecraft:max_command_forks", dynamic -> GameRuleRegistryFix.convertInteger(dynamic, 0)).renameAndFixField("maxEntityCramming", "minecraft:max_entity_cramming", dynamic -> GameRuleRegistryFix.convertInteger(dynamic, 0)).renameAndFixField("minecartMaxSpeed", "minecraft:max_minecart_speed", GameRuleRegistryFix::convertInteger).renameAndFixField("mobExplosionDropDecay", "minecraft:mob_explosion_drop_decay", GameRuleRegistryFix::convertBoolean).renameAndFixField("mobGriefing", "minecraft:mob_griefing", GameRuleRegistryFix::convertBoolean).renameAndFixField("naturalRegeneration", "minecraft:natural_health_regeneration", GameRuleRegistryFix::convertBoolean).renameAndFixField("playersNetherPortalCreativeDelay", "minecraft:players_nether_portal_creative_delay", dynamic -> GameRuleRegistryFix.convertInteger(dynamic, 0)).renameAndFixField("playersNetherPortalDefaultDelay", "minecraft:players_nether_portal_default_delay", dynamic -> GameRuleRegistryFix.convertInteger(dynamic, 0)).renameAndFixField("playersSleepingPercentage", "minecraft:players_sleeping_percentage", dynamic -> GameRuleRegistryFix.convertInteger(dynamic, 0)).renameAndFixField("projectilesCanBreakBlocks", "minecraft:projectiles_can_break_blocks", GameRuleRegistryFix::convertBoolean).renameAndFixField("pvp", "minecraft:pvp", GameRuleRegistryFix::convertBoolean).renameAndFixField("randomTickSpeed", "minecraft:random_tick_speed", dynamic -> GameRuleRegistryFix.convertInteger(dynamic, 0)).renameAndFixField("reducedDebugInfo", "minecraft:reduced_debug_info", GameRuleRegistryFix::convertBoolean).renameAndFixField("sendCommandFeedback", "minecraft:send_command_feedback", GameRuleRegistryFix::convertBoolean).renameAndFixField("showDeathMessages", "minecraft:show_death_messages", GameRuleRegistryFix::convertBoolean).renameAndFixField("snowAccumulationHeight", "minecraft:max_snow_accumulation_height", dynamic -> GameRuleRegistryFix.convertInteger(dynamic, 0, 8)).renameAndFixField("spawnMonsters", "minecraft:spawn_monsters", GameRuleRegistryFix::convertBoolean).renameAndFixField("spawnRadius", "minecraft:respawn_radius", GameRuleRegistryFix::convertInteger).renameAndFixField("spawnerBlocksEnabled", "minecraft:spawner_blocks_work", GameRuleRegistryFix::convertBoolean).renameAndFixField("spectatorsGenerateChunks", "minecraft:spectators_generate_chunks", GameRuleRegistryFix::convertBoolean).renameAndFixField("tntExplodes", "minecraft:tnt_explodes", GameRuleRegistryFix::convertBoolean).renameAndFixField("tntExplosionDropDecay", "minecraft:tnt_explosion_drop_decay", GameRuleRegistryFix::convertBoolean).renameAndFixField("universalAnger", "minecraft:universal_anger", GameRuleRegistryFix::convertBoolean).renameAndFixField("waterSourceConversion", "minecraft:water_source_conversion", GameRuleRegistryFix::convertBoolean);
+        })));
+    }
+
+    private static Dynamic<?> convertInteger(Dynamic<?> dynamic) {
+        return GameRuleRegistryFix.convertInteger(dynamic, Integer.MIN_VALUE, Integer.MAX_VALUE);
+    }
+
+    private static Dynamic<?> convertInteger(Dynamic<?> dynamic, int n) {
+        return GameRuleRegistryFix.convertInteger(dynamic, n, Integer.MAX_VALUE);
+    }
+
+    private static Dynamic<?> convertInteger(Dynamic<?> dynamic, int n, int n2) {
+        String string = dynamic.asString("");
+        try {
+            int n3 = Integer.parseInt(string);
+            return dynamic.createInt(Mth.clamp(n3, n, n2));
+        }
+        catch (NumberFormatException numberFormatException) {
+            return dynamic;
+        }
+    }
+
+    private static Dynamic<?> convertBoolean(Dynamic<?> dynamic) {
+        return dynamic.createBoolean(Boolean.parseBoolean(dynamic.asString("")));
+    }
+
+    private static Dynamic<?> convertBooleanInverted(Dynamic<?> dynamic) {
+        return dynamic.createBoolean(!Boolean.parseBoolean(dynamic.asString("")));
+    }
+}
+
