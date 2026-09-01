@@ -134,9 +134,17 @@ public class NoiseChunk implements DensityFunction.ContextProvider, DensityFunct
                     this, aquiferRandomFactory,
                     minY, settings.height(), globalFluidPicker);
         } else {
+            // 原版 NoiseBasedChunkGenerator.createFluidPicker 三段式：
+            //   y < min(-54, seaLevel) -> 熔岩(-54)
+            //   y < seaLevel          -> 维度默认流体（下界=熔岩，主世界=水，末地=空气）
+            //   否则                  -> 空气
+            // 下界 seaLevel=32 且默认流体=熔岩 → y<32 全部灌熔岩海；末地 seaLevel=0 → 无流体。
+            int defaultFluid = isNether ? lavaId : waterId;
+            int dimMinY = settings.minY();
             finalAquifer = Aquifer.createDisabled((x, y, z) -> {
-                if (y < seaLevel) return new Aquifer.FluidStatus(seaLevel, waterId);
-                return new Aquifer.FluidStatus(Integer.MAX_VALUE, 0);
+                if (y < Math.min(-54, seaLevel)) return new Aquifer.FluidStatus(-54, lavaId);
+                if (y < seaLevel) return new Aquifer.FluidStatus(seaLevel, defaultFluid);
+                return new Aquifer.FluidStatus(dimMinY * 2, 0);
             });
         }
         this.aquifer = finalAquifer;
@@ -151,7 +159,13 @@ public class NoiseChunk implements DensityFunction.ContextProvider, DensityFunct
         NoiseChunk.BlockStateFiller veinFiller = OreVeinifier.create(
                 this.wrappedRouter.veinToggle(), this.wrappedRouter.veinRidged(),
                 this.wrappedRouter.veinGap(), oreRandomFactory, isNether);
-        NoiseChunk.BlockStateFiller[] materialRules = { aquiferFiller, veinFiller };
+        // Bug46: 矿脉只允许替换固体(density>0)。曾放任 aquifer 压力分支返回 null 落穿到
+        // 矿脉判定 -> 应为空气/流体的格位被矿脉/凝灰岩回填, 洞穴顶悬空矿脉。
+        NoiseChunk.BlockStateFiller guardedVeinFiller = (DensityFunction.FunctionContext ctx) -> {
+            if (finalDensity.compute(ctx) <= 0.0) return 0;
+            return veinFiller.calculate(ctx);
+        };
+        NoiseChunk.BlockStateFiller[] materialRules = { aquiferFiller, guardedVeinFiller };
         this.blockStateRule = ctx -> {
             for (NoiseChunk.BlockStateFiller rule : materialRules) {
                 Integer result = rule.calculate(ctx);

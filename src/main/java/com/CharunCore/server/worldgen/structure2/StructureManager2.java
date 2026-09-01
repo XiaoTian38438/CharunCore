@@ -14,7 +14,7 @@ public class StructureManager2 {
 
     // 按维度分层存储：主世界/下界/末地结构互不干扰。
     // 曾共用一张 (chunkX,chunkZ) 表 → 下界/末地生成时命中主世界 start → 结构泄漏到错误维度。
-    private final Map<DimensionType, Map<Long, List<StructureStart>>> chunkStarts =
+    private final Map<DimensionType, Map<Long, List<StructureStartLike>>> chunkStarts =
             new java.util.EnumMap<>(DimensionType.class);
     private final StructureTemplateManager templateManager = StructureTemplateManager.getInstance();
 
@@ -29,18 +29,18 @@ public class StructureManager2 {
     }
 
     public void clear() {
-        for (Map<Long, List<StructureStart>> byChunk : chunkStarts.values()) byChunk.clear();
+        for (Map<Long, List<StructureStartLike>> byChunk : chunkStarts.values()) byChunk.clear();
     }
 
-    public List<StructureStart> getStartsForChunk(DimensionType dim, int chunkX, int chunkZ) {
+    public List<StructureStartLike> getStartsForChunk(DimensionType dim, int chunkX, int chunkZ) {
         return chunkStarts.get(dim).getOrDefault(chunkKey(chunkX, chunkZ), new ArrayList<>());
     }
 
     /** 注册结构 start；同维度同 id 同中心区块去重（防区块重载后重复放置双份结构） */
-    public void addStart(DimensionType dim, int chunkX, int chunkZ, StructureStart start) {
-        List<StructureStart> list = chunkStarts.get(dim)
+    public void addStart(DimensionType dim, int chunkX, int chunkZ, StructureStartLike start) {
+        List<StructureStartLike> list = chunkStarts.get(dim)
                 .computeIfAbsent(chunkKey(chunkX, chunkZ), k -> new ArrayList<>());
-        for (StructureStart s : list) {
+        for (StructureStartLike s : list) {
             if (s.getStructureId().equals(start.getStructureId())
                     && s.getChunkX() == start.getChunkX()
                     && s.getChunkZ() == start.getChunkZ()) {
@@ -50,14 +50,14 @@ public class StructureManager2 {
         list.add(start);
     }
 
-    public List<StructureStart> getStartsIntersecting(DimensionType dim, int chunkX, int chunkZ) {
-        List<StructureStart> result = new ArrayList<>();
+    public List<StructureStartLike> getStartsIntersecting(DimensionType dim, int chunkX, int chunkZ) {
+        List<StructureStartLike> result = new ArrayList<>();
         int chunkMinX = chunkX << 4;
         int chunkMinZ = chunkZ << 4;
         int chunkMaxX = chunkMinX + 15;
         int chunkMaxZ = chunkMinZ + 15;
-        for (List<StructureStart> starts : chunkStarts.get(dim).values()) {
-            for (StructureStart start : starts) {
+        for (List<StructureStartLike> starts : chunkStarts.get(dim).values()) {
+            for (StructureStartLike start : starts) {
                 BoundingBox bb = start.getBoundingBox();
                 if (bb == null) continue;
                 if (bb.maxX >= chunkMinX && bb.minX <= chunkMaxX
@@ -70,8 +70,8 @@ public class StructureManager2 {
     }
 
     public void placeStructuresForChunk(WorldGenLevel level, DimensionType dim, int chunkX, int chunkZ) {
-        List<StructureStart> starts = getStartsIntersecting(dim, chunkX, chunkZ);
-        for (StructureStart start : starts) {
+        List<StructureStartLike> starts = getStartsIntersecting(dim, chunkX, chunkZ);
+        for (StructureStartLike start : starts) {
             start.placeInChunk(level, templateManager, chunkX, chunkZ);
         }
     }

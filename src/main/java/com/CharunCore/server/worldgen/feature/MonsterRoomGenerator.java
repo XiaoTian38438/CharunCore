@@ -100,8 +100,28 @@ public final class MonsterRoomGenerator {
             }
         }
 
-        // Place spawner at center
+        // Place spawner at center (Bug49: 同时创建 BE —— 曾只有方块无 BE,
+        // SpawnerSystem.registerChunk 按 BE 表扫描注册 -> 地牢刷怪笼不刷怪,
+        // 客户端也没有刷怪笼旋转生物预览)。
         chunk.setBlock(cx, cy, cz, spawner);
+        int worldSpawnerX = (chunk.getX() << 4) + cx;
+        int worldSpawnerZ = (chunk.getZ() << 4) + cz;
+        String[] mobPool = {"zombie", "skeleton", "spider", "cave_spider"};
+        String mobType = mobPool[rng.nextInt(mobPool.length)];
+        chunk.setBlockEntity(cx, cy, cz, org.cloudburstmc.nbt.NbtMap.builder()
+            .putString("id", "minecraft:spawner")
+            .putCompound("SpawnData", org.cloudburstmc.nbt.NbtMap.builder()
+                .putCompound("entity", org.cloudburstmc.nbt.NbtMap.builder()
+                    .putString("id", "minecraft:" + mobType).build())
+                .putString("id", "minecraft:" + mobType)
+                .build())
+            .putInt("MinSpawnDelay", 200)
+            .putInt("MaxSpawnDelay", 800)
+            .putInt("SpawnCount", 4)
+            .putInt("MaxNearbyEntities", 6)
+            .putInt("RequiredPlayerRange", 16)
+            .putInt("SpawnRange", 4)
+            .build());
 
         // Place chests (1-2 on walls)
         int chests = 0;

@@ -35,22 +35,17 @@ public final class OreVeinifier {
                                                       DensityFunction veinGap,
                                                       PositionalRandomFactory randomFactory,
                                                       boolean isNether) {
+        // Bug20: 原版 nether.json 明确 ore_veins_enabled=false —— 下界没有矿脉系统。
+        // 曾自加"下界金矿脉/远古残骸脉" -> 下界岩里出现原版没有的大片矿脉结构。
+        if (isNether) {
+            return ctx -> null;
+        }
         return ctx -> {
             double toggle = veinToggle.compute(ctx);
             int y = ctx.blockY();
             int ore, rawOreBlock, filler, minY, maxY;
 
-            if (isNether) {
-                // 下界只有「铁脉(toggle<=0)」承载矿石：下界金矿石 + 远古残骸(2% 稀有块) + 下界岩填充。
-                // 铜脉(toggle>0)在下界不存在（下界无铜矿石），直接禁用，避免错误生成 copper_ore/granite。
-                // Y 范围 0..30：下界低层矿脉带，与散矿(ancient_debris Y8-119)互补。
-                if (toggle > 0.0) return null;
-                ore = BlockIds.netherGoldOre;
-                rawOreBlock = BlockIds.ancientDebris;
-                filler = BlockIds.netherrack;
-                minY = 0;
-                maxY = 30;
-            } else if (toggle > 0.0) {
+            if (toggle > 0.0) {
                 ore = BlockIds.copperOre;
                 rawOreBlock = BlockIds.rawCopper;
                 filler = BlockIds.granite;

@@ -2,7 +2,7 @@ package com.CharunCore.server.worldgen.density.functions;
 
 import com.CharunCore.server.worldgen.density.DensityFunction;
 
-/** 原版 DensityFunctions$ShiftB — (blockZ * 0.25, 0, blockX * 0.25) * 4（X 和 Z 坐标交换） */
+/** 原版 DensityFunctions$ShiftB — compute(blockZ, blockX, 0) → (blockZ*0.25, blockX*0.25, 0) * 4 */
 public final class ShiftB implements DensityFunction {
     private final DensityFunction.NoiseHolder offsetNoise;
     private final double minValue, maxValue;

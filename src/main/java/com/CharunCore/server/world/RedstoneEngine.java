@@ -107,6 +107,11 @@ public class RedstoneEngine {
         // 本批涉及的红石线集合: BFS 后做多轮收敛重算(单次通过不保证 power 收敛,
         // 拆电源后长线衰减不彻底会残留"微弱信号"且落盘后重进仍在)。
         java.util.Set<Long> wirePositions = new java.util.HashSet<>();
+        // #23 修复: 铁轨链也参与收敛重算。BFS 单次通过可能先处理链上轨、后处理相邻电源
+        // (红石线), 导致轨读到旧 power -> 整链算成 false 只激活源相邻 1 根。收敛轮保证电源就绪后再定。
+        java.util.Set<Long> railPositions = new java.util.HashSet<>();
+        // #19 修复: 本批待执行的命令方块坐标集合(脉冲上升沿 / 重复方块供电时)。
+        java.util.List<int[]> pendingCommandBlocks = new java.util.ArrayList<>();
 
         // 先更新该位置自身（如果是红石线，计算 power + 形状）
         int selfState = getState(x, y, z);
@@ -209,6 +214,7 @@ public class RedstoneEngine {
                         newState = BlockStateHelper.withProp(ns, "powered", powered ? "true" : "false");
                         changed = true;
                     }
+                    railPositions.add(posKey(nb[0], nb[1], nb[2]));
                 } else if (name.endsWith("_door")) {
                     boolean powered = receivesAnyPower(nb[0], nb[1], nb[2]);
                     String curPowered = BlockStateHelper.getProp(ns, "powered");
@@ -310,6 +316,34 @@ public class RedstoneEngine {
                     registerTracked(ctxDim(), nb[0], nb[1], nb[2], name);
                 } else if ("daylight_detector".equals(name)) {
                     registerTracked(ctxDim(), nb[0], nb[1], nb[2], name);
+                } else if ("command_block".equals(name) || "chain_command_block".equals(name)
+                        || "repeating_command_block".equals(name)) {
+                    // #19 修复: 命令方块被红石激活时执行其命令。原无任何执行路径 ->
+                    // 红石信号不触发。脉冲方块(impulse)在上升沿执行; 重复方块(repeating)每 tick
+                    // 供电时执行(tick 中处理); 连锁方块(chain)在同一次激活波中被相邻已执行方块触发。
+                    boolean powered = receivesAnyPower(nb[0], nb[1], nb[2]);
+                    String curP = BlockStateHelper.getProp(ns, "powered");
+                    boolean wasPowered = "true".equals(curP);
+                    if (powered != wasPowered) {
+                        newState = BlockStateHelper.withProp(ns, "powered", powered ? "true" : "false");
+                        changed = true;
+                    }
+                    long cbKey = posKey(nb[0], nb[1], nb[2]);
+                    // Bug19: "始终激活"(auto) 的循环方块无红石也每刻执行(原版 Always Active)。
+                    ContainerStore.CommandBlockData cbData = ContainerStore.peekCommandBlock(
+                        new ContainerStore.Pos(ctxDim(), nb[0], nb[1], nb[2]));
+                    boolean alwaysActive = cbData != null && cbData.auto;
+                    // 重复方块供电或始终激活 -> 加入 tick 跟踪; 否则移除。
+                    if ("repeating_command_block".equals(name)) {
+                        if (powered || alwaysActive) trackedCommandBlocks.get(ctxDim()).add(cbKey);
+                        else trackedCommandBlocks.get(ctxDim()).remove(cbKey);
+                    }
+                    // 记录待执行: 脉冲方块上升沿; 重复方块供电/始终激活时(每 tick 由 tick 处理, 这里首 tick 也触发)。
+                    if (powered && !wasPowered && "command_block".equals(name)) {
+                        pendingCommandBlocks.add(new int[]{nb[0], nb[1], nb[2]});
+                    } else if ("repeating_command_block".equals(name) && (powered || alwaysActive)) {
+                        pendingCommandBlocks.add(new int[]{nb[0], nb[1], nb[2]});
+                    }
                 }
 
                 if (changed) {
@@ -369,6 +403,27 @@ public class RedstoneEngine {
                     }
                 }
                 if (!anyChange) break;
+            }
+            // #23 修复: 铁轨链收敛。与红石线同理, 单轮 BFS 可能让链上轨读到未就绪的电源 power,
+            // 整链被算 false。反复重算所有链上轨直到稳定(原版铁轨链最长 8+1+8=17 格)。
+            for (int round = 0; round < 32; round++) {
+                boolean anyRailChange = false;
+                for (Long rk : java.util.List.copyOf(railPositions)) {
+                    int rx = keyX(rk), ry = keyY(rk), rz = keyZ(rk);
+                    int rs = getState(rx, ry, rz);
+                    String rn = BlockStateHelper.getName(rs);
+                    if (!"powered_rail".equals(rn) && !"activator_rail".equals(rn)) continue;
+                    boolean powered = railChainPowered(rx, ry, rz, rn);
+                    String curP = BlockStateHelper.getProp(rs, "powered");
+                    boolean curTrue = "true".equals(curP);
+                    if (powered != curTrue) {
+                        int nsR = BlockStateHelper.withProp(rs, "powered", powered ? "true" : "false");
+                        putState(rx, ry, rz, nsR);
+                        NetworkHandler.broadcastBlockChange(ctxDim(), rx, ry, rz, nsR);
+                        anyRailChange = true;
+                    }
+                }
+                if (!anyRailChange) break;
             }
             // #34 修复: 收敛后线 power 已降, 但 BFS 早前处理灯时读到旧值(灯保持亮);
             // 重新检查所有线相邻的红石灯/火把/活塞等受体, 否则"信号消失灯不灭"。
@@ -433,26 +488,113 @@ public class RedstoneEngine {
                 }
             }
         }
+        // #19 修复: 执行本批待触发的命令方块(脉冲上升沿 / 重复方块供电)。先执行脉冲/重复,
+        // 再以"相邻有方块刚执行"为条件执行连锁方块(最多两轮, 链式传播)。
+        if (!pendingCommandBlocks.isEmpty()) {
+            java.util.List<int[]> executedThisPass = new java.util.ArrayList<>();
+            for (int[] p : pendingCommandBlocks) {
+                if (executeCommandBlock(p[0], p[1], p[2])) executedThisPass.add(p);
+            }
+            // 连锁方块: 供电且相邻(沿 facing 方向)有方块刚执行则触发。
+            for (int pass = 0; pass < 2; pass++) {
+                java.util.List<int[]> chainNext = new java.util.ArrayList<>();
+                // 遍历本批已执行方块周围的 chain 类型
+                for (int[] ep : executedThisPass) {
+                    // 检查 ep 周围的 chain 方块
+                    int[][] around = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+                    for (int[] d : around) {
+                        int cx = ep[0] + d[0], cy = ep[1] + d[1], cz = ep[2] + d[2];
+                        int cs = getState(cx, cy, cz);
+                        if (!"chain_command_block".equals(BlockStateHelper.getName(cs))) continue;
+                        if (!"true".equals(BlockStateHelper.getProp(cs, "powered"))) continue;
+                        if (executeCommandBlock(cx, cy, cz)) chainNext.add(new int[]{cx, cy, cz});
+                    }
+                }
+                if (chainNext.isEmpty()) break;
+                executedThisPass = chainNext;
+            }
+        }
+    }
+
+    /** #19 执行单个命令方块的命令(以控制台身份)。返回是否成功执行(命令非空)。 */
+    private static boolean executeCommandBlock(int x, int y, int z) {
+        try {
+            ContainerStore.Pos p = new ContainerStore.Pos(ctxDim(), x, y, z);
+            ContainerStore.CommandBlockData cbd = ContainerStore.peekCommandBlock(p);
+            String cmd = cbd != null ? cbd.command : null;
+            if (cmd == null || cmd.isBlank()) {
+                // 重启后内存无 CommandBlockData -> 从区块 BE 的 Command 回读(原直接放弃 -> 无法激活)。
+                com.CharunCore.server.world.chunk.Chunk ch =
+                    WorldManager.getChunk(ctxDim(), x >> 4, z >> 4);
+                if (ch != null) {
+                    org.cloudburstmc.nbt.NbtMap be = ch.getBlockEntity(x & 15, y, z & 15);
+                    if (be != null && be.containsKey("Command")) {
+                        cmd = be.getString("Command", "");
+                        if (!cmd.isBlank()) {
+                            ContainerStore.CommandBlockData loaded = ContainerStore.commandBlock(p);
+                            loaded.command = cmd;
+                            String cbName = BlockStateHelper.getName(getState(x, y, z));
+                            loaded.mode = "chain_command_block".equals(cbName) ? 1
+                                : "repeating_command_block".equals(cbName) ? 2 : 0;
+                            cbd = loaded;
+                        }
+                    }
+                }
+            }
+            if (cbd == null || cmd == null || cmd.isBlank()) return false;
+            com.CharunCore.server.plugin.Server.get().dispatchCommand(cmd);
+            if (cbd.trackOutput) cbd.lastOutput = "[OK] " + cmd;
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**
-     * #23 修复: 动力铁轨/激活铁轨链上是否被供电(任一链上轨直接被供电源驱动则整链激活)。
      * 曾用 propagateRailPower 单独把链上轨置 powered=true, 但 BFS 随后用 receivesAnyPower(仅直接电源)
      * 把它们重新算回 false -> 一个红石信号只激活 1 根铁轨。现改为链感知判定: 去源后整链一起熄灭。
      */
     private static boolean railChainPowered(int x, int y, int z, String railName) {
         if (receivesAnyPower(x, y, z)) return true;
-        int[][] dirs = {{1,0,0},{-1,0,0},{0,0,1},{0,0,-1}};
-        for (int[] d : dirs) {
-            int px = x, pz = z;
+        // Bug23: 按"形状"连接传播(原版 RailState 连接语义, 含斜坡升降),
+        // 单侧最长 8 格(8+源+8=17)。曾只沿 4 水平方向扫同层 -> 斜坡链断开。
+        for (int[] d : railConnectedDirs(x, y, z)) {
+            int px = x, py = y, pz = z;
+            int dx = d[0], dy = d[1], dz = d[2];
             for (int i = 0; i < 8; i++) {
-                px += d[0]; pz += d[2];
-                int s = getState(px, y, pz);
+                px += dx; py += dy; pz += dz;
+                int s = getState(px, py, pz);
                 if (!railName.equals(BlockStateHelper.getName(s))) break;
-                if (receivesAnyPower(px, y, pz)) return true;
+                if (receivesAnyPower(px, py, pz)) return true;
+                int[] nd = railForwardDir(px, py, pz, dx, dy, dz);
+                dx = nd[0]; dy = nd[1]; dz = nd[2];
             }
         }
         return false;
+    }
+
+    /** 由铁轨 shape 属性给出两个延伸方向的 (dx,dy,dz)。未知形状按直线处理。 */
+    private static int[][] railConnectedDirs(int x, int y, int z) {
+        String shape = BlockStateHelper.getProp(getState(x, y, z), "shape");
+        if (shape == null) return new int[][]{{1,0,0},{-1,0,0}};
+        return switch (shape) {
+            case "north_south"      -> new int[][]{{0,0,-1},{0,0,1}};
+            case "east_west"        -> new int[][]{{1,0,0},{-1,0,0}};
+            case "ascending_north"  -> new int[][]{{0,1,-1},{0,0,1}}; // 北端高一级
+            case "ascending_south"  -> new int[][]{{0,0,-1},{0,1,1}};
+            case "ascending_east"   -> new int[][]{{1,1,0},{-1,0,0}};
+            case "ascending_west"   -> new int[][]{{1,0,0},{-1,1,0}};
+            default                 -> new int[][]{{1,0,0},{-1,0,0}};
+        };
+    }
+
+    /** 沿来向进入 (x,y,z) 的轨后, 取该轨另一端的延伸方向。 */
+    private static int[] railForwardDir(int x, int y, int z, int fdx, int fdy, int fdz) {
+        for (int[] d : railConnectedDirs(x, y, z)) {
+            if (d[0] == -fdx && d[1] == -fdy && d[2] == -fdz) continue;
+            return d;
+        }
+        return new int[]{fdx, fdy, fdz};
     }
 
     /**
@@ -747,13 +889,20 @@ public class RedstoneEngine {
         }
 
         int sideId = getState(x + dx, y, z + dz);
-        if (isRedstoneConnectable(sideId)) return "side";
-
-        // 水平邻居是实体方块，检查其上方是否有红石线（爬升）
-        if (sideId != 0) {
-            int upId = getState(x + dx, y + 1, z + dz);
-            if (isRedstoneConnectable(upId)) return "up";
+        if (isRedstoneConnectable(sideId)) {
+            // 原版: 同层可连且对角上方也是线 -> 显示爬升臂 "up"
+            int diagUp = getState(x + dx, y + 1, z + dz);
+            if ("redstone_wire".equals(BlockStateHelper.getName(diagUp))) return "up";
+            return "side";
         }
+
+        // 水平邻居不可连(含空气): 检查对角上方是否有红石线(爬升)。
+        // Bug16 修复: 曾错误地要求水平邻居非空气(sideId != 0)才检查爬升,
+        // 且在末尾用非法属性值 "down"(该枚举只有 up/side/none)并误查自身正上/正下方,
+        // 导致上线向下的连接显示不出来("只连下不连上")。
+        // 原版规则: 同层不可连但对角上方(x±1,y+1,z±1)是红石线时该方向 = "up"。
+        int upDiag = getState(x + dx, y + 1, z + dz);
+        if ("redstone_wire".equals(BlockStateHelper.getName(upDiag))) return "up";
 
         // 水平邻居是空气，检查下方是否有红石线（下降）
         if (sideId == 0) {
@@ -792,7 +941,9 @@ public class RedstoneEngine {
             || n.equals("redstone_block")
             || n.equals("comparator") || n.equals("repeater") || n.equals("observer")
             || n.equals("pressure_plate") || n.startsWith("weighted_pressure_plate")
-            || n.endsWith("_pressure_plate");
+            || n.endsWith("_pressure_plate")
+            || n.equals("command_block") || n.equals("chain_command_block")
+            || n.equals("repeating_command_block");
     }
 
     // ── 真实活塞推动 (C8bis)：移植自 vanilla PistonStructureResolver ─────────
@@ -1143,6 +1294,17 @@ public class RedstoneEngine {
             new java.util.EnumMap<>(DimensionType.class);
     private static final java.util.Map<DimensionType, java.util.Map<Long, Integer>> observerLastSeen =
             new java.util.EnumMap<>(DimensionType.class);
+    // #19 修复: 重复命令方块(供电时每 tick 执行)按维度跟踪。
+    private static final java.util.Map<DimensionType, java.util.Set<Long>> trackedCommandBlocks =
+            new java.util.EnumMap<>(DimensionType.class);
+    static {
+        for (DimensionType d : DimensionType.values()) {
+            trackedObservers.put(d, java.util.concurrent.ConcurrentHashMap.newKeySet());
+            trackedPlates.put(d, java.util.concurrent.ConcurrentHashMap.newKeySet());
+            observerLastSeen.put(d, new java.util.concurrent.ConcurrentHashMap<>());
+            trackedCommandBlocks.put(d, java.util.concurrent.ConcurrentHashMap.newKeySet());
+        }
+    }
     private static final java.util.Map<DimensionType, java.util.Set<Long>> trackedDaylight =
             new java.util.EnumMap<>(DimensionType.class);
     static {
@@ -1588,6 +1750,18 @@ public class RedstoneEngine {
                             NetworkHandler.broadcastBlockChange(ctxDim(), x, y, z, ns);
                             onBlockChanged(ctxDim(), x, y, z);
                         }
+                    }
+
+                    // #19 修复: 重复命令方块(repeating_command_block)供电时每 tick 执行其命令。
+                    for (long key : new java.util.ArrayList<>(trackedCommandBlocks.get(dim))) {
+                        int x = keyX(key), y = keyY(key), z = keyZ(key);
+                        int state = getState(x, y, z);
+                        String n = BlockStateHelper.getName(state);
+                        if (!"repeating_command_block".equals(n)) { trackedCommandBlocks.get(dim).remove(key); continue; }
+                        if (!"true".equals(BlockStateHelper.getProp(state, "powered"))) {
+                            trackedCommandBlocks.get(dim).remove(key); continue;
+                        }
+                        executeCommandBlock(x, y, z);
                     }
 
                     // 阳光传感器：每 20 游戏刻(=1 秒)按昼夜重算输出，变化时刷新并触发相邻红石重求值

@@ -241,69 +241,42 @@ public final class EndDragonFight {
         for (int i = 0; i < 4; i++) {
             WorldManager.setBlock(END, 0, podiumY + i, 0, bedrock);
         }
-        // 四方向墙火把 (y+2)
+        // 四方向墙火把 (y+2): 火把贴中心柱外壁, 朝向向外(远离中心)。
+        // Bug35 修复: 原 facing 全部反向(东位火把朝西贴柱内) -> 火把朝向错误且视觉贴反。
+        // 正确: 火把在世界坐标 (tx,tz) 处, 其 facing 应指向远离中心(向外):
+        //   (1,0)=东 -> east; (0,1)=南 -> south; (-1,0)=西 -> west; (0,-1)=北 -> north。
         for (int i = 0; i < 4; i++) {
             int tx = i == 0 ? 1 : i == 1 ? 0 : i == 2 ? -1 : 0;
             int tz = i == 0 ? 0 : i == 1 ? 1 : i == 2 ? 0 : -1;
-            // 原版 WallTorchBlock.FACING = 火把贴墙方向 = 从中心指向火把位置的反向
-            String f2 = i == 0 ? "west" : i == 1 ? "north" : i == 2 ? "east" : "south";
+            String f2 = i == 0 ? "east" : i == 1 ? "south" : i == 2 ? "west" : "north";
             int wt = BlockStateHelper.withProp(BlockStateHelper.getDefault("wall_torch"), "facing", f2);
             WorldManager.setBlock(END, tx, podiumY + 2, tz, wt);
         }
     }
 
     private static void buildSpikes() {
-        // 【修复】重建前清空旧水晶追踪: 多次重建时 crystalIds 累积旧 id,
-        // 导致 hasLivingCrystals() 恒 true → 末影龙永远被"幽灵水晶"保护无法击杀。
+        // Bug57: 柱子与水晶全部由区块生成的 EndSpikeFeature 负责(与原版同款坐标/高度)。
+        // 曾在此独立重建柱子(洗牌种子不同)+生成水晶 -> 与地形柱子错位(水晶"刷在柱子中间")、
+        // 同一柱顶两颗水晶。现在只按 EndSpikeFeature 的位置补缺失的水晶实体(重启恢复用)。
         crystalIds.clear();
-        int obsidian = BlockStateHelper.getDefault("obsidian");
-        int bedrock = BlockStateHelper.getDefault("bedrock");
-        int ironBars = BlockStateHelper.getDefault("iron_bars");
-
-        List<Integer> order = new ArrayList<>();
-        for (int i = 0; i < 10; i++) order.add(i);
-        Collections.shuffle(order, new Random(WorldManager.getSeed()));
-
-        int baseY = Math.max(1, podiumY - 24);
-
-        for (int i = 0; i < 10; i++) {
-            double a = i * Math.PI * 2.0 / 10.0;
-            int sx = (int) Math.round(42.0 * Math.cos(a));
-            int sz = (int) Math.round(42.0 * Math.sin(a));
-            int j = order.get(i);
-            int radius = 2 + j / 3;
-            int height = 76 + j * 3;
-            boolean guarded = (j == 1 || j == 2);
-
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    if (dx * dx + dz * dz > radius * radius + 1) continue;
-                    for (int y = baseY; y < height; y++) {
-                        WorldManager.setBlock(END, sx + dx, y, sz + dz, obsidian);
-                    }
-                    for (int y = height; y <= height + 6; y++) {
-                        WorldManager.setBlock(END, sx + dx, y, sz + dz, 0);
-                    }
+        for (com.CharunCore.server.worldgen.feature.EndSpikeFeature.Spike spike
+                : com.CharunCore.server.worldgen.feature.EndSpikeFeature.createSpikes(WorldManager.getSeed())) {
+            double cx = spike.centerX + 0.5, cy = spike.height + 1.0, cz = spike.centerZ + 0.5;
+            boolean exists = false;
+            for (com.CharunCore.server.world.entity.Entity e : com.CharunCore.server.world.entity.EntityManager.getEntities().values()) {
+                if (e instanceof EndCrystalEntity c && c.deathTime == 0 && c.dim == END
+                        && Math.abs(c.x - cx) < 2 && Math.abs(c.y - cy) < 3 && Math.abs(c.z - cz) < 2) {
+                    exists = true;
+                    crystalIds.add(c.id);
+                    break;
                 }
             }
-            WorldManager.setBlock(END, sx, height, sz, bedrock);
-
-            EndCrystalEntity crystal = new EndCrystalEntity(EntityManager.allocateId(),
-                    sx + 0.5, height + 1, sz + 0.5);
-            crystal.dim = END;
-            EntityManager.addEntity(crystal);
-            crystalIds.add(crystal.id);
-
-            if (guarded) {
-                for (int dx = -2; dx <= 2; dx++) {
-                    for (int dz = -2; dz <= 2; dz++) {
-                        for (int dy = 0; dy <= 3; dy++) {
-                            boolean wall = Math.abs(dx) == 2 || Math.abs(dz) == 2 || dy == 3;
-                            if (!wall) continue;
-                            WorldManager.setBlock(END, sx + dx, height + 1 + dy, sz + dz, ironBars);
-                        }
-                    }
-                }
+            if (!exists) {
+                EndCrystalEntity crystal = new EndCrystalEntity(
+                        com.CharunCore.server.world.entity.EntityManager.allocateId(), cx, cy, cz);
+                crystal.dim = END;
+                com.CharunCore.server.world.entity.EntityManager.addEntity(crystal);
+                crystalIds.add(crystal.id);
             }
         }
     }

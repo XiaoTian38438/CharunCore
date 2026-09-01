@@ -23,10 +23,16 @@ public class MinecartEntity extends Entity {
     public double speed = 0.0;        // 当前速度（沿 dir；可负=反向）
     public int throttle = 0;          // 骑乘油门：+1 正向 / -1 反向 / 0 滑行
     public double lastInputYaw = 0.0; // 最近一次 vehicle_move 上报的玩家朝向
+    /** Bug24: 骑乘时客户端权威 —— 收到 vehicle_move 后置 true, 服务端跳过自行物理模拟。 */
+    public boolean clientDriven = false;
     public double fuel = 0.0;         // furnace_minecart 燃料剩余 tick
     public int[] invIds;              // chest/hopper 存储（暂未接 hopper 自动传输）
     public int[] invCounts;
     public boolean dead = false;
+    /** Bug24: 推力冷却(刻) —— 玩家持续贴着矿车时每 5 刻才施加一次推力, 防推力与回中力逐刻对抗抖动。 */
+    public int pushCooldown = 0;
+    /** Bug24: 客户端权威骑乘的宽限期(刻), 每次 vehicle_move 刷新为 10。 */
+    public int clientDrivenGrace = 0;
 
     public MinecartEntity(int id, String variant, double x, double y, double z) {
         super(id, 0, x, y, z);
@@ -78,6 +84,7 @@ public class MinecartEntity extends Entity {
     public void tick() {
         if (dead) return;
         if (fireTicks > 0) fireTicks--;
+        if (pushCooldown > 0) pushCooldown--;
 
         // TNT 矿车：踩在通电激活轨 -> 引爆
         if ("tnt_minecart".equals(variant)) {
@@ -89,6 +96,16 @@ public class MinecartEntity extends Entity {
                 return;
             }
         }
+
+        // Bug24 二轮: 骑乘时 W/S(throttle!=0) -> 服务端主导物理(油门驱动),
+        // 无输入且客户端在流式同步 -> 采纳客户端位置(空滑不拉扯)。
+        if (clientDriven && passengerEid >= 0 && throttle == 0) {
+            if (--clientDrivenGrace > 0) {
+                updateRider();
+                return;
+            }
+        }
+        clientDriven = false; // 有油门输入/无乘客/超时 -> 服务端物理
 
         int rx = (int) Math.floor(x), rz = (int) Math.floor(z), ry = (int) Math.floor(y);
         int state = WorldManager.getBlockState(dim, rx, ry, rz);
@@ -235,8 +252,13 @@ public class MinecartEntity extends Entity {
                 double ddx = tx - x, ddz = tz - z;
                 double dist = Math.hypot(ddx, ddz);
                 if (canEnter && dist > 1e-6) {
-                    if (dist <= step) { x = tx; z = tz; y = ty; }
-                    else { x += ddx / dist * step; z += ddz / dist * step; y = ty; }
+                    if (step >= dist) { x = tx; z = tz; y = ty; }
+                    else {
+                        x += ddx / dist * step;
+                        z += ddz / dist * step;
+                        // Bug24: 坡道按行进比例渐变抬升(曾直接 y=ty 每格瞬移 1 格 -> 视觉高频抖动)
+                        y += (ty - y) * (step / dist);
+                    }
                 } else {
                     speed = 0;
                 }
@@ -278,31 +300,43 @@ public class MinecartEntity extends Entity {
     private void applyPushFromCollisions(int[][] ports) {
         for (Entity e : EntityManager.getEntities().values()) {
             if (e == this || e.dim != dim || e instanceof MinecartEntity) continue;
-            tryPushOnRail(e.x, e.y, e.z, e.width, e.height, ports);
+            tryPushOnRail(e.x, e.y, e.z, e.width, e.height, ports, Double.NaN);
         }
         for (NetworkHandler p : NetworkHandler.players.values()) {
             if (p.eid == passengerEid || p.currentDim != dim) continue;
-            tryPushOnRail(p.x, p.y, p.z, 0.6, 1.8, ports);
+            tryPushOnRail(p.x, p.y, p.z, 0.6, 1.8, ports, p.yaw);
         }
     }
 
-    private void tryPushOnRail(double ex, double ey, double ez, double ew, double eh, int[][] ports) {
+    private void tryPushOnRail(double ex, double ey, double ez, double ew, double eh, int[][] ports, double pusherYaw) {
         double dx = x - ex, dz = z - ez;
         if (Math.abs(y - ey) > (height / 2 + eh / 2) + 0.5) return;
         double dist = Math.hypot(dx, dz);
         double minDist = (width / 2 + ew / 2) + 0.05;
-        if (dist > minDist + 0.25 || dist < 1e-4) return;
-        double pdx = dx / dist, pdz = dz / dist; // 推离推动者方向
-        double best = -1; int bdx = dirX, bdz = dirZ;
+        // Bug24 修复: 只在真正碰撞重叠(dist < minDist)时推车。曾放宽到 minDist+0.25,
+        // 玩家/生物只是站在矿车旁边(未接触)也每刻被判定为"推" -> 空车原地高频抖动。
+        if (dist >= minDist || dist < 1e-4) return;
+        // Bug24: 推车方向 = 推动者视线方向在轨轴上的投影(原版玩家推车语义)。
+        // 曾用"推离推动者"的径向方向 -> 侧向贴脸时径向垂直轨轴不推(无法开动),
+        // 正对时又与回中力逐刻对抗(高频抖动)。
+        double pdx, pdz;
+        if (!Double.isNaN(pusherYaw)) {
+            pdx = -Math.sin(Math.toRadians(pusherYaw));
+            pdz = Math.cos(Math.toRadians(pusherYaw));
+        } else {
+            pdx = dx / dist;
+            pdz = dz / dist;
+        }
+        if (pushCooldown > 0) return;
+        double best = -2; int bdx = dirX, bdz = dirZ;
         for (int[] p : ports) {
             double dot = pdx * p[0] + pdz * p[1];
             if (dot > best) { best = dot; bdx = p[0]; bdz = p[1]; }
         }
-        if (best <= 0.05) return; // 推离方向与任一轨轴不顺, 不推(避免卡死)
+        if (best <= 0.3) return; // 视线与轨轴几乎垂直, 不推
+        pushCooldown = 5;
         dirX = bdx; dirZ = bdz;
-        double sgn = speed >= 0 ? 1 : -1;
-        if (speed == 0) sgn = 1;
-        speed = sgn * Math.min(0.6, Math.max(Math.abs(speed), 0.12));
+        speed = Math.min(0.35, Math.max(Math.abs(speed), 0.16));
     }
 
     private void applyPushOffRail() {
@@ -321,7 +355,7 @@ public class MinecartEntity extends Entity {
         if (Math.abs(y - ey) > (height / 2 + eh / 2) + 0.5) return;
         double dist = Math.hypot(dx, dz);
         double minDist = (width / 2 + ew / 2) + 0.05;
-        if (dist > minDist + 0.25 || dist < 1e-4) return;
+        if (dist >= minDist || dist < 1e-4) return; // Bug24: 同上, 仅真实重叠才推
         double pdx = dx / dist, pdz = dz / dist;
         vx += pdx * 0.06; vz += pdz * 0.06;
         double sp = Math.hypot(vx, vz);

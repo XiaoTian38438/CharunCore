@@ -20,6 +20,35 @@ public class JigsawPlacement {
             int heightmapY,
             long seed,
             java.util.function.IntBinaryOperator terrainHeightAt) {
+        return addPieces(templateManager, startPoolId, maxDepth, 80,
+            startX, startY, startZ, heightmapY, seed, terrainHeightAt);
+    }
+
+    /** 完整版：maxDistance = 原版 max_distance_from_center（试炼密室=116, 其余默认 80）。 */
+    public static List<PoolElementStructurePiece> addPieces(
+            StructureTemplateManager templateManager,
+            String startPoolId,
+            int maxDepth,
+            int maxDistance,
+            int startX, int startY, int startZ,
+            int heightmapY,
+            long seed,
+            java.util.function.IntBinaryOperator terrainHeightAt) {
+        return addPieces(templateManager, startPoolId, maxDepth, maxDistance,
+            startX, startY, startZ, heightmapY, seed, terrainHeightAt, java.util.Map.of());
+    }
+
+    /** Bug15: 带 pool_aliases 的完整版(每个 start 决议一次别名映射)。 */
+    public static List<PoolElementStructurePiece> addPieces(
+            StructureTemplateManager templateManager,
+            String startPoolId,
+            int maxDepth,
+            int maxDistance,
+            int startX, int startY, int startZ,
+            int heightmapY,
+            long seed,
+            java.util.function.IntBinaryOperator terrainHeightAt,
+            java.util.Map<String, String> poolAliases) {
 
         RandomSource random = new LegacyRandomSource(seed);
         Rotation rotation = Rotation.values()[random.nextInt(4)];
@@ -47,11 +76,10 @@ public class JigsawPlacement {
 
         if (maxDepth <= 0) return pieces;
 
-        int maxDistance = 80;
         int minY = -64, maxY = 320;
 
         Placer placer = new Placer(templateManager, maxDepth, random, pieces, maxDistance,
-                minY, maxY, heightmapY, centerX, centerZ, terrainHeightAt);
+                minY, maxY, heightmapY, centerX, centerZ, terrainHeightAt, poolAliases);
         placer.tryPlacingChildren(rootPiece, 0);
 
         while (!placer.queue.isEmpty()) {
@@ -93,12 +121,14 @@ public class JigsawPlacement {
         int heightmapY; // 基准高度（根片段使用），子片段可能覆盖
         final int centerX, centerZ;
         final java.util.function.IntBinaryOperator terrainHeightAt; // (x,z) → 表面Y
+        final java.util.Map<String, String> poolAliases; // Bug15: pool_aliases 决议结果
         final Queue<PieceState> queue = new LinkedList<>();
 
         Placer(StructureTemplateManager templateManager, int maxDepth, RandomSource random,
                List<PoolElementStructurePiece> pieces, int maxDistance, int minY, int maxY,
                int heightmapY, int centerX, int centerZ,
-               java.util.function.IntBinaryOperator terrainHeightAt) {
+               java.util.function.IntBinaryOperator terrainHeightAt,
+               java.util.Map<String, String> poolAliases) {
             this.templateManager = templateManager;
             this.maxDepth = maxDepth;
             this.random = random;
@@ -110,6 +140,7 @@ public class JigsawPlacement {
             this.centerX = centerX;
             this.centerZ = centerZ;
             this.terrainHeightAt = terrainHeightAt;
+            this.poolAliases = poolAliases == null ? java.util.Map.of() : poolAliases;
         }
 
         void tryPlacingChildren(PoolElementStructurePiece parentPiece, int depth) {
@@ -145,7 +176,11 @@ public class JigsawPlacement {
 
                 String poolId = parentJigsaw.pool();
                 if (poolId == null) continue;
-                StructureTemplatePool pool = StructureTemplatePool.get(poolId);
+                // Bug15: 经 pool_aliases 映射(试炼密室 spawner/contents/* 等)
+                String mappedPool = poolId.startsWith("minecraft:")
+                    ? poolId.substring(10) : poolId;
+                mappedPool = poolAliases.getOrDefault(mappedPool, mappedPool);
+                StructureTemplatePool pool = StructureTemplatePool.get(mappedPool);
                 if (pool == null || pool.size() == 0) continue;
                 if (depth == 0 && DEBUG)
                     System.out.println("[DBG] parentJigsaw front=" + parentJigsaw.frontFacing()
@@ -250,8 +285,8 @@ public class JigsawPlacement {
                                 ? parentPiece.getGroundLevelDelta() - (deltaToParentMinY + frontDy - childJigsawY)
                                 : candidate.getGroundLevelDelta();
 
-                            // 安全上限：防止极端种子下片段数失控（正常村庄远小于此值）
-                            if (pieces.size() >= 512) continue;
+                            // 安全上限：防止极端种子下片段数失控(试炼密室 size=20 可达数百片段)
+                            if (pieces.size() >= 1024) continue;
 
                             PoolElementStructurePiece childPiece = new PoolElementStructurePiece(
                                 candidate, childPosX, childPosY + moveDy, childPosZ,

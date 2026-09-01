@@ -18,6 +18,7 @@ public class BlockManager {
     private static final Map<String, Integer>  ITEM_STACK       = new HashMap<>();
     private static final Map<String, java.util.Set<Integer>> blockHarvestTools = new HashMap<>();
     private static final Map<String, Integer> enchantNameToId  = new HashMap<>();
+    private static final Map<Integer, String> enchantIdToName  = new HashMap<>();
     private static final java.util.Set<String> fortuneableBlocks = new java.util.HashSet<>();
 
     /**
@@ -58,6 +59,30 @@ public class BlockManager {
         loadItems();
         loadEnchantments();
         loadHardness();
+        loadCollisionShapes();
+    }
+
+    // Bug47: 方块名 -> 碰撞形状 id (0 = 无碰撞箱,如火把/红石粉/花/水)
+    private static final java.util.Map<String, Integer> COLLISION_SHAPES = new java.util.HashMap<>();
+
+    private static void loadCollisionShapes() {
+        try (FileReader r = new FileReader(Paths.get("json", "1.21.11", "blockCollisionShapes.json").toString())) {
+            com.google.gson.JsonObject root = com.google.gson.JsonParser.parseReader(r).getAsJsonObject();
+            JsonObject blocks = root.getAsJsonObject("blocks");
+            for (String k : blocks.keySet()) {
+                String name = k.startsWith("minecraft:") ? k.substring(10) : k;
+                COLLISION_SHAPES.put(name, blocks.get(k).getAsInt());
+            }
+        } catch (Exception e) {
+            System.err.println("[数据] blockCollisionShapes.json 加载失败: " + e.getMessage());
+        }
+    }
+
+    /** 该方块是否有碰撞箱(用于"不能放在玩家脚下"判定; 火把/红石粉等无碰撞方块原版可放脚下)。 */
+    public static boolean hasCollision(String name) {
+        if (name == null) return false;
+        Integer id = COLLISION_SHAPES.get(name.startsWith("minecraft:") ? name.substring(10) : name);
+        return id != null && id != 0;
     }
 
     /** 从 json/1.21.11/blocks.json 载入全部方块原版硬度 (花/火把/拉杆等 hardness=0 → 可徒手秒破)。 */
@@ -116,6 +141,7 @@ public class BlockManager {
                 String name = o.get("name").getAsString();
                 if (name.startsWith("minecraft:")) name = name.substring(10);
                 enchantNameToId.put(name, id);
+                enchantIdToName.put(id, name);
             }
             System.out.println("[数据] 已加载 " + enchantNameToId.size() + " 个附魔定义");
         } catch (Exception e) {
@@ -173,6 +199,11 @@ public class BlockManager {
         if (name == null) return -1;
         if (name.startsWith("minecraft:")) name = name.substring(10);
         return enchantNameToId.getOrDefault(name, -1);
+    }
+
+    /** 附魔 id → 名称（供铁砧合并等需要按 id 查最大等级的场景）。 */
+    public static String getEnchantName(int id) {
+        return enchantIdToName.get(id);
     }
 
     public static boolean isFortuneable(String blockName) {

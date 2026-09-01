@@ -34,6 +34,10 @@ public class MobEntity extends LivingEntity {
     private static final int BABY_MATURE = 2400;
     /** 距离最近玩家 >32 格后累计的存活刻数, 用于随机消失判定。 */
     public int despawnCounter = 0;
+    /** #30 修复: 是否计入"敌对生物上限"并随敌对生物一起消失。末地末影人/下界僵尸猪灵等
+     *  中立生物经敌对刷怪器生成, 原版仍占用末地/下界怪物上限且会消失; 曾仅按 isHostile()
+     *  判定 -> 这类中立怪不计数也不消失 -> 末地末影人无限刷。生成时置 true。 */
+    public boolean countsHostile = false;
     /** BUG8: 上次广播给客户端的"着火"状态, 仅在状态翻转时重发, 避免每 tick 刷包。 */
     private boolean lastFireBroadcast = false;
     /** 猪灵以物易物: 拾取金锭后倒计时(原版 120 tick=6 秒), 到 0 吐出战利品; -1=未拾取。 */

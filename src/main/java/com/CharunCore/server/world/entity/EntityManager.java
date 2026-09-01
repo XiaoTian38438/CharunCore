@@ -98,6 +98,12 @@ public class EntityManager {
         }
     }
 
+    /** Bug60: 仅移除客户端跟踪记录(不删实体) —— 玩家死亡移除模型后,
+     *  重生时 syncTracking 会因 seen 不含该 id 而重新发送 spawn。 */
+    public static void removeTrackingEverywhere(int eid) {
+        for (Set<Integer> seen : trackingFor.values()) seen.remove(eid);
+    }
+
     /** 只读访问全部实体(繁殖配对搜索用)。 */
     public static java.util.Map<Integer, Entity> getEntities() {
         return entities;
@@ -124,7 +130,7 @@ public class EntityManager {
             if (handler.ctx == null || handler.currentDim != mob.dim) continue;
             Set<Integer> seen = trackingFor.get(handler);
             if (seen == null || !seen.contains(mob.id)) continue;
-            handler.sendPacket(handler.ctx, 0x61, pb -> {
+            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(mob.id);
                 pb.writeByte(17);
                 pb.writeVarInt(8);
@@ -207,7 +213,7 @@ public class EntityManager {
             Set<Integer> seen = trackingFor.get(handler);
             if (seen == null || !seen.contains(e.id)) continue;
             if (e instanceof ItemFrameEntity frame) {
-                handler.sendPacket(handler.ctx, 0x61, pb -> {
+                handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                     pb.writeVarInt(e.id);
                     pb.writeByte(8);
                     pb.writeVarInt(7);
@@ -215,7 +221,7 @@ public class EntityManager {
                     pb.writeByte(0xFF);
                 });
             } else if (e instanceof MobEntity mob) {
-                handler.sendPacket(handler.ctx, 0x61, pb -> {
+                handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                     pb.writeVarInt(e.id);
                     pb.writeByte(9);
                     pb.writeVarInt(3);
@@ -262,7 +268,7 @@ public class EntityManager {
     /** 自然消失: 远离所有玩家的敌对生物按原版节奏消失(>128 格立即消失, 32~128 格随机消失)。 */
     private static void despawnMobs() {
         for (Entity e : new java.util.ArrayList<>(entities.values())) {
-            if (!(e instanceof MobEntity m) || !m.isHostile()) continue;
+            if (!(e instanceof MobEntity m) || !countsAsHostile(m)) continue;
             double nearest = Double.MAX_VALUE;
             for (NetworkHandler p : NetworkHandler.players.values()) {
                 if (p.isDead) continue;
@@ -396,7 +402,7 @@ public class EntityManager {
             int cap = hostileCapFor(dim);
             int mobCount = 0;
             for (Entity e : entities.values()) {
-                if (!(e instanceof MobEntity m) || !m.isHostile() || e.dim != dim) continue;
+                if (!(e instanceof MobEntity m) || !countsAsHostile(m) || e.dim != dim) continue;
                 double dx = e.x - player.x;
                 double dz = e.z - player.z;
                 if (dx * dx + dz * dz < 128 * 128) mobCount++;
@@ -422,7 +428,8 @@ public class EntityManager {
                 // 末地特例: 末影人无视光照生成(原版 EndSpawner 行为, 末地中央岛天空光=15 恒亮)。
                 if (light > 7 && dim != DimensionType.THE_END) continue;
 
-                if (hostileCountInChunk(dim, sx >> 4, sz >> 4) >= 8) continue; // per-chunk 上限
+                int perChunkCap = dim == DimensionType.THE_END ? 5 : 8;
+                if (hostileCountInChunk(dim, sx >> 4, sz >> 4) >= perChunkCap) continue; // per-chunk 上限
 
                 String[] pool = hostilePoolFor(dim, biomeAt(dim, sx, sz));
                 String type = pool[spawnRng.nextInt(pool.length)];
@@ -431,10 +438,22 @@ public class EntityManager {
                         && !endSpawnSpace(dim, sx, sy, sz)) continue;
                 MobEntity mob = new MobEntity(allocateId(), type, sx + 0.5, sy, sz + 0.5);
                 mob.dim = dim;
+                mob.countsHostile = true; // #30: 经敌对刷怪器生成的中立怪(末影人/僵尸猪灵)计入上限并消失
                 addEntity(mob);
                 done++;
             }
         }
+    }
+
+    
+    /** Bug30: 计入敌对容量/消失判定的统一谓词。末影人等中立生物按名称计入,
+     *  否则旧实体(未设 countsHostile)既不占上限也永不消失 -> 末地无限堆积。 */
+    private static boolean countsAsHostile(MobEntity m) {
+        if (m.isHostile() || m.countsHostile) return true;
+        return switch (m.entityName) {
+            case "enderman", "zombified_piglin", "piglin", "piglin_brute" -> true;
+            default -> false;
+        };
     }
 
     private static void trySpawnPassiveMobs() {
@@ -486,7 +505,10 @@ public class EntityManager {
     private static int hostileCapFor(DimensionType dim) {
         return switch (dim) {
             case THE_NETHER -> 40;
-            case THE_END -> 30;
+            // Bug30 二次收紧: 截图显示末地城区域末影人仍然爆多。
+            // 末地敌对怪只有末影人一种 -> 全部容量都是它, 且每区块 8 只上限
+            // 在城市跨几十区块时叠加成百只。降到 20/5 接近原版观感。
+            case THE_END -> 20;
             default -> 50;
         };
     }
@@ -494,7 +516,7 @@ public class EntityManager {
     private static int hostileCountInChunk(DimensionType dim, int cx, int cz) {
         int n = 0;
         for (Entity e : entities.values()) {
-            if (!(e instanceof MobEntity m) || !m.isHostile() || e.dim != dim) continue;
+            if (!(e instanceof MobEntity m) || !countsAsHostile(m) || e.dim != dim) continue;
             if (((int) Math.floor(e.x) >> 4) == cx && ((int) Math.floor(e.z) >> 4) == cz) n++;
         }
         return n;
@@ -507,10 +529,19 @@ public class EntityManager {
         return chunk.getBiome(wx & 15, wz & 15);
     }
 
-    /** 按维度 + 生物群系(项目自有 biome id)选择敌对种群权重池。 */
+    /** 按维度 + 生物群系(项目自有 biome id)选择敌对种群权重池。
+     *  Bug50: 原版烈焰人只从下界要塞刷怪笼生成, 不在任何自然生成列表 -> 已从下界池移除;
+     *  下界按群系分池(原版 biomes spawns): 荒地=僵尸猪灵/恶魂, 灵魂沙谷=骷髅/恶魂/末影人,
+     *  绯红森林=疣猪兽/猪灵/僵尸猪灵, 诡异森林=末影人, 玄武岩三角洲=岩浆怪/恶魂。 */
     private static String[] hostilePoolFor(DimensionType dim, int biomeId) {
         if (dim == DimensionType.THE_NETHER)
-            return new String[]{"zombified_piglin", "magma_cube", "blaze", "ghast"};
+            return switch (biomeId) {
+                case 49 -> new String[]{"skeleton", "skeleton", "skeleton", "ghast", "enderman", "enderman"}; // soul_sand_valley
+                case 7  -> new String[]{"hoglin", "hoglin", "zombified_piglin", "zombified_piglin", "piglin"}; // crimson_forest
+                case 59 -> new String[]{"enderman", "enderman", "enderman", "enderman"};                       // warped_forest
+                case 2  -> new String[]{"magma_cube", "magma_cube", "magma_cube", "ghast"};                    // basalt_deltas
+                default -> new String[]{"zombified_piglin", "zombified_piglin", "zombified_piglin", "ghast"};  // nether_wastes
+            };
         if (dim == DimensionType.THE_END)
             return new String[]{"enderman", "enderman", "enderman"};
         return switch (biomeId) {
@@ -580,10 +611,18 @@ public class EntityManager {
             e.dxMove = e.x - e.prevX;
             e.dyMove = e.y - e.prevY;
             e.dzMove = e.z - e.prevZ;
+            // Bug2 补充: 亚毫米级抖动(水中物品/生物物理的浮点残差)归零,
+            // 否则静止实体每 tick 仍发增量包造成网络洪泛。
+            if (Math.abs(e.dxMove) < 0.0005) e.dxMove = 0.0;
+            if (Math.abs(e.dyMove) < 0.0005) e.dyMove = 0.0;
+            if (Math.abs(e.dzMove) < 0.0005) e.dzMove = 0.0;
             // 仅当位移过大(>4 格)或首次同步(prevX 全 0)才用 full teleport(0x23);
             // 朝向变化由 entity_move_look(0x34) 携带, 不再触发全量传送。
             boolean tp = Math.abs(e.dxMove) > 4.0 || Math.abs(e.dyMove) > 4.0 || Math.abs(e.dzMove) > 4.0
                 || (e.prevX == 0.0 && e.prevY == 0.0 && e.prevZ == 0.0);
+            // Bug18: 每 60 tick 对所有实体错峰重锚定一次(原版 ClientboundTeleportEntity 同步周期)。
+            // 曾只发相对增量 -> 客户端本地模拟与服务端积分发散, 水中掉落物"看得见捡不到"。
+            if (com.CharunCore.server.Main.worldAge % 60 == e.id % 60) tp = true;
             e.needsTeleport = tp;
             e.needHeadRot = (e.yaw != e.prevYaw);
         }
@@ -698,7 +737,7 @@ public class EntityManager {
 
         if (e instanceof ItemFrameEntity frame) {
             // 元数据: Item (index 8, Slot)
-            handler.sendPacket(handler.ctx, 0x61, pb -> {
+            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(e.id);
                 pb.writeByte(8);
                 pb.writeVarInt(7);
@@ -706,7 +745,7 @@ public class EntityManager {
                 pb.writeByte(0xFF);
             });
         } else if (e instanceof ItemEntity item) {
-            handler.sendPacket(handler.ctx, 0x61, pb -> {
+            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(e.id);
                 pb.writeByte(8);
                 pb.writeVarInt(7);
@@ -715,7 +754,7 @@ public class EntityManager {
             });
         } else if ("tnt".equals(e.typeName)) {
             // 引爆 TNT: FUSE 元数据(index 8, INT), 客户端据此渲染闪烁与缩放
-            handler.sendPacket(handler.ctx, 0x61, pb -> {
+            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(e.id);
                 pb.writeByte(8);
                 pb.writeVarInt(1);
@@ -723,7 +762,7 @@ public class EntityManager {
                 pb.writeByte(0xFF);
             });
         } else if (e instanceof MobEntity mob) {
-            handler.sendPacket(handler.ctx, 0x61, pb -> {
+            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(e.id);
                 // Entry 1: flags (index 0, byte) — 含 ON_FIRE 位(0x01), 使燃烧中的生物一出生就显示火焰
                 pb.writeByte(0);
@@ -735,7 +774,29 @@ public class EntityManager {
                 pb.writeFloat(mob.health);
                 pb.writeByte(0xFF);
             });
+            sendMobEquipment(handler, mob, e.id);
         }
+    }
+
+    /** Bug55: skeleton-family spawn with weapon (entity_equipment 0x65, topBitSetTerminatedArray).
+     *  Never sent equipment -> skeletons rendered empty-handed ("melee like zombies"). */
+    private static void sendMobEquipment(NetworkHandler handler, MobEntity mob, int entityId) {
+        int itemId;
+        switch (mob.entityName) {
+            case "skeleton", "stray" -> itemId = com.CharunCore.server.utils.BlockManager.getItemIdByName("bow");
+            case "wither_skeleton" -> itemId = com.CharunCore.server.utils.BlockManager.getItemIdByName("stone_sword");
+            default -> { return; }
+        }
+        if (itemId <= 0) return;
+        final int fid = itemId;
+        handler.sendPacket(handler.ctx, 0x65, pb -> {
+            pb.writeVarInt(entityId);
+            // topBitSetTerminatedArray: high bit of slot byte = more entries follow
+            pb.getBuffer().writeByte(0x80); // slot 0 = main hand, more follow
+            pb.writeSlot(fid, 1);
+            pb.getBuffer().writeByte(0x00); // slot 1 = off hand empty, last entry
+            pb.writeSlot(0, 0);
+        });
     }
 
     /** BUG8: 向所有追踪该实体的客户端广播"着火"状态位(index 0 的 0x01 位)。
@@ -745,7 +806,7 @@ public class EntityManager {
             if (handler.ctx == null || handler.currentDim != e.dim) continue;
             Set<Integer> seen = trackingFor.get(handler);
             if (seen == null || !seen.contains(e.id)) continue;
-            handler.sendPacket(handler.ctx, 0x61, pb -> {
+            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(e.id);
                 pb.writeByte(0);    // metadata index 0
                 pb.writeVarInt(0);  // type = byte
@@ -839,7 +900,7 @@ public class EntityManager {
                 }
             });
             if (e instanceof MobEntity mob) {
-                handler.sendPacket(handler.ctx, 0x61, pb -> {
+                handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                     pb.writeVarInt(e.id);
                     pb.writeByte(9);
                     pb.writeVarInt(3);
@@ -861,7 +922,7 @@ public class EntityManager {
             if (handler.ctx == null || handler.currentDim != e.dim) continue;
             Set<Integer> seen = trackingFor.get(handler);
             if (seen == null || !seen.contains(e.id)) continue;
-            handler.sendPacket(handler.ctx, 0x61, pb -> {
+            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(e.id);
                 pb.writeByte(16);
                 pb.writeVarInt(1);
@@ -969,6 +1030,9 @@ public class EntityManager {
             case "slime" -> 117;
             case "small_fireball" -> 118;
             case "snowball" -> 120;
+            case "splash_potion" -> 105;     // splash potion 投掷物
+            case "lingering_potion" -> 106;  // lingering potion 投掷物
+            case "experience_bottle" -> 48;
             case "snow_golem" -> 121;
             case "spider" -> 124;
             case "squid" -> 127;

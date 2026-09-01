@@ -24,6 +24,12 @@ public class ArrowEntity extends Entity {
     public int piercing = 0;
     /** 已被穿透命中的实体 id, 避免重复命中同一目标。 */
     public Set<Integer> piercedIds = new HashSet<>();
+    /** Bug42: 力量(power)附魔加成 —— 结算时按速度格数乘 0.25×(lvl+1) 追加。 */
+    public double bonusDamage = 0.0;
+    /** Bug42: 冲击(punch)附魔击退强度(0=无)。 */
+    public int knockbackStrength = 0;
+    /** Bug42: 火矢(flame)点燃目标。 */
+    public int fireTicks = 0;
 
     private int life = 0;
     private int stuckTicks = 0;
@@ -137,16 +143,18 @@ public class ArrowEntity extends Entity {
 
     private void onHitEntity(Object target) {
         double speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
-        int dmg = (int) Math.ceil(Math.min(2.147483647E9, speed * baseDamage));
+        int dmg = (int) Math.ceil(Math.min(2.147483647E9, speed * (baseDamage + bonusDamage)));
         if (isCritical) dmg += 1 + (int) (Math.random() * (dmg / 2 + 1));
         if (dmg < 1) dmg = 1;
+        double kb = knockbackStrength > 0 ? 0.6 + 0.25 * knockbackStrength : 0.6;
 
         if (target instanceof NetworkHandler player) {
             // 命中玩家: 走护甲/盾牌/吸收心统一结算
             player.damagePlayer(dmg, "arrow", x, z);
+            if (fireTicks > 0 && !player.isDead) player.ignite(fireTicks);
             double horiz = Math.sqrt(vx * vx + vz * vz);
             if (horiz > 0.001 && !player.isDead) {
-                player.knockback(vx / horiz * 0.6, vz / horiz * 0.6, 0.1);
+                player.knockback(vx / horiz * kb, vz / horiz * kb, 0.1);
             }
             if (shooter != null) {
                 shooter.sendSoundAt("minecraft:entity.arrow.hit_player", x, y, z, 1.0f, 1.2f);
@@ -163,11 +171,12 @@ public class ArrowEntity extends Entity {
         }
 
         target2.damage(dmg, "arrow");
+        if (fireTicks > 0) target2.fireTicks = Math.max(target2.fireTicks, fireTicks);
 
         double horiz = Math.sqrt(vx * vx + vz * vz);
         if (horiz > 0.001 && !(target2 instanceof EnderDragonEntity)) {
-            target2.vx += vx / horiz * 0.6;
-            target2.vz += vz / horiz * 0.6;
+            target2.vx += vx / horiz * kb;
+            target2.vz += vz / horiz * kb;
         }
 
         if (shooter != null) {

@@ -12,16 +12,14 @@ public abstract class ShiftNoise {
 
     public static double compute(DensityFunction.NoiseHolder noise, FunctionContext ctx,
                                  boolean swapCoordOrder) {
+        // 原版 ShiftNoise.compute(d,d2,d3) = offset.getValue(d*0.25, d2*0.25, d3*0.25) * 4
+        // ShiftA: compute(blockX, 0, blockZ)；ShiftB: compute(blockZ, blockX, 0)
+        // —— B 把交换坐标放进 X/Y 槽（Z=0），不是 X/Z 槽，否则采样的是噪声的另一切片。
         int bx = ctx.blockX();
         int bz = ctx.blockZ();
-        double x, z;
         if (swapCoordOrder) {
-            x = bz * 0.25;
-            z = bx * 0.25;
-        } else {
-            x = bx * 0.25;
-            z = bz * 0.25;
+            return noise.getValue(bz * 0.25, bx * 0.25, 0.0) * 4.0;
         }
-        return noise.getValue(x, 0.0, z) * 4.0;
+        return noise.getValue(bx * 0.25, 0.0, bz * 0.25) * 4.0;
     }
 }

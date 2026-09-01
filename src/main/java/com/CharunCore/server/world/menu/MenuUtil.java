@@ -121,7 +121,7 @@ public final class MenuUtil {
 
     /** 信标可选主/副效果协议 id（对齐 MobEffect 协议 id）。 */
     public static int[] beaconEffects() {
-        return new int[]{1,3,5,8,10,11,12,13,14}; // speed,haste,strength,jump_boost,regeneration,resistance,fire_resistance,water_breathing,night_vision
+        return new int[]{0,2,4,7,9,10,11,12,15}; // speed,haste,strength,jump_boost,regeneration,resistance,fire_resistance,water_breathing,night_vision (0 基注册表 id)
     }
 
     /** 锻造台升级模板物品名。 */

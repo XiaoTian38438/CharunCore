@@ -22,12 +22,50 @@ public final class ContainerStore {
         public final int[] slots = new int[54];
         public volatile boolean loaded = false;
         public volatile int version = 0;
-        // P9-B4: 每格物品的 NBT 组件（附魔/药水/自定义数据等），key = 槽位索引(0..26)
-        public final java.util.Map<Integer, byte[]> slotComponents = new java.util.concurrent.ConcurrentHashMap<>();
+        // Bug4/33 修复: 每格物品的 NBT 组件（附魔/药水/自定义名/耐久），原仅存 id+count ->
+        // 放入箱子的附魔书/药水重进后丢失全部 NBT。
+        public final SlotMeta meta = new SlotMeta(27);
+        public void clearChestSlot(int s) {
+            slots[2 * s] = 0; slots[2 * s + 1] = 0;
+            meta.clear(s);
+        }
+        public void setChestSlot(int s, int id, int cnt, int dmg,
+                java.util.Map<Integer, Integer> ench, String pot, String name) {
+            slots[2 * s] = id; slots[2 * s + 1] = cnt;
+            meta.slotDamage[s] = dmg;
+            meta.slotEnchants[s] = ench == null ? new java.util.HashMap<>() : new java.util.HashMap<>(ench);
+            meta.slotPotion[s] = pot; meta.slotCustomName[s] = name;
+        }
+    }
+
+    /** Bug4/33: 通用每槽组件并行数组(附魔/药水/自定义名/耐久)。熔炉/漏斗/发射器/
+     *  酿造台/切石机/砂轮/锻造台/附魔台等容器共用, 与 ChestData 的离散字段语义一致。 */
+    public static final class SlotMeta {
+        public final int n;
+        public final int[] slotDamage;
+        public final java.util.Map<Integer, Integer>[] slotEnchants;
+        public final String[] slotPotion;
+        public final String[] slotCustomName;
+        public SlotMeta(int n) {
+            this.n = n;
+            this.slotDamage = new int[n];
+            this.slotEnchants = new java.util.HashMap[n];
+            this.slotPotion = new String[n];
+            this.slotCustomName = new String[n];
+            for (int i = 0; i < n; i++) slotEnchants[i] = new java.util.HashMap<>();
+        }
+        public void clear(int s) {
+            slotDamage[s] = 0; slotEnchants[s].clear(); slotPotion[s] = null; slotCustomName[s] = null;
+        }
+        public boolean has(int s) {
+            return slotDamage[s] > 0 || !slotEnchants[s].isEmpty()
+                    || slotPotion[s] != null || slotCustomName[s] != null;
+        }
     }
 
     public static final class FurnaceData {
         public final int[] slots = new int[6];
+        public final SlotMeta meta = new SlotMeta(3);
         public volatile int cookTime = 0;
         public volatile int cookTotal = 200;
         public volatile int burnTime = 0;     // 剩余燃烧时间 (litTime)
@@ -41,6 +79,7 @@ public final class ContainerStore {
 
     public static final class HopperData {
         public final int[] slots = new int[10];
+        public final SlotMeta meta = new SlotMeta(5);
         public volatile int version = 0;
         public volatile int transferCd = 0; // 每 8 tick 传输 1 个物品
         public volatile boolean loaded = false;
@@ -49,13 +88,15 @@ public final class ContainerStore {
     /** 锻造台: 原版 4 槽 → 0=template(下界合金升级模板), 1=base(钻石装备), 2=addition(下界合金锭), 3=result。 */
     public static final class SmithingData {
         public final int[] slots = new int[8]; // 4 槽 (id,count 并行)
-        public volatile int outTrimMaterial = 0;  // #19 纹饰: 输出 trim 材料 id (-1 无)
-        public volatile int outTrimPattern = 0;   // #19 纹饰: 输出 trim 图案 id (-1 无)
+        public final SlotMeta meta = new SlotMeta(4);
+        public volatile int outTrimMaterial = -1;  // #19 纹饰: 输出 trim 材料 id (-1 无; 0=紫水晶是合法 id!)
+        public volatile int outTrimPattern = -1;   // #19 纹饰: 输出 trim 图案 id (-1 无)
         public volatile int version = 0;
     }
 
     public static final class EnchantingData {
         public final int[] slots = new int[6]; // 0=item, 1=lapis, 2=result(preview)
+        public final SlotMeta meta = new SlotMeta(2);
         public volatile int[] optionEnchant = new int[3]; // 各选项主附魔 id (0=无)
         public volatile int[] optionLevel = new int[3];
         public volatile int[] optionCost = new int[3];    // 各选项所需 xp 等级
@@ -76,6 +117,7 @@ public final class ContainerStore {
         public volatile boolean payment = false;   // 是否有支付物 (杏矿/金块等)
         public volatile boolean updating = false;  // 当前是否处于“确认中”
         public final int[] paymentSlot = new int[2]; // #15 支付物槽 (id, count) — 原版 SimpleContainer(1)
+        public final SlotMeta meta = new SlotMeta(1);
         public volatile int version = 0;
     }
 
@@ -126,7 +168,8 @@ public final class ContainerStore {
     }
 
     public static final class BrewingData {
-        public final int[] slots = new int[10]; // 0-2=瓶子, 3=材料, 4=燃料
+        public final int[] slots = new int[10]; // 0-2=瓶子, 3=燃料(烈焰粉), 4=材料
+        public final SlotMeta meta = new SlotMeta(5); // Bug4/33: 各槽附魔/自定义名/耐久
         public final String[] potionType = new String[3]; // 每个瓶子槽的药水效果字符串
         public volatile int brewTime = 0;
         public volatile int brewTotal = 400;
@@ -155,6 +198,7 @@ public final class ContainerStore {
 
     public static final class DispenserData {
         public final int[] slots = new int[18]; // 9 槽 (id,count 并行)
+        public final SlotMeta meta = new SlotMeta(9);
         public volatile int version = 0;
         public volatile boolean loaded = false;
     }
@@ -164,12 +208,14 @@ public final class ContainerStore {
     // ── P5-#2: 切石机 / 砂轮 (进阶制造) ──
     public static final class StonecutterData {
         public final int[] slots = new int[4]; // 0=input, 1=result
+        public final SlotMeta meta = new SlotMeta(2);
         public volatile int selectedIndex = -1;   // 当前选中配方索引 (-1=未选)
         public volatile int[] candidates = new int[0]; // #18 全部可行切制产物 (左侧样式列表)
         public volatile int version = 0;
     }
     public static final class GrindstoneData {
         public final int[] slots = new int[6]; // 0=inA, 1=inB, 2=result
+        public final SlotMeta meta = new SlotMeta(3);
         public volatile int version = 0;
     }
     private static final Map<Pos, StonecutterData> STONECUTTERS = new ConcurrentHashMap<>();
@@ -199,31 +245,16 @@ public final class ContainerStore {
 
     /** 首次访问时从区块 block entity 的 Items 载入 (结构生成/旧存档的发射器内容物)。 */
     private static void loadDispenserFromBE(Pos p, DispenserData d) {
-        try {
-            Chunk chunk =
-                WorldManager.getChunk(p.dim(), p.x() >> 4, p.z() >> 4);
-            if (chunk == null) return;
-            org.cloudburstmc.nbt.NbtMap be = chunk.getBlockEntity(p.x() & 15, p.y(), p.z() & 15);
-            if (be == null) return;
-            org.cloudburstmc.nbt.NbtList items = be.containsKey("Items")
-                ? (org.cloudburstmc.nbt.NbtList) be.get("Items") : null;
-            if (items == null) return;
-            for (int i = 0; i < items.size() && i < 9; i++) {
-                org.cloudburstmc.nbt.NbtMap item = (org.cloudburstmc.nbt.NbtMap) items.get(i);
-                String iname = item.getString("id");
-                if (iname == null) continue;
-                iname = iname.startsWith("minecraft:") ? iname.substring(10) : iname;
-                int id = BlockManager.getItemIdByName(iname);
-                if (id <= 0) continue;
-                int cnt = item.containsKey("Count") ? item.getByte("Count") : 1;
-                int slot = item.containsKey("Slot") ? item.getByte("Slot") : i;
-                if (slot >= 0 && slot < 9) { d.slots[slot * 2] = id; d.slots[slot * 2 + 1] = cnt; }
-            }
-        } catch (Exception ignored) {}
+        loadPairedFromBE(p, d.slots, 9, d.meta);
     }
 
     /** 通用: 从区块 BE 的 Items 载入 (id,count) 并行数组容器 (漏斗/酿造台)。 */
     private static void loadPairedFromBE(Pos p, int[] slots, int slotCount) {
+        loadPairedFromBE(p, slots, slotCount, null);
+    }
+
+    /** Bug4/33: 载入时解析每槽 components(附魔/药水/自定义名/耐久), 与 writeContainerBlockEntity 对称。 */
+    private static void loadPairedFromBE(Pos p, int[] slots, int slotCount, SlotMeta meta) {
         try {
             Chunk chunk =
                 WorldManager.getChunk(p.dim(), p.x() >> 4, p.z() >> 4);
@@ -244,14 +275,48 @@ public final class ContainerStore {
                 if (slot >= 0 && slot < slotCount) {
                     slots[slot * 2] = id;
                     slots[slot * 2 + 1] = cnt;
+                    if (meta != null && item.containsKey("components")) {
+                        PlayerDataManager.ItemComps c = PlayerDataManager.parseItemComponents(item);
+                        meta.slotDamage[slot] = c.damage();
+                        meta.slotEnchants[slot] = c.enchants() == null ? new java.util.HashMap<>() : new java.util.HashMap<>(c.enchants());
+                        meta.slotPotion[slot] = c.potion();
+                        meta.slotCustomName[slot] = c.customName();
+                    }
                 }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    /** 酿造台载入: 复用 loadPairedFromBE 读瓶子/燃料/材料槽, 同时把瓶子 tag.potion 还原到 potionType。 */
+    private static void loadBrewingFromBE(Pos p, BrewingData d) {
+        loadPairedFromBE(p, d.slots, 5, d.meta);
+        try {
+            Chunk chunk = WorldManager.getChunk(p.dim(), p.x() >> 4, p.z() >> 4);
+            if (chunk == null) return;
+            org.cloudburstmc.nbt.NbtMap be = chunk.getBlockEntity(p.x() & 15, p.y(), p.z() & 15);
+            if (be == null || !be.containsKey("Items")) return;
+            org.cloudburstmc.nbt.NbtList items = (org.cloudburstmc.nbt.NbtList) be.get("Items");
+            for (int i = 0; i < items.size(); i++) {
+                org.cloudburstmc.nbt.NbtMap item = (org.cloudburstmc.nbt.NbtMap) items.get(i);
+                int slot = item.containsKey("Slot") ? item.getByte("Slot", (byte) i) : i;
+                if (slot < 0 || slot > 2) continue;             // 仅 3 个瓶子槽带效果
+                String potion = null;
+                if (item.containsKey("tag")) {
+                    org.cloudburstmc.nbt.NbtMap tag = (org.cloudburstmc.nbt.NbtMap) item.get("tag");
+                    if (tag.containsKey("potion")) {
+                        potion = tag.getString("potion");
+                        if (potion != null && potion.startsWith("minecraft:")) potion = potion.substring(10);
+                    }
+                }
+                if (potion == null) potion = d.meta.slotPotion[slot]; // Bug8: components 形式回读
+                if (potion != null) d.potionType[slot] = potion;
             }
         } catch (Exception ignored) {}
     }
 
     /** 熔炉: 内容物 + 烧炼/燃烧进度一起从 BE 载入。 */
     private static void loadFurnaceFromBE(Pos p, FurnaceData d) {
-        loadPairedFromBE(p, d.slots, 3);
+        loadPairedFromBE(p, d.slots, 3, d.meta);
         try {
             Chunk chunk =
                 WorldManager.getChunk(p.dim(), p.x() >> 4, p.z() >> 4);
@@ -281,11 +346,15 @@ public final class ContainerStore {
                 if (id <= 0 || cnt <= 0) continue;
                 String iname = BlockManager.itemIdToName(id);
                 if (iname == null) continue;
-                items.add(org.cloudburstmc.nbt.NbtMap.builder()
+                org.cloudburstmc.nbt.NbtMapBuilder ib = org.cloudburstmc.nbt.NbtMap.builder()
                     .putByte("Slot", (byte) i)
                     .putString("id", iname.startsWith("minecraft:") ? iname : "minecraft:" + iname)
-                    .putByte("Count", (byte) Math.min(64, cnt))
-                    .build());
+                    .putByte("Count", (byte) Math.min(64, cnt));
+                if (d.meta.has(i)) {
+                    ib.putCompound("components", PlayerDataManager.buildItemComponents(iname,
+                        d.meta.slotDamage[i], d.meta.slotEnchants[i], d.meta.slotPotion[i], d.meta.slotCustomName[i]));
+                }
+                items.add(ib.build());
             }
             org.cloudburstmc.nbt.NbtMap existing = chunk.getBlockEntity(p.x() & 15, p.y(), p.z() & 15);
             org.cloudburstmc.nbt.NbtMapBuilder b = org.cloudburstmc.nbt.NbtMap.builder();
@@ -344,10 +413,35 @@ public final class ContainerStore {
         }
         ChestData created = CHESTS.computeIfAbsent(p, k -> new ChestData());
         if (!created.loaded) {
-            loadPairedFromBE(p, created.slots, 27);
+            loadChestFromBE(p, created);
             created.loaded = true;
         }
         return created;
+    }
+
+    /** 箱子/木桶/潜影盒: 从区块 BE 的 Items 载入 (id,count) + 组件(附魔/药水/自定义名/耐久)。 */
+    private static void loadChestFromBE(Pos p, ChestData d) {
+        try {
+            Chunk chunk = WorldManager.getChunk(p.dim(), p.x() >> 4, p.z() >> 4);
+            if (chunk == null) return;
+            org.cloudburstmc.nbt.NbtMap be = chunk.getBlockEntity(p.x() & 15, p.y(), p.z() & 15);
+            if (be == null || !be.containsKey("Items")) return;
+            org.cloudburstmc.nbt.NbtList items = (org.cloudburstmc.nbt.NbtList) be.get("Items");
+            for (int i = 0; i < items.size(); i++) {
+                org.cloudburstmc.nbt.NbtMap item = (org.cloudburstmc.nbt.NbtMap) items.get(i);
+                String iname = item.getString("id");
+                if (iname == null) continue;
+                iname = iname.startsWith("minecraft:") ? iname.substring(10) : iname;
+                int id = BlockManager.getItemIdByName(iname);
+                if (id <= 0) continue;
+                int cnt = item.containsKey("Count") ? item.getByte("Count", (byte) 1) : 1;
+                if (cnt <= 0) cnt = 1;
+                int slot = item.containsKey("Slot") ? item.getByte("Slot", (byte) i) : i;
+                if (slot < 0 || slot >= 27) continue;
+                PlayerDataManager.ItemComps c = PlayerDataManager.parseItemComponents(item);
+                d.setChestSlot(slot, id, cnt, c.damage(), c.enchants(), c.potion(), c.customName());
+            }
+        } catch (Exception ignored) {}
     }
 
     private static Pos findChestPartner(Pos p) {
@@ -546,19 +640,47 @@ public final class ContainerStore {
             Object d = e.getValue();
             int[] slots;
             int ver;
-            if (d instanceof ChestData cd) { slots = cd.slots; ver = cd.version; }
-            else if (d instanceof FurnaceData fd) { slots = fd.slots; ver = fd.version; }
-            else if (d instanceof HopperData hd) { slots = hd.slots; ver = hd.version; }
-            else if (d instanceof BrewingData bd) { slots = bd.slots; ver = bd.version; }
+            SlotMeta meta;
+            int count;
+            if (d instanceof ChestData cd) {
+                slots = cd.slots; ver = cd.version; meta = cd.meta; count = 27;
+            } else if (d instanceof FurnaceData fd) { slots = fd.slots; ver = fd.version; meta = fd.meta; count = 3; }
+            else if (d instanceof HopperData hd) { slots = hd.slots; ver = hd.version; meta = hd.meta; count = 5; }
+            else if (d instanceof BrewingData bd) {
+                slots = bd.slots; ver = bd.version; count = 5;
+                meta = new SlotMeta(5);
+                for (int i = 0; i < 5; i++) {
+                    meta.slotDamage[i] = bd.meta.slotDamage[i];
+                    meta.slotEnchants[i] = bd.meta.slotEnchants[i];
+                    meta.slotCustomName[i] = bd.meta.slotCustomName[i];
+                    meta.slotPotion[i] = (i < 3 && bd.potionType[i] != null) ? bd.potionType[i] : bd.meta.slotPotion[i];
+                }
+            }
             else continue;
             Integer last = LAST_FLUSH_VERSION.get(p);
             if (last != null && last == ver) continue;
             LAST_FLUSH_VERSION.put(p, ver);
-            int count = (d instanceof ChestData) ? 27 : (d instanceof HopperData) ? 5
-                    : (d instanceof FurnaceData) ? 3 : 5;
-            writeContainerBlockEntity(p, slots, count);
+            writeContainerBlockEntity(p, slots, count, meta);
+            // Bug8: 酿造台瓶子槽的药水类型(potionType)也要落盘(原仅 UI 关闭时持久化)
+            if (d instanceof BrewingData bd) writeBrewingState(p, bd);
             if (d instanceof FurnaceData fd) writeFurnaceState(p, fd);
         }
+    }
+
+    /** 酿造台进度/燃料持久化到区块 BE (周期 flush 用; Items 由 writeContainerBlockEntity 写)。 */
+    private static void writeBrewingState(Pos p, BrewingData d) {
+        try {
+            Chunk chunk = WorldManager.getChunk(p.dim(), p.x() >> 4, p.z() >> 4);
+            if (chunk == null) return;
+            org.cloudburstmc.nbt.NbtMap be = chunk.getBlockEntity(p.x() & 15, p.y(), p.z() & 15);
+            if (be == null) return;
+            org.cloudburstmc.nbt.NbtMapBuilder b = org.cloudburstmc.nbt.NbtMap.builder();
+            for (String k : be.keySet()) b.put(k, be.get(k));
+            b.putInt("BrewTime", d.brewTime);
+            b.putShort("Fuel", (short) d.fuelTime);
+            b.putShort("FuelTotal", (short) d.fuelTotal);
+            chunk.setBlockEntity(p.x() & 15, p.y(), p.z() & 15, b.build());
+        } catch (Exception ignored) {}
     }
 
     /** 熔炉烧炼/燃烧进度持久化到区块 BE。 */
@@ -591,11 +713,20 @@ public final class ContainerStore {
                 if (id <= 0 || cnt <= 0) continue;
                 String iname = BlockManager.itemIdToName(id);
                 if (iname == null) continue;
-                items.add(org.cloudburstmc.nbt.NbtMap.builder()
+                org.cloudburstmc.nbt.NbtMapBuilder ib = org.cloudburstmc.nbt.NbtMap.builder()
                         .putByte("Slot", (byte) i)
                         .putString("id", iname.startsWith("minecraft:") ? iname : "minecraft:" + iname)
-                        .putByte("Count", (byte) Math.min(127, cnt))
-                        .build());
+                        .putByte("Count", (byte) Math.min(127, cnt));
+                // #8 修复: 瓶子效果走标准 components(potion_contents)。
+                // 曾把内部效果串("night_vision|0|3600")直接写进 tag.potion —— 那不是合法
+                // 原版药水 id, 客户端悬浮瓶渲染成"不可合成的药水"。
+                if (i < 3) {
+                    String eff = d.potionType[i];
+                    if (eff != null && !eff.isEmpty()) {
+                        ib.putCompound("components", PlayerDataManager.buildItemComponents(iname, 0, null, eff, null));
+                    }
+                }
+                items.add(ib.build());
             }
             org.cloudburstmc.nbt.NbtMap existing = chunk.getBlockEntity(p.x() & 15, p.y(), p.z() & 15);
             org.cloudburstmc.nbt.NbtMapBuilder b = org.cloudburstmc.nbt.NbtMap.builder();
@@ -619,6 +750,12 @@ public final class ContainerStore {
     }
 
     private static void writeContainerBlockEntity(Pos p, int[] slots, int count) {
+        writeContainerBlockEntity(p, slots, count, null);
+    }
+
+    /** Bug4/33: 落盘时把每槽组件(附魔/药水/自定义名/耐久)一并写入 Items NBT,
+     *  否则箱子附魔物品重启掉附魔、酿造台药水重启变白瓶。 */
+    private static void writeContainerBlockEntity(Pos p, int[] slots, int count, SlotMeta meta) {
         try {
             Chunk chunk =
                     WorldManager.getChunk(p.dim(), p.x() >> 4, p.z() >> 4);
@@ -629,11 +766,16 @@ public final class ContainerStore {
                 if (id <= 0 || cnt <= 0) continue;
                 String iname = BlockManager.itemIdToName(id);
                 if (iname == null) continue;
-                items.add(org.cloudburstmc.nbt.NbtMap.builder()
+                org.cloudburstmc.nbt.NbtMapBuilder ib = org.cloudburstmc.nbt.NbtMap.builder()
                         .putByte("Slot", (byte) i)
                         .putString("id", iname.startsWith("minecraft:") ? iname : "minecraft:" + iname)
-                        .putByte("Count", (byte) Math.min(127, cnt))
-                        .build());
+                        .putByte("Count", (byte) Math.min(127, cnt));
+                if (meta != null && meta.has(i)) {
+                    String pot = meta.slotPotion[i];
+                    ib.putCompound("components", PlayerDataManager.buildItemComponents(iname,
+                            meta.slotDamage[i], meta.slotEnchants[i], pot, meta.slotCustomName[i]));
+                }
+                items.add(ib.build());
             }
             org.cloudburstmc.nbt.NbtMap existing = chunk.getBlockEntity(p.x() & 15, p.y(), p.z() & 15);
             org.cloudburstmc.nbt.NbtMapBuilder b = org.cloudburstmc.nbt.NbtMap.builder();
@@ -687,9 +829,7 @@ public final class ContainerStore {
     }
 
     public static HopperData hopper(Pos p) {
-        HopperData d = HOPPERS.computeIfAbsent(p, k -> new HopperData());
-        if (!d.loaded) { loadPairedFromBE(p, d.slots, 5); d.loaded = true; }
-        return d;
+        return HOPPERS.computeIfAbsent(p, k -> new HopperData());
     }
 
     public static HopperData peekHopper(Pos p) {
@@ -726,7 +866,7 @@ public final class ContainerStore {
 
     public static BrewingData brewing(Pos p) {
         BrewingData d = BREWINGS.computeIfAbsent(p, k -> new BrewingData());
-        if (!d.loaded) { loadPairedFromBE(p, d.slots, 5); d.loaded = true; }
+        if (!d.loaded) { loadBrewingFromBE(p, d); d.loaded = true; }
         return d;
     }
 
@@ -736,6 +876,8 @@ public final class ContainerStore {
 
     public static SmithingData removeSmithing(Pos p) { return SMITHINGS.remove(p); }
     public static EnchantingData removeEnchanting(Pos p) { return ENCHANTINGS.remove(p); }
+    public static StonecutterData removeStonecutter(Pos p) { return STONECUTTERS.remove(p); }
+    public static GrindstoneData removeGrindstone(Pos p) { return GRINDSTONES.remove(p); }
     public static AnvilData removeAnvil(Pos p) { return ANVILS.remove(p); }
     public static BrewingData removeBrewing(Pos p) { return BREWINGS.remove(p); }
     public static BeaconData beacon(Pos p) { return BEACONS.computeIfAbsent(p, k -> new BeaconData()); }
@@ -773,12 +915,18 @@ public final class ContainerStore {
     // ── 漏斗自动传输 ──────────────────────────────────────
     private static final class ContainerRef {
         final int[] slots;
+        final SlotMeta meta; // 可为 null(不跟踪组件)
         final int slotCount;
         final int type; // 0=chest, 1=hopper, 2=furnace, 3=brewing
         final Pos pos;
 
         ContainerRef(int[] slots, int slotCount, int type, Pos pos) {
+            this(slots, null, slotCount, type, pos);
+        }
+
+        ContainerRef(int[] slots, SlotMeta meta, int slotCount, int type, Pos pos) {
             this.slots = slots;
+            this.meta = meta;
             this.slotCount = slotCount;
             this.type = type;
             this.pos = pos;
@@ -819,15 +967,15 @@ public final class ContainerStore {
         int st = WorldManager.getBlockState(p.dim(), p.x(), p.y(), p.z());
         String name = BlockStateHelper.getName(st);
         return switch (name) {
-            case "chest", "trapped_chest", "barrel" -> new ContainerRef(chest(p).slots, 27, 0, p);
+            case "chest", "trapped_chest", "barrel" -> new ContainerRef(chest(p).slots, chest(p).meta, 27, 0, p);
             default -> {
                 if (name != null && name.endsWith("_shulker_box"))
-                    yield new ContainerRef(chest(p).slots, 27, 0, p);
+                    yield new ContainerRef(chest(p).slots, chest(p).meta, 27, 0, p);
                 yield switch (name) {
-                    case "hopper" -> new ContainerRef(hopper(p).slots, 5, 1, p);
-                    case "furnace", "blast_furnace", "smoker" -> new ContainerRef(furnace(p, name).slots, 3, 2, p);
-                    case "brewing_stand" -> new ContainerRef(brewing(p).slots, 5, 3, p);
-                    case "dispenser", "dropper" -> new ContainerRef(dispenser(p).slots, 9, 4, p);
+                    case "hopper" -> new ContainerRef(hopper(p).slots, hopper(p).meta, 5, 1, p);
+                    case "furnace", "blast_furnace", "smoker" -> new ContainerRef(furnace(p, name).slots, furnace(p, name).meta, 3, 2, p);
+                    case "brewing_stand" -> new ContainerRef(brewing(p).slots, brewing(p).meta, 5, 3, p);
+                    case "dispenser", "dropper" -> new ContainerRef(dispenser(p).slots, dispenser(p).meta, 9, 4, p);
                     default -> null;
                 };
             }
@@ -849,14 +997,24 @@ public final class ContainerStore {
             if (!src.extractable(i)) continue;
             int id = src.idAt(i), c = src.countAt(i);
             if (id <= 0 || c <= 0) continue;
+            boolean hasMeta = src.meta != null && src.meta.has(i);
+            // Bug4/33: 带组件的物品(附魔/药水/改名)不与普通堆合并, 只整组移入空槽并携带组件
             for (int j = 0; j < dst.slotCount; j++) {
                 if (!dst.insertable(j, id)) continue;
                 int dj = dst.idAt(j), dc = dst.countAt(j);
-                if (dj == id && dc > 0 && dc < 64) {
+                if (!hasMeta && dj == id && dc > 0 && dc < 64) {
                     dst.setCount(j, dc + 1); src.dec(i); return true;
                 }
                 if (dj == 0 && dc == 0) {
-                    dst.setId(j, id); dst.setCount(j, 1); src.dec(i); return true;
+                    dst.setId(j, id); dst.setCount(j, 1); 
+                    if (src.meta != null && dst.meta != null) {
+                        dst.meta.slotDamage[j] = src.meta.slotDamage[i];
+                        dst.meta.slotEnchants[j] = new java.util.HashMap<>(src.meta.slotEnchants[i]);
+                        dst.meta.slotPotion[j] = src.meta.slotPotion[i];
+                        dst.meta.slotCustomName[j] = src.meta.slotCustomName[i];
+                    }
+                    if (src.meta != null) src.meta.clear(i);
+                    src.dec(i); return true;
                 }
             }
         }
@@ -886,14 +1044,22 @@ public final class ContainerStore {
                 }
                 if (slot >= 0) {
                     int add = Math.min(item.count, 64 - h.slots[2*slot+1]);
-                    if (h.slots[2*slot] == 0) h.slots[2*slot] = item.itemId;
-                    h.slots[2*slot+1] += add;
-                    h.version++;
+                    if (h.slots[2*slot] == 0) {
+                        h.slots[2*slot] = item.itemId;
+                        // Bug4/33: 掉落物携带的组件随物品进入漏斗槽
+                        h.meta.slotDamage[slot] = item.itemDamage;
+                        h.meta.slotEnchants[slot] = item.itemEnchants == null
+                            ? new java.util.HashMap<>() : new java.util.HashMap<>(item.itemEnchants);
+                        h.meta.slotPotion[slot] = item.itemPotion;
+                        h.meta.slotCustomName[slot] = item.itemCustomName;
+                    }
                     if (add >= item.count) {
                         EntityManager.removeEntity(item.id);
                     } else {
                         item.count -= add;
                     }
+                    h.slots[2*slot+1] += add;
+                    h.version++;
                     h.transferCd = 8;
                     NetworkHandler.broadcastContainerUpdate(pos); // #28 实时动效
                     return;
@@ -931,6 +1097,7 @@ public final class ContainerStore {
     }
 
     private static int[] facingDelta(String facing) {
+        if (facing == null) return null; // 漏斗方块已卸载/被移除时 getProp 返回 null(曾 switch(null) 直接 NPE)
         return switch (facing) {
             case "north" -> new int[] { 0, 0, -1 };
             case "south" -> new int[] { 0, 0, 1 };
@@ -1043,24 +1210,27 @@ public final class ContainerStore {
     private static void tickBrewing(Pos pos, BrewingData b) {
         // #12 修复: 原版 BrewingStandMenu 槽位 = 0-2 瓶子 / 3 燃料(烈焰粉) / 4 材料。
         // 曾把槽3(燃料)当材料、槽4(材料)当燃料 -> 烈焰粉放燃料位被当材料、材料放材料位
-        // 被当燃料 -> 永远无法酿造。现按原版: 槽3=slots[6/7]燃料, 槽4=slots[8/9]材料。
-        // ── 燃料 (槽 3) ──
-        int fuelId = b.slots[6], fuelCount = b.slots[7];
+        // 被当燃料 -> 永远无法酿造。现按原版: 槽3=slots[6/7]材料, 槽4=slots[8/9]燃料。
+        // Bug8 二修: 原版 1.21.11 BrewingStandMenu 布局是 0-2 瓶子 / 3=材料(IngredientSlot) /
+        // 4=燃料(FuelSlot) —— 曾按 3=燃料/4=材料 理解, 烈焰粉进了材料格、材料进了燃料格,
+        // 酿造永远无法启动(实测"烈焰粉不消耗/无动效/东西不消失")。
+        // ── 材料 (槽 3 → slots[6/7]) ──
+        int ingId = b.slots[6], ingCount = b.slots[7];
+        String ingName = BlockManager.itemIdToName(ingId);
+
+        // ── 燃料 (槽 4 → slots[8/9]) ──
+        int fuelId = b.slots[8], fuelCount = b.slots[9];
         String fuelName = BlockManager.itemIdToName(fuelId);
         if (b.fuelTime <= 0) {
             if (fuelCount > 0 && BrewingSystem.isFuel(fuelName)) {
-                b.slots[7] = fuelCount - 1;
-                if (b.slots[7] <= 0) { b.slots[6] = 0; b.slots[7] = 0; }
+                b.slots[9] = fuelCount - 1;
+                if (b.slots[9] <= 0) { b.slots[8] = 0; b.slots[9] = 0; }
                 b.fuelTime = 8000; b.fuelTotal = 8000;
                 b.version++;
             }
         } else {
             b.fuelTime--;
         }
-
-        // 材料 (槽 4)
-        int ingId = b.slots[8], ingCount = b.slots[9];
-        String ingName = BlockManager.itemIdToName(ingId);
 
         if (b.brewTime <= 0) {
             if (ingCount > 0 && b.fuelTime > 0) {
@@ -1072,17 +1242,17 @@ public final class ContainerStore {
                         if (BrewingSystem.canBrew(bn, ingName, b.potionType[s])) { canBrew = true; break; }
                     }
                 }
-                if (canBrew) { b.brewTime = 1; b.brewTotal = 400; }
+                // 原版 brewTime 从 400 倒数到 0, 客户端箭头按该值渲染(曾正数递增 -> 箭头反向)
+                if (canBrew) { b.brewTime = 400; b.brewTotal = 400; b.version++; }
             }
         } else {
-            b.brewTime++;
-            if (b.brewTime >= b.brewTotal) {
+            b.brewTime--;
+            if (b.brewTime <= 0) {
                 b.brewTime = 0;
                 // 原版: 每次酿造消耗 1 个材料(在 3 个瓶子都处理完时)。
-                // 曾误扣 slots[7](燃料数量) -> 酿造完扣的是烈焰粉、材料原地不动。
                 if (ingCount > 0) {
-                    b.slots[9] = ingCount - 1;
-                    if (b.slots[9] <= 0) { b.slots[8] = 0; b.slots[9] = 0; }
+                    b.slots[7] = ingCount - 1;
+                    if (b.slots[7] <= 0) { b.slots[6] = 0; b.slots[7] = 0; }
                 }
                 for (int s = 0; s <= 2; s++) {
                     int bid = b.slots[s * 2], bct = b.slots[s * 2 + 1];

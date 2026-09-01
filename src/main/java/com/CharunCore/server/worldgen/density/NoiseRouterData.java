@@ -408,11 +408,25 @@ public final class NoiseRouterData {
         return DensityFunctions.interpolated(DensityFunctions.rangeChoice(y, minY, (maxY + 1), df, DensityFunctions.constant(elseReturn)));
     }
 
+    /** 原版 NormalNoise.createLegacyNetherBiome(LegacyRandomSource(seed+idx), params(-7,[1,1]))。 */
+    private static DensityFunction shiftedLegacyNetherBiomeNoise(String key,
+                                                                 DensityFunction shiftX, DensityFunction shiftZ, int idx) {
+        com.CharunCore.server.world.gen.LegacyRandomSource rnd =
+            new com.CharunCore.server.world.gen.LegacyRandomSource(DensityFunction.NoiseHolder.worldSeed() + idx);
+        com.CharunCore.server.world.gen.NormalNoise.NoiseParameters params =
+            new com.CharunCore.server.world.gen.NormalNoise.NoiseParameters(-7, new double[]{1.0, 1.0});
+        com.CharunCore.server.world.gen.NormalNoise noise =
+            new com.CharunCore.server.world.gen.NormalNoise(rnd, params, false);
+        return new ShiftedNoise2D(shiftX, shiftZ, 0.25, new DensityFunction.NoiseHolder(key, params, noise));
+    }
+
     private static NoiseRouter noNewCaves(java.util.Map<String, DensityFunction> map, DensityFunction df) {
         DensityFunction shiftX = getFunction(map, SHIFT_X);
         DensityFunction shiftZ = getFunction(map, SHIFT_Z);
-        DensityFunction temperature = DensityFunctions.shiftedNoise2d("minecraft:temperature", shiftX, shiftZ, 0.25, NoiseParameters.get("minecraft:temperature"));
-        DensityFunction vegetation = DensityFunctions.shiftedNoise2d("minecraft:vegetation", shiftX, shiftZ, 0.25, NoiseParameters.get("minecraft:vegetation"));
+        // 原版 RandomState.NoiseWiringHelper：legacy_random_source 维度（下界）的温度/植被
+        // 噪声替换为 LegacyRandomSource(seed+0/+1) 驱动的 createLegacyNetherBiome 实例。
+        DensityFunction temperature = shiftedLegacyNetherBiomeNoise("minecraft:temperature", shiftX, shiftZ, 0);
+        DensityFunction vegetation = shiftedLegacyNetherBiomeNoise("minecraft:vegetation", shiftX, shiftZ, 1);
         DensityFunction postProcessed = postProcess(df);
         DensityFunction z = DensityFunctions.zero();
         return new NoiseRouter(z, z, z, z, temperature, vegetation,

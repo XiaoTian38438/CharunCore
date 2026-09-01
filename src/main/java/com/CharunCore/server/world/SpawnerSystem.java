@@ -36,12 +36,18 @@ public final class SpawnerSystem {
         int minDelay;
         int maxDelay;
         int spawnCount;
+        int maxNearby;
 
         SpawnerData(String[] types, int minDelay, int maxDelay, int spawnCount) {
+            this(types, minDelay, maxDelay, spawnCount, 6);
+        }
+
+        SpawnerData(String[] types, int minDelay, int maxDelay, int spawnCount, int maxNearby) {
             this.types = types;
             this.minDelay = minDelay;
             this.maxDelay = Math.max(minDelay, maxDelay);
             this.spawnCount = Math.max(1, spawnCount);
+            this.maxNearby = Math.max(1, maxNearby);
             this.delay = minDelay + RND.nextInt(Math.max(1, this.maxDelay - minDelay + 1));
         }
     }
@@ -60,9 +66,10 @@ public final class SpawnerSystem {
     /** 读取刷怪笼方块 NBT 配置；无 NBT 或解析失败则用默认种群。 */
     private static SpawnerData readOrCreate(DimensionType dim, int x, int y, int z) {
         String[] types = null;
-        int minDelay = 20 + RND.nextInt(40);
-        int maxDelay = 200 + RND.nextInt(400);
+        int minDelay = 200 + RND.nextInt(200);
+        int maxDelay = 400 + RND.nextInt(400);
         int spawnCount = 4;
+        int maxNearby = 6;
         try {
             var chunk = WorldManager.getChunk(dim, x >> 4, z >> 4);
             if (chunk != null) {
@@ -71,19 +78,25 @@ public final class SpawnerSystem {
                     if (be.containsKey("MinSpawnDelay")) minDelay = be.getInt("MinSpawnDelay", minDelay);
                     if (be.containsKey("MaxSpawnDelay")) maxDelay = be.getInt("MaxSpawnDelay", maxDelay);
                     if (be.containsKey("SpawnCount")) spawnCount = be.getInt("SpawnCount", spawnCount);
+                    if (be.containsKey("MaxNearbyEntities")) maxNearby = be.getInt("MaxNearbyEntities", maxNearby);
                     if (be.containsKey("SpawnPotentials")) {
                         List<NbtMap> pots = be.getList("SpawnPotentials", NbtType.COMPOUND);
                         List<String> tl = new ArrayList<>();
                         for (NbtMap m : pots) {
                             NbtMap data = m.getCompound("data");
-                            String id = entityIdFromNbt(data.getString("id", ""));
+                            // 1.19.3+: data:{entity:{id}}; 兼容旧 {id} 直写
+                            String id = data.containsKey("entity")
+                                ? entityIdFromNbt(data.getCompound("entity").getString("id", ""))
+                                : entityIdFromNbt(data.getString("id", ""));
                             int w = m.getInt("weight", 1);
                             for (int i = 0; i < Math.max(1, w); i++) tl.add(id);
                         }
                         if (!tl.isEmpty()) types = tl.toArray(new String[0]);
                     } else if (be.containsKey("SpawnData")) {
                         NbtMap sd = be.getCompound("SpawnData");
-                        String id = entityIdFromNbt(sd.getString("id", ""));
+                        String id = sd.containsKey("entity")
+                            ? entityIdFromNbt(sd.getCompound("entity").getString("id", ""))
+                            : entityIdFromNbt(sd.getString("id", ""));
                         if (!id.isEmpty()) types = new String[]{id};
                     }
                 }
@@ -94,7 +107,7 @@ public final class SpawnerSystem {
         // 原版: 空刷怪笼(无 SpawnData 也无 SpawnPotentials) 绝不刷怪,
         // 必须玩家右键刷怪蛋设置 SpawnData 后才刷。故 types 保持 null, tick 中跳过。
         // 不再回退随机类型(否则空笼子也会刷蜘蛛, 违反 #14)。
-        return new SpawnerData(types, minDelay, maxDelay, spawnCount);
+        return new SpawnerData(types, minDelay, maxDelay, spawnCount, maxNearby);
     }
 
     private static String entityIdFromNbt(String id) {
@@ -117,7 +130,8 @@ public final class SpawnerSystem {
             int rz = (int) ((k >> 4) & 15);
             int y = (int) ((k >> 16) - 64);
             int state = chunk.getBlock(rx, y, rz);
-            if (!"spawner".equals(BlockStateHelper.getName(state))) continue;
+            String sn = BlockStateHelper.getName(state);
+            if (!"spawner".equals(sn) && !"trial_spawner".equals(sn)) continue;
             register(dim, chunkX * 16 + rx, y, chunkZ * 16 + rz);
         }
     }
@@ -144,8 +158,9 @@ public final class SpawnerSystem {
             int sy = Integer.parseInt(xyz[1]);
             int sz = Integer.parseInt(xyz[2]);
 
-            // 笼子方块已被移除则清理
-            if (!"spawner".equals(BlockStateHelper.getName(WorldManager.getBlockState(dim, sx, sy, sz)))) {
+            // 笼子方块已被移除则清理(spawner/trial_spawner 均有效)
+            String cbName = BlockStateHelper.getName(WorldManager.getBlockStateCached(dim, sx, sy, sz));
+            if (!"spawner".equals(cbName) && !"trial_spawner".equals(cbName)) {
                 SPAWNERS.remove(e.getKey());
                 continue;
             }
@@ -162,6 +177,19 @@ public final class SpawnerSystem {
 
             // 原版: 仅当已设置 SpawnData(刷怪类型) 才刷怪; 空笼子(types=null)绝不刷。
             if (d.types == null || d.types.length == 0) continue;
+
+            // Bug43: 原版 MaxNearbyEntities —— 笼子周围(原版 2×spawnRange+1 格盒)同类生物
+            // 达上限则本轮不刷。曾无此检查 -> 要塞烈焰人笼高频刷满并漫游出要塞,
+            // 表现为"非要塞区域凭空出现烈焰人"。
+            String firstType = d.types[0];
+            int nearby = 0;
+            for (var me : EntityManager.getEntities().values()) {
+                if (!(me instanceof MobEntity mob)) continue;
+                if (mob.dim != dim || !firstType.equals(mob.typeName)) continue;
+                double mdx = mob.x - sx, mdy = mob.y - sy, mdz = mob.z - sz;
+                if (mdx * mdx + mdy * mdy + mdz * mdz <= 16 * 16 && ++nearby >= d.maxNearby) break;
+            }
+            if (nearby >= d.maxNearby) continue;
 
             int spawned = 0;
             int attempts = 0;

@@ -4,7 +4,7 @@ import com.CharunCore.server.worldgen.WorldGenLevel;
 
 import java.util.List;
 
-public class StructureStart {
+public class StructureStart implements StructureStartLike {
     private final String structureId;
     private final int chunkX;
     private final int chunkZ;

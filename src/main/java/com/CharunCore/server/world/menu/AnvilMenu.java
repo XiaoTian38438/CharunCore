@@ -58,13 +58,25 @@ public final class AnvilMenu {
             cost += 1;
         }
 
-        // 2) 附魔书 / 附魔物品合并（冲突取高等级）
+        // 2) 附魔书 / 附魔物品合并（对齐原版 AnvilMenu 合并规则）：
+        //    同名附魔 —— 取较高者; 若两者等级相等且都低于该附魔最大等级, 则等级 +1(封顶 maxLevel)。
+        //    此前仅 Math.max -> 锋利 II + 锋利 II 仍是 II(原版应为 III), 与原版不符(#12)。
         boolean rightIsBook = "enchanted_book".equals(rightName);
         if (rightId > 0 && (rightIsBook || !ad.rightEnchants.isEmpty())) {
             for (Map.Entry<Integer, Integer> e : ad.rightEnchants.entrySet()) {
                 int id = e.getKey(), lvl = e.getValue();
                 int cur = outEnch.getOrDefault(id, 0);
-                outEnch.put(id, cur == 0 ? lvl : Math.max(cur, lvl));
+                if (cur == 0) {
+                    outEnch.put(id, lvl);
+                } else {
+                    int maxLvl = com.CharunCore.server.world.EnchantSystem
+                        .getEnchantMaxLevel(com.CharunCore.server.utils.BlockManager.getEnchantName(id));
+                    if (cur == lvl && lvl < maxLvl) {
+                        outEnch.put(id, lvl + 1);   // 同级合并升一级(原版)
+                    } else {
+                        outEnch.put(id, Math.max(cur, lvl));
+                    }
+                }
             }
             cost += rightIsBook ? (1 + outEnch.size()) : 2;
         }

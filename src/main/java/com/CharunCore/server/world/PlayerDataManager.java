@@ -40,6 +40,146 @@ public final class PlayerDataManager {
 
     private PlayerDataManager() {}
 
+    /** 单物品解析出的组件（与设计/读取共用）。 */
+    public record ItemComps(int damage, java.util.Map<Integer, Integer> enchants, String potion, String customName,
+                            int trimMaterial, int trimPattern) {
+        public ItemComps(int damage, java.util.Map<Integer, Integer> enchants, String potion, String customName) {
+            this(damage, enchants, potion, customName, -1, -1);
+        }
+    }
+
+    // Bug44: trim 注册表 id ↔ 原版资源路径 (顺序 = dumped_registries reg_3/reg_4)
+    private static final String[] TRIM_MATERIAL_NAMES = {
+        "amethyst", "copper", "diamond", "emerald", "gold", "iron", "lapis",
+        "netherite", "quartz", "redstone", "resin"
+    };
+    private static final String[] TRIM_PATTERN_NAMES = {
+        "bolt", "coast", "dune", "eye", "flow", "host", "raiser", "rib",
+        "sentry", "shaper", "silence", "snout", "spire", "tide", "vex",
+        "ward", "wayfinder", "wild"
+    };
+
+    /** 构建某物品的 components NBT（附魔/药水/自定义名/耐久/纹饰）。 */
+    public static NbtMap buildItemComponents(String itemName, int damage,
+            java.util.Map<Integer, Integer> enchants, String potion, String customName) {
+        return buildItemComponents(itemName, damage, enchants, potion, customName, -1, -1);
+    }
+
+    public static NbtMap buildItemComponents(String itemName, int damage,
+            java.util.Map<Integer, Integer> enchants, String potion, String customName,
+            int trimMaterial, int trimPattern) {
+        NbtMapBuilder components = NbtMap.builder();
+        if (damage > 0) components.putInt("minecraft:damage", damage);
+        if (enchants != null && !enchants.isEmpty()) {
+            NbtMapBuilder levels = NbtMap.builder();
+            for (java.util.Map.Entry<Integer, Integer> e : enchants.entrySet()) {
+                String en = ENCHANT_ID_TO_NAME.get(e.getKey());
+                if (en != null && e.getValue() > 0) levels.putInt(en, e.getValue());
+            }
+            NbtMap enchantments = NbtMap.builder()
+                    .putCompound("levels", levels.build())
+                    .putBoolean("show_in_tooltip", true)
+                    .build();
+            boolean book = "enchanted_book".equals(itemName);
+            components.putCompound(book ? "minecraft:stored_enchantments" : "minecraft:enchantments", enchantments);
+        }
+        if (potion != null && !potion.isEmpty()) {
+            String[] parts = potion.split("\\|");
+            if (parts.length >= 3) {
+                NbtMapBuilder effect = NbtMap.builder()
+                        .putString("id", "minecraft:" + parts[0])
+                        .putInt("amplifier", Math.max(0, Integer.parseInt(parts[1]) - 1))
+                        .putInt("duration", Integer.parseInt(parts[2]))
+                        .putBoolean("ambient", false)
+                        .putBoolean("show_particles", true);
+                NbtMap contents = NbtMap.builder()
+                        .putList("custom_effects", NbtType.COMPOUND, List.of(effect.build()))
+                        .build();
+                components.putCompound("minecraft:potion_contents", contents);
+            } else {
+                // 原版 PotionContents NBT 形式: {potion:"minecraft:x"}, 仅有类型无自定义效果
+                String p = parts[0].startsWith("minecraft:") ? parts[0] : "minecraft:" + parts[0];
+                components.putCompound("minecraft:potion_contents", NbtMap.builder()
+                        .putString("potion", p).build());
+            }
+        }
+        if (customName != null && !customName.isEmpty()) {
+            components.putString("minecraft:custom_name",
+                    "{\"text\":" + new com.google.gson.Gson().toJson(customName) + "}");
+        }
+        if (trimMaterial >= 0 && trimPattern >= 0
+                && trimMaterial < TRIM_MATERIAL_NAMES.length
+                && trimPattern < TRIM_PATTERN_NAMES.length) {
+            // Bug44: 原版 trim 组件 NBT = {material:"minecraft:x", pattern:"minecraft:y"}
+            components.putCompound("minecraft:trim", NbtMap.builder()
+                    .putString("material", "minecraft:" + TRIM_MATERIAL_NAMES[trimMaterial])
+                    .putString("pattern", "minecraft:" + TRIM_PATTERN_NAMES[trimPattern])
+                    .build());
+        }
+        return components.build();
+    }
+
+    /** 从物品 NBT（含 components 复合标签）解析出组件。 */
+    public static ItemComps parseItemComponents(NbtMap itemNbt) {
+        int damage = 0;
+        java.util.Map<Integer, Integer> enchants = new java.util.HashMap<>();
+        String potion = null;
+        String customName = null;
+        int trimMaterial = -1, trimPattern = -1;
+        NbtMap components = itemNbt.getCompound("components");
+        if (components != null) {
+            if (components.containsKey("minecraft:damage")) damage = components.getInt("minecraft:damage", 0);
+            NbtMap ench = null;
+            if (components.containsKey("minecraft:enchantments")) {
+                ench = components.getCompound("minecraft:enchantments");
+            } else if (components.containsKey("minecraft:stored_enchantments")) {
+                ench = components.getCompound("minecraft:stored_enchantments");
+            }
+            if (ench != null) {
+                NbtMap levels = ench.getCompound("levels");
+                if (levels != null) for (String key : levels.keySet()) {
+                    Integer eid = enchantIdByName(key);
+                    if (eid != null) enchants.put(eid, levels.getInt(key, 0));
+                }
+            }
+            Object potionV = components.get("minecraft:potion_contents");
+            if (potionV instanceof String ps) {
+                // 原版裸字符串形式: 仅有药水类型无自定义效果
+                potion = ps.startsWith("minecraft:") ? ps.substring(10) : ps;
+            } else if (potionV instanceof NbtMap potionC) {
+                String typeOnly = potionC.getString("potion", null);
+                List<NbtMap> effects = potionC.getList("custom_effects", NbtType.COMPOUND);
+                if (effects != null && !effects.isEmpty()) {
+                    NbtMap eff = effects.get(0);
+                    String eidName = eff.getString("id", "speed");
+                    eidName = eidName.startsWith("minecraft:") ? eidName.substring(10) : eidName;
+                    potion = eidName + "|" + (eff.getInt("amplifier", 0) + 1) + "|" + eff.getInt("duration", 3600);
+                } else if (typeOnly != null && !typeOnly.isEmpty()) {
+                    potion = typeOnly.startsWith("minecraft:") ? typeOnly.substring(10) : typeOnly;
+                }
+            }
+            String cn = components.getString("minecraft:custom_name", null);
+            if (cn != null && !cn.isEmpty()) {
+                try {
+                    com.google.gson.JsonObject o = com.google.gson.JsonParser.parseString(cn).getAsJsonObject();
+                    if (o.has("text")) customName = o.get("text").getAsString();
+                } catch (Exception ignored) {}
+            }
+            NbtMap trim = components.getCompound("minecraft:trim");
+            if (trim != null && trim.containsKey("material")) {
+                String m = trim.getString("material", "");
+                String pt = trim.getString("pattern", "");
+                for (int i = 0; i < TRIM_MATERIAL_NAMES.length; i++) {
+                    if (("minecraft:" + TRIM_MATERIAL_NAMES[i]).equals(m)) { trimMaterial = i; break; }
+                }
+                for (int i = 0; i < TRIM_PATTERN_NAMES.length; i++) {
+                    if (("minecraft:" + TRIM_PATTERN_NAMES[i]).equals(pt)) { trimPattern = i; break; }
+                }
+            }
+        }
+        return new ItemComps(damage, enchants, potion, customName, trimMaterial, trimPattern);
+    }
+
     public static void init() {
         new File("world/playerdata").mkdirs();
         new File("world/advancements").mkdirs();
@@ -64,7 +204,7 @@ public final class PlayerDataManager {
                     new DataInputStream(new GZIPInputStream(new FileInputStream(dat))))) {
                 Object tag = in.readTag();
                 if (tag instanceof NbtMap nbt) {
-                    result = fromNbt(nbt);
+                    result = fromNbt(nbt, uuid);
                 }
             } catch (Exception e) {
                 System.err.println("[玩家数据] 读取 " + uuid + ".dat 失败: " + e.getMessage());
@@ -163,58 +303,48 @@ public final class PlayerDataManager {
             item.putInt("Slot", vs);
             item.putString("id", name.startsWith("minecraft:") ? name : "minecraft:" + name);
             item.putInt("count", d.inventoryCounts[slot]);
-            NbtMapBuilder components = NbtMap.builder();
-            if (d.inventoryDamage != null && slot < d.inventoryDamage.length && d.inventoryDamage[slot] > 0) {
-                components.putInt("minecraft:damage", d.inventoryDamage[slot]);
-            }
-            if (d.inventoryEnchants != null && slot < d.inventoryEnchants.length
-                    && d.inventoryEnchants[slot] != null && !d.inventoryEnchants[slot].isEmpty()) {
-                NbtMapBuilder levels = NbtMap.builder();
-                for (Map.Entry<Integer, Integer> e : d.inventoryEnchants[slot].entrySet()) {
-                    String en = ENCHANT_ID_TO_NAME.get(e.getKey());
-                    if (en != null && e.getValue() > 0) levels.putInt(en, e.getValue());
-                }
-                NbtMap enchantments = NbtMap.builder()
-                        .putCompound("levels", levels.build())
-                        .putBoolean("show_in_tooltip", true)
-                        .build();
-                // 附魔书用 stored_enchantments, 普通物品用 enchantments (曾一律写 enchantments
-                // -> 附魔书重进后丢失附魔信息, 只显示"附魔书"三个灰字)。
-                boolean book = "enchanted_book".equals(name);
-                components.putCompound(book ? "minecraft:stored_enchantments" : "minecraft:enchantments", enchantments);
-            }
-            if (d.inventoryPotion != null && slot < d.inventoryPotion.length
-                    && d.inventoryPotion[slot] != null && !d.inventoryPotion[slot].isEmpty()) {
-                String[] parts = d.inventoryPotion[slot].split("\\|");
-                if (parts.length >= 3) {
-                    NbtMapBuilder effect = NbtMap.builder()
-                            .putString("id", "minecraft:" + parts[0])
-                            .putInt("amplifier", Math.max(0, Integer.parseInt(parts[1]) - 1))
-                            .putInt("duration", Integer.parseInt(parts[2]))
-                            .putBoolean("ambient", false)
-                            .putBoolean("show_particles", true);
-                    NbtMap contents = NbtMap.builder()
-                            .putList("custom_effects", NbtType.COMPOUND, List.of(effect.build()))
-                            .build();
-                    components.putCompound("minecraft:potion_contents", contents);
-                }
-            }
-            if (d.inventoryCustomName != null && slot < d.inventoryCustomName.length
-                    && d.inventoryCustomName[slot] != null && !d.inventoryCustomName[slot].isEmpty()) {
-                components.putString("minecraft:custom_name",
-                        "{\"text\":" + new com.google.gson.Gson().toJson(d.inventoryCustomName[slot]) + "}");
-            }
-            NbtMap builtComponents = components.build();
+            NbtMap builtComponents = buildItemComponents(name,
+                d.inventoryDamage != null && slot < d.inventoryDamage.length ? d.inventoryDamage[slot] : 0,
+                d.inventoryEnchants != null && slot < d.inventoryEnchants.length ? d.inventoryEnchants[slot] : null,
+                d.inventoryPotion != null && slot < d.inventoryPotion.length ? d.inventoryPotion[slot] : null,
+                d.inventoryCustomName != null && slot < d.inventoryCustomName.length ? d.inventoryCustomName[slot] : null,
+                d.inventoryTrimMaterial != null && slot < d.inventoryTrimMaterial.length ? d.inventoryTrimMaterial[slot] : -1,
+                d.inventoryTrimPattern != null && slot < d.inventoryTrimPattern.length ? d.inventoryTrimPattern[slot] : -1);
             if (!builtComponents.isEmpty()) item.putCompound("components", builtComponents);
             inventory.add(item.build());
         }
         b.putList("Inventory", NbtType.COMPOUND, inventory);
-        b.putList("EnderItems", NbtType.COMPOUND, List.of());
+        // Bug4/33 修复: 末影箱内容随玩家数据落盘 (原硬编码空列表 -> 末影箱物品永远丢失)。
+        b.putList("EnderItems", NbtType.COMPOUND, buildEnderItems(uuid));
         b.putInt("DataVersion", DATA_VERSION);
         return b.build();
     }
 
-    private static PlayerData fromNbt(NbtMap nbt) {
+    /** 把内存中的末影箱内容序列化为 EnderItems 列表（带组件, 与背包一致）。 */
+    private static List<NbtMap> buildEnderItems(UUID uuid) {
+        List<NbtMap> ender = new ArrayList<>();
+        try {
+            ContainerStore.ChestData ed = ContainerStore.peekEnderChest(uuid);
+            if (ed == null) return ender;
+            for (int s = 0; s < 27; s++) {
+                int id = ed.slots[2 * s], cnt = ed.slots[2 * s + 1];
+                if (id <= 0 || cnt <= 0) continue;
+                String name = BlockManager.itemIdToName(id);
+                if (name == null) continue;
+                NbtMapBuilder item = NbtMap.builder();
+                item.putInt("Slot", s);
+                item.putString("id", name.startsWith("minecraft:") ? name : "minecraft:" + name);
+                item.putInt("count", cnt);
+                NbtMap comps = buildItemComponents(name, ed.meta.slotDamage[s], ed.meta.slotEnchants[s],
+                        ed.meta.slotPotion[s], ed.meta.slotCustomName[s]);
+                if (!comps.isEmpty()) item.putCompound("components", comps);
+                ender.add(item.build());
+            }
+        } catch (Exception ignored) {}
+        return ender;
+    }
+
+    private static PlayerData fromNbt(NbtMap nbt, java.util.UUID uuid) {
         try {
             PlayerData d = new PlayerData();
             List<Double> pos = nbt.getList("Pos", NbtType.DOUBLE);
@@ -259,40 +389,30 @@ public final class PlayerDataManager {
                     if (count <= 0) count = 1;
                     d.inventoryIds[slot] = itemId;
                     d.inventoryCounts[slot] = count;
-                    NbtMap components = item.getCompound("components");
-                    if (components == null) continue;
-                    if (components.containsKey("minecraft:damage")) {
-                        d.inventoryDamage[slot] = components.getInt("minecraft:damage", 0);
-                    }
-                    NbtMap ench = components.getCompound("minecraft:enchantments");
-                    if (ench == null) ench = components.getCompound("minecraft:stored_enchantments");
-                    if (ench != null) {
-                        NbtMap levels = ench.getCompound("levels");
-                        if (levels != null) {
-                            for (String key : levels.keySet()) {
-                                Integer eid = enchantIdByName(key);
-                                if (eid != null) d.inventoryEnchants[slot].put(eid, levels.getInt(key, 0));
-                            }
-                        }
-                    }
-                    NbtMap potion = components.getCompound("minecraft:potion_contents");
-                    if (potion != null) {
-                        List<NbtMap> effects = potion.getList("custom_effects", NbtType.COMPOUND);
-                        if (effects != null && !effects.isEmpty()) {
-                            NbtMap eff = effects.get(0);
-                            String eidName = eff.getString("id", "speed");
-                            eidName = eidName.startsWith("minecraft:") ? eidName.substring(10) : eidName;
-                            d.inventoryPotion[slot] = eidName + "|" + (eff.getInt("amplifier", 0) + 1)
-                                    + "|" + eff.getInt("duration", 3600);
-                        }
-                    }
-                    String customName = components.getString("minecraft:custom_name", null);
-                    if (customName != null && !customName.isEmpty()) {
-                        try {
-                            com.google.gson.JsonObject o = com.google.gson.JsonParser.parseString(customName).getAsJsonObject();
-                            if (o.has("text")) d.inventoryCustomName[slot] = o.get("text").getAsString();
-                        } catch (Exception ignored) {}
-                    }
+                    ItemComps c = parseItemComponents(item);
+                    d.inventoryDamage[slot] = c.damage();
+                    if (!c.enchants().isEmpty()) d.inventoryEnchants[slot] = new java.util.HashMap<>(c.enchants());
+                    d.inventoryPotion[slot] = c.potion();
+                    d.inventoryCustomName[slot] = c.customName();
+                    d.inventoryTrimMaterial[slot] = c.trimMaterial();
+                    d.inventoryTrimPattern[slot] = c.trimPattern();
+                }
+            }
+            // Bug4/33 修复: 末影箱内容从 EnderItems 还原到内存 (原未读取 -> 末影箱永远空)。
+            List<NbtMap> enderItems = nbt.getList("EnderItems", NbtType.COMPOUND);
+            if (enderItems != null) {
+                ContainerStore.ChestData ed = ContainerStore.enderChest(uuid);
+                for (NbtMap item : enderItems) {
+                    int s = item.getInt("Slot", item.getInt("slot", 0));
+                    if (s < 0 || s >= 27) continue;
+                    String id = item.getString("id", "");
+                    String name = id.startsWith("minecraft:") ? id.substring(10) : id;
+                    Integer itemId = ITEM_NAME_TO_ID.get(name);
+                    if (itemId == null) continue;
+                    int count = item.getInt("count", item.containsKey("Count") ? (int) item.getByte("Count", (byte) 0) : 1);
+                    if (count <= 0) count = 1;
+                    ItemComps c = parseItemComponents(item);
+                    ed.setChestSlot(s, itemId, count, c.damage(), c.enchants(), c.potion(), c.customName());
                 }
             }
             return d;

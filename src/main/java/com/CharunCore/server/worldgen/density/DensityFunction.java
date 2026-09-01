@@ -84,6 +84,12 @@ public interface DensityFunction {
         private static volatile long WORLD_SEED_LO = 0L;
         private static volatile long WORLD_SEED_HI = 0L;
         private static volatile PositionalRandomFactory SHARED_FACTORY = null;
+        /** 原版 NoiseGeneratorSettings.useLegacyRandomSource（下界/末地=true）。 */
+        private static volatile boolean USE_LEGACY_RANDOM = false;
+
+        public static void setUseLegacyRandomSource(boolean b) { USE_LEGACY_RANDOM = b; }
+        public static boolean useLegacyRandomSource() { return USE_LEGACY_RANDOM; }
+        public static long worldSeed() { return WORLD_SEED_LO; }
 
         public static void setWorldSeed(long seedLo, long seedHi) {
             WORLD_SEED_LO = seedLo;

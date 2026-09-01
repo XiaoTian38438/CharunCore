@@ -40,7 +40,8 @@ public final class NonJigsawPlacer {
         switch (type) {
             case "buried_treasure" ->
                 placeBuriedTreasure(level, centerX, centerZ, surfaceY, random);
-            case "mineshaft" -> placeMineshaft(level, chunkX, chunkZ, random);
+            // Bug27: mineshaft 改走 ProceduralStructureStart.mineshaft 分件系统
+            // (registerStructuresForChunk 注册), 曾每区块独立 14 段迷你走廊导致矿井碎片化。
             case "stronghold" -> placeStronghold(level, centerX, centerZ, surfaceY, random);
             case "shipwreck" -> placeScatterTemplate(level, pickVariant("shipwreck", random),
                 centerX, centerZ, level.getSeaLevel() - 3, random);
@@ -50,11 +51,11 @@ public final class NonJigsawPlacer {
                 centerX, centerZ, surfaceY - 1, random);
             case "igloo" -> placeIgloo(level, centerX, centerZ, surfaceY, random);
             case "nether_fossil" -> placeFossil(level, centerX, centerZ, surfaceY, random);
-            case "fortress" -> placeFortress(level, centerX, centerZ, random);
+            // fortress: 已改为原版 NetherFortressPieces 逐件移植（ProceduralStructureStart 中央注册）
             case "desert_pyramid" -> placeDesertPyramid(level, centerX, centerZ, surfaceY, random);
             case "jungle_temple" -> placeJungleTemple(level, centerX, centerZ, surfaceY, random);
             case "swamp_hut" -> placeSwampHut(level, centerX, centerZ, surfaceY, random);
-            case "end_city" -> placeEndCity(level, centerX, centerZ, surfaceY, random);
+            // end_city: 已改为原版 EndCityPieces 逐件移植（ProceduralStructureStart 中央注册）
             case "ocean_monument" -> placeOceanMonument(level, centerX, centerZ, surfaceY, random);
             case "woodland_mansion" -> placeWoodlandMansion(level, centerX, centerZ, surfaceY, random);
             default -> {
@@ -131,36 +132,116 @@ public final class NonJigsawPlacer {
         placeLootChest(level, centerX, y, centerZ, "chests/buried_treasure", seed);
     }
 
-    // best-effort 近似（P1-3）：无原版 nbt 逐块还原，手工隧道+铁轨/蛛网/箱子，与原版分叉房间网络有偏差。
+    // Bug28 改造: 对齐原版 MineshaftPieces 的分件链拓扑(算法级还原, 非种子逐字节):
+    //  - 起点为房间(MineshaftRoom), 之后沿单一轴向迭代延伸;
+    //  - 每段走廊长 5 格、截面 3x3, 沿途每格原木支撑排(原版 Corridor 每段一排);
+    //  - 约 1/4 概率十字路口(Crossing, 垂直轴双向各延伸一条支线);
+    //  - 约 1/10 概率房间(Room); 楼梯(Stairs)以 ±3 格换层连接;
+    //  - 走廊铺铁轨/随机蛛网/墙面火把, 房间低概率刷怪箱+运输矿车箱子。
     private static void placeMineshaft(WorldGenLevel level, int chunkX, int chunkZ,
                                        RandomSource random) {
         int baseX = chunkX << 4;
         int baseZ = chunkZ << 4;
-        int tunnels = 2 + random.nextInt(3);
-        for (int t = 0; t < tunnels; t++) {
-            int startY = 8 + random.nextInt(32);
-            int x = baseX + random.nextInt(16);
-            int z = baseZ + random.nextInt(16);
-            int len = 12 + random.nextInt(22);
-            int dx = random.nextInt(3) - 1;
-            int dz = random.nextInt(3) - 1;
-            if (dx == 0 && dz == 0) dz = 1;
-            int y = startY;
-            // 记录本隧道生成的坐标用于支撑柱
-            java.util.List<int[]> segs = new java.util.ArrayList<>();
-            for (int i = 0; i < len; i++) {
+        int startX = baseX + 8, startZ = baseZ + 8;
+        int startY = 10 + random.nextInt(30);
+        boolean axisX = random.nextBoolean();
+
+        // 分件队列: {x,y,z,axis(0=X,1=Z),piecesLeft}
+        // 性能注意: 矿井 structure_set 为 spacing=1 -> 每个区块都会进入本方法,
+        // 预算必须保持小(原版分件跨区块增量放置, 这里单区块内完成),
+        // 曾给到 24-48 段 -> 区块生成耗时暴涨, 玩家移动时 FPS 周期性骤降。
+        java.util.ArrayDeque<int[]> frontier = new java.util.ArrayDeque<>();
+        frontier.add(new int[]{startX, startY, startZ, axisX ? 0 : 1, 6 + random.nextInt(6)});
+        java.util.Set<Long> visited = new java.util.HashSet<>();
+
+        int piecesBuilt = 0;
+        final int MAX_PIECES = 14;
+        while (!frontier.isEmpty() && piecesBuilt < MAX_PIECES) {
+            int[] job = frontier.poll();
+            int x = job[0], y = job[1], z = job[2], axis = job[3], budget = job[4];
+            long key = ((long) x & 0x3FFFFFFL) << 38 | ((long) y & 0xFFFL) << 26 | ((long) z & 0x3FFFFFFL);
+            if (!visited.add(key)) continue;
+            piecesBuilt++;
+
+            double roll = random.nextDouble();
+            if (roll < 0.10) {
+                placeMineshaftRoom(level, x, y, z, random);
+                continue;
+            }
+            if (roll < 0.32 && budget > 4) {
+                placeMineshaftCrossing(level, x, y, z, random);
+                // 十字路口向垂直轴分出支线
+                frontier.add(new int[]{x, y, z, axis == 0 ? 1 : 0, budget / 2});
+            }
+            int dir = random.nextBoolean() ? 1 : -1;   // 沿当前轴向的正/负端继续
+            for (int seg = 0; seg < 5 && budget > 0; seg++, budget--) {
+                // 原版 Stairs 分件: 换层 ±3 格后继续同轴走廊
+                boolean stair = seg == 2 && random.nextInt(5) == 0;
+                if (stair) y += random.nextBoolean() ? 3 : -3;
+                if (y < 5) y = 5;
+                if (y > 50) y = 50;
+                if (axis == 0) x += dir;
+                else z += dir;
                 carveTunnelSegment(level, x, y, z, random);
-                segs.add(new int[]{x, y, z});
-                // #46 原版矿井: 每 4 格生成原木支撑柱(竖梁横梁), 防塌方感
-                if (i % 4 == 0 && random.nextInt(3) == 0) {
-                    placeMineshaftSupport(level, x, y, z, random);
+                placeMineshaftSupport(level, x, y, z, random);
+                if (stair) break; // 换层后本段结束
+            }
+            if (budget > 0) frontier.add(new int[]{x, y, z, axis, budget});
+        }
+    }
+
+    /** 原版 MineshaftRoom: 7x7x3 空腔 + 围栏支撑角。 */
+    private static void placeMineshaftRoom(WorldGenLevel level, int x, int y, int z,
+                                           RandomSource random) {
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                for (int dy = 0; dy <= 2; dy++) {
+                    int cur = level.getBlock(x + dx, y + dy, z + dz);
+                    String nm = BlockStateHelper.getName(cur);
+                    if (nm != null && !nm.equals("bedrock") && !nm.equals("water") && !nm.equals("lava")) {
+                        level.setBlock(x + dx, y + dy, z + dz, 0);
+                    }
                 }
-                x += dx;
-                z += dz;
-                if (random.nextInt(5) == 0) {
-                    y += random.nextInt(3) - 1;
-                    if (y < 5) y = 5;
-                    if (y > 44) y = 44;
+            }
+        }
+        // 房间中央低概率洞穴蜘蛛刷怪笼(原版 Room 特征)
+        if (random.nextInt(4) == 0) {
+            int spawner = BlockStateHelper.getDefault("spawner");
+            if (spawner > 0) level.setBlock(x, y, z, spawner);
+        }
+        // 运输矿车战利品: 用箱子近似(chests/abandoned_mineshaft)
+        if (random.nextInt(3) == 0) {
+            placeLootChest(level, x + 2, y, z + 2, "chests/abandoned_mineshaft",
+                ((long) x * 31L + z * 7L + y) ^ 0x9e3779b9L);
+        }
+    }
+
+    /** 原版 MineShaftCrossing: 3x3 全高开放 + 四向围栏柱, 双轴交汇。 */
+    private static void placeMineshaftCrossing(WorldGenLevel level, int x, int y, int z,
+                                               RandomSource random) {
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dy = 0; dy <= 2; dy++) {
+                    int cur = level.getBlock(x + dx, y + dy, z + dz);
+                    String nm = BlockStateHelper.getName(cur);
+                    if (nm != null && !nm.equals("bedrock") && !nm.equals("water") && !nm.equals("lava")) {
+                        level.setBlock(x + dx, y + dy, z + dz, 0);
+                    }
+                }
+            }
+        }
+        placeMineshaftSupport(level, x, y, z, random);
+        // 十字路口地面满铺铁轨(原版 Crossing 地板为铁轨)
+        int railId = BlockStateHelper.getDefault("rail");
+        if (railId > 0) {
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    int fl = level.getBlock(x + dx, y - 1, z + dz);
+                    String fnm = BlockStateHelper.getName(fl);
+                    if (fnm != null && !fnm.equals("air") && !fnm.equals("water")
+                            && !fnm.equals("lava") && !fnm.equals("rail")) {
+                        level.setBlock(x + dx, y - 1, z + dz, railId);
+                    }
                 }
             }
         }
@@ -331,67 +412,7 @@ public final class NonJigsawPlacer {
     }
 
     // best-effort 近似（P1-3）：外形接近原版，但缺少内部红石陷阱连线/隐藏密室等逐块还原，与原版 1:1 有偏差。
-    private static void placeFortress(WorldGenLevel level, int centerX, int centerZ,
-                                      RandomSource random) {
-        // 地狱要塞：石砖走廊网络 + 塔（原版特征：nether_bricks 走廊 2x3 高 + 竖井塔）。
-        // 曾缺失 → 下界要塞 100% 不生成（NonJigsawPlacer 无 fortress case）。
-        int brick = BlockStateHelper.getDefault("nether_bricks");
-        if (brick <= 0) return;
-        int baseY = 27 + random.nextInt(40); // 原版要塞 y 27-110 之间
-        // 主走廊（沿 X）
-        int len = 24 + random.nextInt(30);
-        for (int i = 0; i < len; i++) {
-            for (int dx = -1; dx <= 1; dx++) {
-                for (int dy = 0; dy <= 3; dy++) {
-                    boolean solid = dy == 0 || dy == 3 || dx == -1 || dx == 1;
-                    level.setBlock(centerX + i, baseY + dy, centerZ, solid ? brick : 0);
-                }
-            }
-        }
-        // 分支走廊（沿 Z，交叉于主走廊中段）
-        int branchLen = 16 + random.nextInt(16);
-        int crossX = centerX + len / 2;
-        for (int i = 0; i < branchLen; i++) {
-            for (int dz = -1; dz <= 1; dz++) {
-                for (int dy = 0; dy <= 3; dy++) {
-                    boolean solid = dy == 0 || dy == 3 || dz == -1 || dz == 1;
-                    level.setBlock(crossX, baseY + dy, centerZ + i, solid ? brick : 0);
-                }
-            }
-        }
-        // 塔（竖井 + 顶部平台）
-        int towerX = centerX + 2 + random.nextInt(Math.max(2, len - 4));
-        for (int y = baseY; y < baseY + 14; y++) {
-            for (int dx = -2; dx <= 2; dx++) {
-                for (int dz = -2; dz <= 2; dz++) {
-                    boolean edge = Math.abs(dx) == 2 || Math.abs(dz) == 2;
-                    if (edge) level.setBlock(towerX + dx, y, centerZ + dz, brick);
-                }
-            }
-        }
-        // 塔顶平台
-        for (int dx = -3; dx <= 3; dx++) {
-            for (int dz = -3; dz <= 3; dz++) {
-                level.setBlock(towerX + dx, baseY + 14, centerZ + dz, brick);
-            }
-        }
-        // 塔内楼梯（螺旋近似）
-        int stairs = BlockStateHelper.getDefault("nether_brick_stairs");
-        for (int y = 0; y < 12; y++) {
-            if (stairs > 0) level.setBlock(towerX, baseY + y + 1, centerZ, stairs);
-        }
-        // 要塞功能补全（解决 ⚠️：原近似缺刷怪笼 → 玩家拿不到烈焰棒 → 无法合成末影之眼 → 末地软锁）：
-        // 1) 塔内中央放烈焰人刷怪笼（SpawnData=blaze），产出烈焰棒；
-        // 2) 主走廊末端放凋灵骷髅刷怪笼，产出凋灵骷髅头颅（用于召唤凋灵/信标）；
-        // 3) 主走廊与分支走廊各放一个 nether_bridge 战利品箱（鞍/金马铠/石两栖/岩浆膏等）。
-        placeSpawner(level, towerX, baseY + 1, centerZ, "blaze");
-        placeSpawner(level, centerX + len - 2, baseY + 1, centerZ, "wither_skeleton");
-        placeLootChest(level, centerX + 4, baseY + 1, centerZ, "chests/nether_bridge",
-            ((long) centerX * 31L + centerZ * 7L + baseY) ^ 0x9e3779b9L);
-        placeLootChest(level, crossX, baseY + 1, centerZ + branchLen - 2, "chests/nether_bridge",
-            ((long) crossX * 31L + (centerZ + branchLen) * 7L + baseY) ^ 0x1b873593L);
-    }
-
+    
     // 忠实还原原版 DesertPyramidPiece：21x21 砂岩金字塔 + 陶瓦饰带 + 地下陷阱室（9-TNT 缓存 + 压力板 + 红石引线）+ 4 个战利品室。
     private static void placeDesertPyramid(WorldGenLevel level, int centerX, int centerZ,
                                            int surfaceY, RandomSource random) {
@@ -620,73 +641,7 @@ public final class NonJigsawPlacer {
         spawnMob("cat", centerX + 1.5, baseY + 1, centerZ - 0.5);
     }
 
-    private static void placeEndCity(WorldGenLevel level, int centerX, int centerZ,
-                                     int surfaceY, RandomSource random) {
-        // 使用 end_city/ NBT 模板构建可识别的末地城（替代原来的 9x9 盒子）
-        // 结构：base_floor → tower_base → [tower_floor × 0-2] → tower_top
-        //        随机附加：second_floor + second_roof 或 ship
-        Rotation rot = Rotation.random(random);
-
-        // 1. 基座平台
-        StructureTemplate baseFloor = StructureTemplate.load("end_city/base_floor");
-        if (baseFloor != null) {
-            baseFloor.placeInWorld(level, centerX, surfaceY, centerZ, rot, Mirror.NONE);
-        }
-
-        // 2. 主塔：从 base_floor 上方开始堆叠
-        int towerBaseY = surfaceY + (baseFloor != null ? baseFloor.sizeY : 0);
-        
-        // tower_base (7x7x7)
-        StructureTemplate tBase = StructureTemplate.load("end_city/tower_base");
-        if (tBase != null) {
-            tBase.placeInWorld(level, centerX, towerBaseY, centerZ, rot, Mirror.NONE);
-            towerBaseY += tBase.sizeY;
-        }
-
-        // 随机层数的 tower_floor/tower_piece (7x4x7 each)
-        int extraFloors = random.nextInt(3); // 0-2 层
-        for (int f = 0; f < extraFloors; f++) {
-            StructureTemplate floor = random.nextBoolean()
-                ? StructureTemplate.load("end_city/tower_floor")
-                : StructureTemplate.load("end_city/tower_piece");
-            if (floor != null) {
-                floor.placeInWorld(level, centerX, towerBaseY, centerZ, rot, Mirror.NONE);
-                towerBaseY += floor.sizeY;
-            }
-        }
-
-        // tower_top (9x5x9) — 塔顶收尾
-        StructureTemplate tTop = StructureTemplate.load("end_city/tower_top");
-        if (tTop != null) {
-            tTop.placeInWorld(level, centerX, towerBaseY, centerZ, rot, Mirror.NONE);
-            towerBaseY += tTop.sizeY;
-        }
-
-        // 3. 随机附加建筑（二层的房子或船）
-        float roll = random.nextFloat();
-        if (roll < 0.35f) {
-            // 第二层楼 + 屋顶。原版中 second_floor 是接驳在 base_floor 侧面的独立建筑，
-            // 此前 floor2Y 与 tower_base 同高且同 center，导致二层楼与中央塔身重叠（P7-B10）。
-            // 现将其推到基座东侧偏移处，避免与塔身重叠；门洞朝向仍近似（原版靠 jigsaw 接驳，此处无）。
-            int floor2Y = surfaceY + (baseFloor != null ? baseFloor.sizeY : 0);
-            int floor2OffX = 9; // 推到基座东侧，避免与中央 tower_base 重叠（仍近似）
-            StructureTemplate sf1 = StructureTemplate.load("end_city/second_floor_1");
-            if (sf1 != null) { sf1.placeInWorld(level, centerX + floor2OffX, floor2Y, centerZ, rot, Mirror.NONE); floor2Y += sf1.sizeY; }
-            StructureTemplate sr = StructureTemplate.load("end_city/second_roof");
-            if (sr != null) sr.placeInWorld(level, centerX + floor2OffX, floor2Y, centerZ, rot, Mirror.NONE);
-        } else if (roll < 0.50f) {
-            // 末地船！原版通过 jigsaw 与塔身接驳，此处仅作近似偏移（P7-B10：门洞仍不对齐）。
-            StructureTemplate ship = StructureTemplate.load("end_city/ship");
-            if (ship != null) {
-                int shipX = centerX + (random.nextBoolean() ? 10 : -10);
-                int shipZ = centerZ + (random.nextBoolean() ? 10 : -10);
-                Rotation shipRot = Rotation.random(random);
-                int shipY = surfaceY + (baseFloor != null ? baseFloor.sizeY : 5);
-                ship.placeInWorld(level, shipX, shipY, shipZ, shipRot, Mirror.NONE);
-            }
-        }
-    }
-
+    
     // 忠实还原原版 OceanMonumentPieces 的规模与材质：58x58x23 海晶石神殿 + 核心房（金块）+ 3 远古守卫者 + 海晶灯装饰。
     private static void placeOceanMonument(WorldGenLevel level, int centerX, int centerZ,
                                            int surfaceY, RandomSource random) {

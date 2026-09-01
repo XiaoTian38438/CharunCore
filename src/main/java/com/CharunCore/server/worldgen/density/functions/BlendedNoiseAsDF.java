@@ -26,8 +26,14 @@ public final class BlendedNoiseAsDF implements DensityFunction {
 
     private BlendedNoise noise() {
         if (!initialized) {
-            BlendedNoise n = new BlendedNoise(
-                DensityFunction.NoiseHolder.sharedFactory().fromHashOf(key),
+            // 原版 RandomState.NoiseWiringHelper.wrapNew：
+            //   legacy_random_source=true  -> new LegacyRandomSource(worldSeed)
+            //   否则                        -> factory.fromHashOf("minecraft:terrain")
+            com.CharunCore.server.world.gen.RandomSource r =
+                DensityFunction.NoiseHolder.useLegacyRandomSource()
+                    ? new com.CharunCore.server.world.gen.LegacyRandomSource(DensityFunction.NoiseHolder.worldSeed())
+                    : DensityFunction.NoiseHolder.sharedFactory().fromHashOf("minecraft:terrain");
+            BlendedNoise n = new BlendedNoise(r,
                 xzScale, yScale, xzFactor, yFactor, smearScaleMultiplier);
             this.noise = n;
             this.minValue = -n.maxValue();

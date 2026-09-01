@@ -26,11 +26,14 @@ import com.CharunCore.server.worldgen.noisechunk.carver.CarvingMask;
 import com.CharunCore.server.worldgen.noisechunk.carver.CaveWorldCarver;
 import com.CharunCore.server.worldgen.noisechunk.carver.CanyonWorldCarver;
 import com.CharunCore.server.worldgen.biome.MultiNoiseBiomeSource;
+import com.CharunCore.server.worldgen.biome.NetherBiomeSource;
 import com.CharunCore.server.worldgen.biome.Climate;
 import com.CharunCore.server.worldgen.feature.SimpleTreeFeature.TreeType;
 import com.CharunCore.server.world.gen.NormalNoise;
 import com.CharunCore.server.world.gen.NoiseParameters;
+import com.CharunCore.server.worldgen.surfacerule.NetherSurfaceRules;
 import com.CharunCore.server.worldgen.surfacerule.OverworldSurfaceRules;
+import com.CharunCore.server.worldgen.surfacerule.SurfaceRules;
 import com.CharunCore.server.worldgen.surfacerule.SurfaceSystem;
 
 
@@ -50,6 +53,9 @@ public final class DensityRouterChunkGenerator {
     final NoiseRouter router;
     private final java.util.Map<String, DensityFunction> densityMap;
     private final MultiNoiseBiomeSource biomeSource;
+    private final NetherBiomeSource netherBiomeSource;
+    /** 下界表面规则树（每生成器构建一次，携带本世界种子的噪声实例）。 */
+    private SurfaceRules.RuleSource netherSurfaceRule;
     private final OreGenerator oreGen;
     private final AquaticGenerator aquaticGen;
     private final SurfaceDecorator surfaceDecor;
@@ -100,6 +106,7 @@ public final class DensityRouterChunkGenerator {
         this.LAVA_LEVEL = dimType == DimensionType.THE_NETHER ? 31 : -54;
 
         NoiseHolder.setWorldSeed(seedLo, seedHi);
+        NoiseHolder.setUseLegacyRandomSource(dimType == DimensionType.THE_NETHER || dimType == DimensionType.THE_END);
         this.densityMap = NoiseRouterData.bootstrap();
 
         if (dimType == DimensionType.THE_NETHER) {
@@ -132,6 +139,23 @@ public final class DensityRouterChunkGenerator {
         this.endStoneId = BlockStateHelper.getDefault("end_stone");
 
         this.biomeSource = new MultiNoiseBiomeSource();
+        this.netherBiomeSource = new NetherBiomeSource();
+        // 要塞环带的群系解析（原版 ChunkGeneratorStructureState 用 climate sampler 搜索偏好群系）
+        Climate.Sampler ringSampler = biomeSource.createSampler(this.router);
+        ConcentricRingsStructurePlacement.setBiomeResolver((qx, qy, qz) ->
+            biomeSource.getBiome(qx, qy, qz, ringSampler));
+        // Bug44: 要塞环带位置计算(128 环点 × 225x225 群系搜索)首次调用 ~20s,
+        // 曾发生在第一个玩家进服的第一个区块生成里 = 进服巨卡。挪到生成器构造时后台预热。
+        if (dimensionType == DimensionType.OVERWORLD && seedLo != 0L) {
+            final long fSeed = seedLo;
+            com.CharunCore.server.world.WorldManager.getIoExecutor().execute(() -> {
+                try {
+                    isStrongholdRingChunk(0, 0); // 触发环带位置缓存计算
+                } catch (Throwable t) {
+                    System.err.println("[要塞] 环带预热失败: " + t);
+                }
+            });
+        }
         this.oreGen = new OreGenerator();
         this.aquaticGen = new AquaticGenerator();
         this.surfaceDecor = new SurfaceDecorator();
@@ -151,15 +175,28 @@ public final class DensityRouterChunkGenerator {
         };
     }
 
-    private void applyNetherBedrock(Chunk chunk, int height) {
-        for (int x = 0; x < 16; x++) {
-            for (int z = 0; z < 16; z++) {
-                chunk.setBlock(x, MIN_Y, z, bedrockId);
-                chunk.setBlock(x, MIN_Y + 1, z, bedrockId);
-                chunk.setBlock(x, MIN_Y + height - 1, z, bedrockId);
-                chunk.setBlock(x, MIN_Y + height - 2, z, bedrockId);
-            }
-        }
+    /** 下界表面系统：原版 nether 表面规则 + nether preset 群系管理器 + netherrack 为目标方块。 */
+    private SurfaceSystem buildNetherSurfaceSystem(Chunk chunk, int chunkX, int chunkZ,
+                                                   int height, int[] topSolidY) {
+        var surfFactory = DensityFunction.NoiseHolder.sharedFactory();
+        NormalNoise surfDepthNoise = new NormalNoise(surfFactory.fromHashOf("minecraft:surface"), NoiseParameters.get("minecraft:surface"));
+        NormalNoise surfSecondaryNoise = new NormalNoise(surfFactory.fromHashOf("minecraft:surface_secondary"), NoiseParameters.get("minecraft:surface_secondary"));
+        NormalNoise clayBandsNoise = new NormalNoise(surfFactory.fromHashOf("minecraft:clay_bands_offset"), NoiseParameters.get("minecraft:clay_bands_offset"));
+        Climate.Sampler sampler = netherBiomeSource.createSampler(router);
+        BiomeManager netherBiomeMgr = new BiomeManager(
+            (qx, qy, qz) -> netherBiomeSource.getBiome(qx, qy, qz, sampler),
+            BiomeManager.obfuscateSeed(seedLo));
+        if (netherSurfaceRule == null) netherSurfaceRule = NetherSurfaceRules.nether();
+        return new SurfaceSystem(netherSurfaceRule,
+            SEA_LEVEL, MIN_Y, height,
+            surfDepthNoise, surfSecondaryNoise, clayBandsNoise,
+            chunk, chunkX, chunkZ, netherBiomeMgr,
+            (x, z) -> SEA_LEVEL,
+            (x, z) -> {
+                int solid = topSolidY[(z & 15) * 16 + (x & 15)];
+                return solid > MIN_Y ? solid : SEA_LEVEL;
+            },
+            netherrackId);
     }
 
     // profiling accumulators (enable for diagnostics)
@@ -258,15 +295,49 @@ public final class DensityRouterChunkGenerator {
             // 周围潜在结构，邻居 generate 时 getStartsIntersecting 立即命中 → 消除"先完成
             // 的邻居永久缺角"时序问题（曾导致村庄/古城缺角）。
             registerStructuresForChunk(chunk, chunkX, chunkZ, topSolidY);
+            // Bug51: 预注册 3x3 邻居的 start(他们可能在本区块之后才轮到 generate)。
+            // Beardifier 与跨区块结构放置都需要邻居 start 已就位。
+            for (int wdx = -1; wdx <= 1; wdx++) {
+                for (int wdz = -1; wdz <= 1; wdz++) {
+                    if (wdx == 0 && wdz == 0) continue;
+                    int nwx = chunkX + wdx, nwz = chunkZ + wdz;
+                    Chunk nc = window.get(WorldGenLevel.key(nwx, nwz));
+                    if (nc == null) continue;
+                    registerStructuresForChunk(nc, nwx, nwz, computeTopSolidY(nc));
+                }
+            }
+
+            if (dimensionType == DimensionType.OVERWORLD) {
+                FeatureDecoration.carveOverworld(level, chunkX, chunkZ, seedLo);
+            }
+
+            // Bug51: Beardifier —— terrain_adaptation != none 的结构对地形做增密修正,
+            // 消除"村庄房屋悬空/嵌地/同一高度"(原版在噪声阶段完成, 此处为等效方块后处理)。
+            applyBeardifier(level, chunk, chunkX, chunkZ);
+
+            // Bug46: 散矿在雕刻之后放置(原版顺序: ore 属于 feature 阶段)。
+            // 曾在 generateBase 雕刻前放置 -> 洞穴/峡谷把矿周围挖空, 矿残留悬空。
+            RandomSource oreRng = new XoroshiroRandomSource(seedLo + chunkX * 341873128712L + chunkZ * 132897987541L);
+            if (dimensionType == DimensionType.OVERWORLD) {
+                oreGen.generate(chunk, chunkX, chunkZ, oreRng.fork());
+            } else if (dimensionType == DimensionType.THE_NETHER) {
+                oreGen.generateNether(chunk, chunkX, chunkZ, oreRng.fork());
+            }
+            // THE_END：末地无散矿特征
 
             placeFeatures(level, chunk, chunkX, chunkZ, topSolidY, colBiome);
 
             placeStructures2(level, chunk, chunkX, chunkZ, topSolidY);
 
-            if (dimensionType == DimensionType.OVERWORLD) {
-                StructureManager.generateStronghold(
-                    chunk, chunkX, chunkZ, seedLo, topSolidY);
-            }
+            // Bug27: 要塞改走 RegisterStructuresForChunk 注册的 StrongholdPieces 分件系统,
+            // 原版 moveBelowSeaLevel 由 ProceduralStructureStart 的分件引擎处理。
+            // 曾直接调用 StrongholdPortalRoomGenerator(仅生成传送门房间) -> 要塞只剩一个房间。
+
+            // Bug46 修复: 光照在初始地形生成阶段就计算了(isLightComputed=true),
+            // 但火把/荧石/熔岩等光源是之后才由 placeFeatures/placeStructures2 放入的,
+            // 光照数据永远不含它们 -> "自然光源完全不亮"。清除光照标记使其在
+            // 区块包发送前(ChunkEncoder.writeLightData -> chunk.ensureLight)重算。
+            chunk.clearLight();
 
             featuresDone.add(key);
             return chunk;
@@ -286,8 +357,42 @@ public final class DensityRouterChunkGenerator {
         }
     }
 
-    private int[] computeTopSolidY(Chunk chunk) {
-        int[] topSolidY = new int[256];
+    /** Bug51: 收集 3x3 邻域内 terrain_adaptation != none 的结构片段并应用 Beardifier。 */
+    private void applyBeardifier(WorldGenLevel level, Chunk chunk, int chunkX, int chunkZ) {
+        com.CharunCore.server.worldgen.structure2.StructureManager2 mgr =
+            com.CharunCore.server.worldgen.structure2.StructureManager2.getInstance();
+        java.util.List<com.CharunCore.server.worldgen.structure2.Beardifier.Rigid> rigids = new java.util.ArrayList<>();
+        java.util.List<com.CharunCore.server.worldgen.structure2.Beardifier.Junction> junctions = new java.util.ArrayList<>();
+        int cMinX = chunkX << 4, cMinZ = chunkZ << 4;
+        for (int wdx = -1; wdx <= 1; wdx++) {
+            for (int wdz = -1; wdz <= 1; wdz++) {
+                for (var start : mgr.getStartsForChunk(dimensionType, chunkX + wdx, chunkZ + wdz)) {
+                    if (!(start instanceof com.CharunCore.server.worldgen.structure2.StructureStart ss)
+                            || !ss.isValid()) continue;
+                    com.CharunCore.server.worldgen.structure2.StructureRegistry.ConfiguredStructure cs =
+                        com.CharunCore.server.worldgen.structure2.StructureRegistry.get(ss.getStructureId());
+                    if (cs == null || "none".equals(cs.terrainAdaptation)) continue;
+                    for (com.CharunCore.server.worldgen.structure2.PoolElementStructurePiece p : ss.getPieces()) {
+                        com.CharunCore.server.worldgen.structure2.BoundingBox bb = p.getBoundingBox();
+                        if (bb == null) continue;
+                        if (bb.maxX < cMinX - 12 || bb.minX > cMinX + 27
+                                || bb.maxZ < cMinZ - 12 || bb.minZ > cMinZ + 27) continue;
+                        rigids.add(new com.CharunCore.server.worldgen.structure2.Beardifier.Rigid(
+                            bb, cs.terrainAdaptation, p.getGroundLevelDelta()));
+                        for (var j : p.getJunctions()) {
+                            junctions.add(new com.CharunCore.server.worldgen.structure2.Beardifier.Junction(
+                                j.sourceX(), j.sourceGroundY(), j.sourceZ()));
+                        }
+                    }
+                }
+            }
+        }
+        if (rigids.isEmpty() && junctions.isEmpty()) return;
+        com.CharunCore.server.worldgen.structure2.Beardifier.applyToChunk(
+            level, chunk, chunkX, chunkZ, rigids, junctions);
+    }
+
+    private int[] computeTopSolidY(Chunk chunk) {        int[] topSolidY = new int[256];
         java.util.Arrays.fill(topSolidY, MIN_Y - 1);
         int waterId = this.waterId;
         int lavaId = this.lavaId;
@@ -315,38 +420,24 @@ public final class DensityRouterChunkGenerator {
     }
 
     private int[] computeColBiome(Chunk chunk, int chunkX, int chunkZ, int[] topSolidY) {
-        // 下界/末地无多噪声气候源：直接用固定 biome（与 fillFixedBiomes 一致）。
-        // 【修复】原实现对下界/末地也走 MultiNoiseBiomeSource（主世界气候）→ colBiome 返回
-        // 主世界 biome → 下界结构的 biome 检查(如 nether_fortress={34,...})永远失败 → 结构不生成。
+        // 下界：原版 nether MultiNoise preset（temperature/vegetation 五点最近邻）；
+        // 末地：原版 TheEndBiomeSource（主岛 64 区块半径内 + 岛屿高度函数分档）。
         if (dimensionType == DimensionType.THE_NETHER) {
-            // 【群系多样性】5 种下界群系按 chunk 噪声分布（原版 MultiNoise 近似）：
-            //   nether_wastes=34, soul_sand_valley=49, crimson_forest=7,
-            //   warped_forest=59, basalt_deltas=2
-            long h = (chunkX * 341873128712L ^ chunkZ * 132897987541L) & 0xFFFF;
-            int biome;
-            if (h % 5 == 0) biome = 49;       // soul_sand_valley
-            else if (h % 5 == 1) biome = 7;   // crimson_forest
-            else if (h % 5 == 2) biome = 59;  // warped_forest
-            else if (h % 5 == 3) biome = 2;   // basalt_deltas
-            else biome = 34;                  // nether_wastes
+            Climate.Sampler sampler = netherBiomeSource.createSampler(router);
             int[] b = new int[256];
-            java.util.Arrays.fill(b, biome);
+            for (int lx = 0; lx < 16; lx++)
+                for (int lz = 0; lz < 16; lz++) {
+                    // Bug20: 地表规则用的列群系按该列地表高度采样(曾固定 quart y=8,
+                    // 地表群系与实际方块带错位)。
+                    int surfY = Math.max(MIN_Y, Math.min(MAX_Y - 1, topSolidY[lz * 16 + lx]));
+                    b[lz * 16 + lx] = netherBiomeSource.getBiome(
+                        ((chunkX << 4) + lx) >> 2, surfY >> 2, ((chunkZ << 4) + lz) >> 2, sampler);
+                }
             return b;
         }
         if (dimensionType == DimensionType.THE_END) {
-            int bx = chunkX << 4, bz = chunkZ << 4;
-            long distSq = (long) bx * bx + (long) bz * bz;
-            int biome;
-            if (distSq <= 1000L * 1000L) biome = 56; // the_end
-            else {
-                double d = Math.sqrt(distSq);
-                if (d < 1100) biome = 44;      // small_end_islands
-                else if (d < 1500) biome = 16; // end_barrens
-                else if (d < 2500) biome = 18; // end_midlands
-                else biome = 17;               // end_highlands
-            }
             int[] b = new int[256];
-            java.util.Arrays.fill(b, biome);
+            java.util.Arrays.fill(b, endBiomeForChunk(chunkX, chunkZ));
             return b;
         }
         int[] colBiome = new int[256];
@@ -373,12 +464,62 @@ public final class DensityRouterChunkGenerator {
 
     /** 按世界坐标查询该列的覆盖层生物群系 id (供 /locate 做结构合法性校验)。 */
     public int getColumnBiome(int blockX, int blockZ) {
+        if (dimensionType == DimensionType.THE_NETHER) {
+            return netherBiomeSource.getBiomeAt(router, blockX, SEA_LEVEL, blockZ);
+        }
+        if (dimensionType == DimensionType.THE_END) {
+            return endBiomeForChunk(blockX >> 4, blockZ >> 4);
+        }
         Climate.Sampler climateSampler = biomeSource.createSampler(router);
         BiomeManager biomeManager =
             new BiomeManager(
                 (qx, qy, qz) -> biomeSource.getBiome(qx, qy, qz, climateSampler),
                 BiomeManager.obfuscateSeed(seedLo));
         return biomeManager.getBiome(blockX, SEA_LEVEL, blockZ);
+    }
+
+    /**
+     * 原版 TheEndBiomeSource.getNoiseBiome 逐值移植：
+     * chunk 坐标 <=64 区块半径 -> the_end；其余采样 router.erosion()（即 cache2d(endIslands(0))，
+     * 与决定岛屿实体位置的函数同源）按 列中心 (chunkX*2+1)*8 分档：
+     *   >0.25 highlands, >=-0.0625 midlands, <-0.21875 small_islands, else barrens。
+     */
+    private transient java.util.Set<Long> strongholdRingCache;
+
+    /** 原始气候采样（无 BiomeManager 四角模糊），用于特征 biome 过滤与诊断。 */
+    public int getRawBiomeAt(int blockX, int blockY, int blockZ) {
+        if (dimensionType == DimensionType.THE_NETHER) {
+            return netherBiomeSource.getBiomeAt(router, blockX, blockY, blockZ);
+        }
+        if (dimensionType == DimensionType.THE_END) {
+            return endBiomeForChunk(blockX >> 4, blockZ >> 4);
+        }
+        Climate.Sampler sampler = biomeSource.createSampler(router);
+        return biomeSource.getBiome(blockX >> 2, blockY >> 2, blockZ >> 2, sampler);
+    }
+
+    /** 本世界种子下的要塞环带区块（原版 concentric_rings 定位）。 */
+    boolean isStrongholdRingChunk(int chunkX, int chunkZ) {
+        if (strongholdRingCache == null) {
+            StructureSet set = StructureSet.get("strongholds");
+            if (set == null || set.getRings() == null) return false;
+            strongholdRingCache = new java.util.HashSet<>();
+            for (int[] cp : set.getRings().ringPositions(seedLo)) {
+                strongholdRingCache.add(((long) cp[0] << 32) | (cp[1] & 0xFFFFFFFFL));
+            }
+        }
+        long key = ((long) chunkX << 32) | (chunkZ & 0xFFFFFFFFL);
+        return strongholdRingCache.contains(key);
+    }
+
+    private int endBiomeForChunk(int chunkX, int chunkZ) {
+        if ((long) chunkX * chunkX + (long) chunkZ * chunkZ <= 4096L) return 56;
+        double d = router.erosion().compute(new DensityFunction.SinglePointContext(
+            (chunkX * 2 + 1) * 8, 64, (chunkZ * 2 + 1) * 8));
+        if (d > 0.25) return 17;      // end_highlands
+        if (d >= -0.0625) return 18;  // end_midlands
+        if (d < -0.21875) return 44;  // small_end_islands
+        return 16;                    // end_barrens
     }
 
     private Chunk generateBaseNoCarvers(int chunkX, int chunkZ) {
@@ -398,7 +539,7 @@ public final class DensityRouterChunkGenerator {
                 dimensionType == DimensionType.THE_NETHER,
                 waterId, lavaId,
                 SEA_LEVEL, LAVA_LEVEL,
-                true, false, false);
+                dimensionType == DimensionType.OVERWORLD, false, false);
 
         int[] topSolidY = new int[256];
         java.util.Arrays.fill(topSolidY, MIN_Y - 1);
@@ -485,7 +626,8 @@ public final class DensityRouterChunkGenerator {
         } else {
             fillFixedBiomes(chunk, chunkX, chunkZ, settings.height());
             if (dimensionType == DimensionType.THE_NETHER) {
-                applyNetherBedrock(chunk, settings.height());
+                buildNetherSurfaceSystem(chunk, chunkX, chunkZ, settings.height(), topSolidY)
+                    .buildSurface(chunk);
             }
         }
 
@@ -493,38 +635,37 @@ public final class DensityRouterChunkGenerator {
     }
 
     /**
-     * 下界/末地没有多噪声群系源, 客户端需要正确的 biome 才能渲染对应的天空与雾。
-     * 索引取自 dumped_registries/reg_1.bin (minecraft:worldgen/biome):
-     *   16 end_barrens, 17 end_highlands, 18 end_midlands, 34 nether_wastes,
-     *   44 small_end_islands, 56 the_end
+     * 下界/末地群系填充：
+     * - 下界：原版 nether preset MultiNoise，逐 quart 列采样（噪声为 2D，纵向不变）。
+     * - 末地：原版 TheEndBiomeSource 阈值（见 endBiomeForChunk），原版粒度即按 16×16 列。
+     * biome id 取自 dumped_registries/reg_1.bin：
+     *   2 basalt_deltas, 7 crimson_forest, 16 end_barrens, 17 end_highlands,
+     *   18 end_midlands, 34 nether_wastes, 44 small_end_islands, 49 soul_sand_valley,
+     *   56 the_end, 59 warped_forest
      */
     private void fillFixedBiomes(Chunk chunk, int chunkX, int chunkZ, int height) {
-        final int NETHER_WASTES = 34;
-        final int THE_END = 56;
-        final int SMALL_END_ISLANDS = 44;
-        final int END_BARRENS = 16;
-        final int END_MIDLANDS = 18;
-        final int END_HIGHLANDS = 17;
-
-        int biome;
         if (dimensionType == DimensionType.THE_NETHER) {
-            biome = NETHER_WASTES;
-        } else if (dimensionType == DimensionType.THE_END) {
-            int bx = chunkX << 4, bz = chunkZ << 4;
-            long distSq = (long) bx * bx + (long) bz * bz;
-            if (distSq <= 1000L * 1000L) {
-                biome = THE_END;
-            } else {
-                double d = Math.sqrt(distSq);
-                if (d < 1100) biome = SMALL_END_ISLANDS;
-                else if (d < 1500) biome = END_BARRENS;
-                else if (d < 2500) biome = END_MIDLANDS;
-                else biome = END_HIGHLANDS;
+            // Bug20: 原版下界群系是 3D 的(nether preset temperature 带 y 偏移 -7, 群系随高度变化:
+            // 玄武岩三角洲成片悬空/诡异森林贴顶)。曾固定在 quart y=8 采样 -> 整列同群系,
+            // 下界观感与原版差异明显。改为逐 quart 全高度采样。
+            Climate.Sampler sampler = netherBiomeSource.createSampler(router);
+            int qxBase = (chunkX << 4) >> 2, qzBase = (chunkZ << 4) >> 2;
+            int sections = height >> 4;
+            for (int sec = 0; sec < sections; sec++) {
+                for (int qy = 0; qy < 4; qy++) {
+                    int blockY = MIN_Y + sec * 16 + qy * 4;
+                    int qyQ = blockY >> 2;
+                    for (int qz = 0; qz < 4; qz++)
+                        for (int qx = 0; qx < 4; qx++)
+                            chunk.setBiome(qx * 4, blockY, qz * 4,
+                                netherBiomeSource.getBiome(qxBase + qx, qyQ, qzBase + qz, sampler));
+                }
             }
-        } else {
             return;
         }
+        if (dimensionType != DimensionType.THE_END) return;
 
+        int biome = endBiomeForChunk(chunkX, chunkZ);
         int sections = height >> 4;
         for (int sec = 0; sec < sections; sec++) {
             for (int qy = 0; qy < 4; qy++) {
@@ -558,7 +699,7 @@ public final class DensityRouterChunkGenerator {
                 dimensionType == DimensionType.THE_NETHER,
                 waterId, lavaId,
                 SEA_LEVEL, LAVA_LEVEL,
-                true, false, false);
+                dimensionType == DimensionType.OVERWORLD, false, false);
 
         int minBlockX = chunkMinX;
         int minBlockZ = chunkMinZ;
@@ -687,7 +828,10 @@ public final class DensityRouterChunkGenerator {
         if (dimensionType == DimensionType.OVERWORLD) {
         surfSys.buildSurface(chunk);
         } else if (dimensionType == DimensionType.THE_NETHER) {
-            applyNetherBedrock(chunk, settings.height());
+            // 原版 noise_settings/nether.json surface_rule 全量移植（基岩顶底梯度/玄武岩三角洲/
+            // 灵魂沙峡谷/绯红诡异森林 nylium/下界荒地砾石与灵魂沙带/y<32 熔岩坑）。
+            buildNetherSurfaceSystem(chunk, chunkX, chunkZ, settings.height(), topSolidY)
+                .buildSurface(chunk);
         }
 
         long t4 = profiling ? System.nanoTime() : 0;
@@ -695,51 +839,9 @@ public final class DensityRouterChunkGenerator {
         long t4b = profiling ? System.nanoTime() : 0;
 
         // 洞穴/峡谷雕刻 — 原版遍历 17×17 邻居区块，用 LegacyRandomSource + setLargeFeatureSeed
-        if (dimensionType == DimensionType.OVERWORLD) {
-            computeCarverSeeds();
-        Aquifer aquifer = noiseChunk.aquifer;
-        int minY = settings.minY();
-        int height = settings.height();
-        CarvingMask mask = new CarvingMask(height, minY);
-        for (int dx = -8; dx <= 8; dx++) {
-            for (int dz = -8; dz <= 8; dz++) {
-                int neighborX = chunkX + dx;
-                int neighborZ = chunkZ + dz;
-
-                long caveFinal = (long) neighborX * caveA ^ (long) neighborZ * caveB ^ seedLo;
-                LegacyRandomSource caveRng = new LegacyRandomSource(caveFinal);
-                if (CaveWorldCarver.INSTANCE.isStartChunk(caveRng)) {
-                    CaveWorldCarver.INSTANCE.carve(chunk, mask, caveRng, aquifer,
-                        neighborX, neighborZ, chunkX, chunkZ, minY, height);
-                }
-
-                long caveExtraFinal = (long) neighborX * caveExtraA ^ (long) neighborZ * caveExtraB ^ (seedLo + 1);
-                LegacyRandomSource caveExtraRng = new LegacyRandomSource(caveExtraFinal);
-                if (CaveWorldCarver.CAVE_EXTRA.isStartChunk(caveExtraRng)) {
-                    CaveWorldCarver.CAVE_EXTRA.carve(chunk, mask, caveExtraRng, aquifer,
-                        neighborX, neighborZ, chunkX, chunkZ, minY, height);
-                }
-
-                long canyonFinal = (long) neighborX * canyonA ^ (long) neighborZ * canyonB ^ (seedLo + 2);
-                LegacyRandomSource canyonRng = new LegacyRandomSource(canyonFinal);
-                if (CanyonWorldCarver.INSTANCE.isStartChunk(canyonRng)) {
-                    CanyonWorldCarver.INSTANCE.carve(chunk, mask, canyonRng, aquifer,
-                        neighborX, neighborZ, chunkX, chunkZ, minY, height);
-                }
-            }
-        }
-
-        } // end if OVERWORLD carvers
-
-        long t4c = profiling ? System.nanoTime() : 0;
-
-        RandomSource oreRng = new XoroshiroRandomSource(seedLo + chunkX * 341873128712L + chunkZ * 132897987541L);
-        if (dimensionType == DimensionType.OVERWORLD) {
-            oreGen.generate(chunk, chunkX, chunkZ, oreRng.fork());
-        } else if (dimensionType == DimensionType.THE_NETHER) {
-            oreGen.generateNether(chunk, chunkX, chunkZ, oreRng.fork());
-        }
-        // THE_END：末地无散矿特征
+        // [原版化迁移] 雕刻移至 generate() 特征阶段（FeatureDecoration.carveOverworld）
+        // Bug46: 散矿同样移至 generate() 雕刻之后(原版 ore 是 feature 阶段放置,
+        // 曾在雕刻前放置 -> 挖洞后煤/金/钻石等矿残留悬空在洞穴里)。
 
         if (profiling) {
             profNoiseChunk += t1 - t0;
@@ -747,8 +849,8 @@ public final class DensityRouterChunkGenerator {
             profBiome += t3 - t2;
             profSurface += t4 - t3;
             profDeepBed += t4b - t4;
-            profCarve += t4c - t4b;
-            profOre += (profiling ? System.nanoTime() : 0) - t4c;
+            profCarve += (profiling ? System.nanoTime() : 0) - t4b;
+            profOre += 0;
         }
 
         return chunk;
@@ -857,8 +959,9 @@ public final class DensityRouterChunkGenerator {
         int chunkBiome = allBiomes[8 + 8 * 16];
 
         for (StructureSet set : cachedStructureSets.values()) {
-            if (set == null || set.getPlacement() == null) continue;
-            if (!set.getPlacement().isStructureChunk(seedLo, chunkX, chunkZ)) continue;
+            if (set == null || set.getPlacementLike() == null) continue;
+            if (set.getRings() != null) continue; // 要塞走专用环带管线（isStrongholdRingChunk）
+            if (!set.getPlacementLike().isStructureChunk(seedLo, chunkX, chunkZ)) continue;
 
             RandomSource picker =
                 StructurePlacementMath
@@ -896,10 +999,48 @@ public final class DensityRouterChunkGenerator {
             StructureRegistry.ConfiguredStructure cs =
                 StructureRegistry.get(chosen.structureId());
             if (cs == null) continue;
-            if (!cs.isJigsaw() || cs.startPool == null) continue; // 非 jigsaw 由 placeStructures2 直接放置
 
             int centerX = (chunkX << 4) + 8;
             int centerZ = (chunkZ << 4) + 8;
+
+            // 过程化结构（原版件系统移植）：中央注册 start，跨区块按包围盒重复构建。
+            if (cs.id.equals("mineshaft")) {
+                // Bug27: 分件系统矿井(房间/走廊/十字/楼梯 + 轨道/蛛网/刷怪笼),
+                // 曾用每区块独立 14 段迷你走廊 -> 矿井碎片化互不连通。
+                long sSeed = picker.nextLong();
+                int centerBiome = chunk.getBiome(8, 8);
+                boolean mesa = centerBiome == B_BADLANDS || centerBiome == B_ERODED_BADLANDS
+                    || centerBiome == B_WOODED_BADLANDS;
+                mgr.addStart(dimensionType, chunkX, chunkZ,
+                    ProceduralStructureStart.mineshaft(sSeed, centerX - 4, centerZ - 4,
+                        mesa, cs.id, chunkX, chunkZ));
+                continue;
+            }
+            if (cs.id.equals("fortress")) {
+                long sSeed = picker.nextLong();
+                mgr.addStart(dimensionType, chunkX, chunkZ,
+                    ProceduralStructureStart.fortress(sSeed, centerX - 8, centerZ - 8,
+                        cs.id, chunkX, chunkZ));
+                continue;
+            }
+            if (cs.id.equals("end_city")) {
+                long sSeed = picker.nextLong();
+                mgr.addStart(dimensionType, chunkX, chunkZ,
+                    ProceduralStructureStart.endCity(sSeed, centerX, medianSurfaceY + 1,
+                        centerZ, cs.id, chunkX, chunkZ));
+                continue;
+            }
+            if (cs.id.equals("stronghold")) {
+                // Bug27: 主世界要塞(原版 StrongholdPieces 分件系统 + moveBelowSeaLevel)
+                long sSeed = picker.nextLong();
+                int startY = medianSurfaceY - 25; // 大致地下埋深(原版从 y25 探深调整)
+                mgr.addStart(dimensionType, chunkX, chunkZ,
+                    ProceduralStructureStart.stronghold(sSeed,
+                        centerX, startY, centerZ, cs.id, chunkX, chunkZ));
+                continue;
+            }
+            if (!cs.isJigsaw() || cs.startPool == null) continue; // 非 jigsaw 由 placeStructures2 直接放置
+
             int surfaceY = medianSurfaceY;
             int heightY;
             if (cs.projectStartToHeightmap) {
@@ -913,8 +1054,9 @@ public final class DensityRouterChunkGenerator {
             long structSeed = picker.nextLong();
             java.util.List<PoolElementStructurePiece> pieces =
                 JigsawPlacement.addPieces(
-                    mgr.getTemplateManager(), cs.startPool, cs.size,
-                    centerX, heightY, centerZ, heightY, structSeed, terrainHeightAt);
+                    mgr.getTemplateManager(), cs.startPool, cs.size, cs.maxDistance,
+                    centerX, heightY, centerZ, heightY, structSeed, terrainHeightAt,
+                    com.CharunCore.server.worldgen.structure2.PoolAliases.resolve(cs.poolAliases, picker));
             if (pieces == null || pieces.isEmpty()) continue;
             mgr.addStart(dimensionType, chunkX, chunkZ,
                 new StructureStart(
@@ -936,8 +1078,9 @@ public final class DensityRouterChunkGenerator {
         int chunkBiome = allBiomes[8 + 8 * 16];
 
         for (StructureSet set : cachedStructureSets.values()) {
-            if (set == null || set.getPlacement() == null) continue;
-            if (!set.getPlacement().isStructureChunk(seedLo, chunkX, chunkZ)) continue;
+            if (set == null || set.getPlacementLike() == null) continue;
+            if (set.getRings() != null) continue; // 要塞走专用环带管线（isStrongholdRingChunk）
+            if (!set.getPlacementLike().isStructureChunk(seedLo, chunkX, chunkZ)) continue;
 
             RandomSource picker =
                 StructurePlacementMath
@@ -998,13 +1141,28 @@ public final class DensityRouterChunkGenerator {
 
     private void placeFeatures(WorldGenLevel level, Chunk chunk, int chunkX, int chunkZ,
                                 int[] topSolidY, int[] colBiome) {
-        // 末地: 只生成紫颂树(外岛), 无主世界植被/矿石 (修复: 原直接 return 导致紫颂树缺失)
+        // 末地: 黑曜石柱(主岛) + 紫颂树(外岛), 无主世界植被/矿石
         if (dimensionType == DimensionType.THE_END) {
+            com.CharunCore.server.worldgen.feature.EndSpikeFeature.generate(
+                level, chunkX, chunkZ, seedLo);
             ChorusTreeFeature.generate(
                 level, chunkX, chunkZ,
                 new XoroshiroRandomSource(seedLo + chunkX * 341873128712L + chunkZ * 132897987541L + 98765L));
             return;
         }
+
+        // 下界: 原版式特征（萤石簇/岩浆块/蘑菇/火焰/巨型菌/玄武岩柱）
+        if (dimensionType == DimensionType.THE_NETHER) {
+            NetherFeatures.generate(level, chunk, chunkX, chunkZ, colBiome,
+                new XoroshiroRandomSource(seedLo + chunkX * 341873128712L + chunkZ * 132897987541L + 424242L));
+            return;
+        }
+
+        // 主世界: 采用快速稳定的旧版装饰管线（~50ms/区块，避免 JSON 管线从网络线程
+        // 同步生成导致客户端超时/区块永不完成 = "无法放置/挖掘"）。
+        // JSON 版 applyBiomeDecoration 管线保留在 feature/vanilla，待性能与
+        // RNG 顺序核对后再重新接线。
+        if (dimensionType != DimensionType.OVERWORLD) return;
 
         WorldgenRandom worldgenRandom = new WorldgenRandom(new XoroshiroRandomSource(0L));
         long decorationSeed = worldgenRandom.setDecorationSeed(seedLo, chunkX << 4, chunkZ << 4);

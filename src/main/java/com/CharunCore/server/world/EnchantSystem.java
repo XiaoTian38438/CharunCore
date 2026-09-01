@@ -103,6 +103,55 @@ public class EnchantSystem {
         TREASURE.add("soul_speed");
     }
 
+    /** 附魔名称 → 最大等级（原版 Enchantment.getMaxLevel）。未知返回 1。供铁砧合并等使用。 */
+    public static int getEnchantMaxLevel(String name) {
+        if (name == null) return 1;
+        if (name.startsWith("minecraft:")) name = name.substring(10);
+        Def d = DEFS.get(name);
+        return d != null ? d.maxLevel : 1;
+    }
+
+    // ── Bug6/12: 铁砧按注册表 id 操作附魔所需的定义查询 ─────────────────────
+    private static final Map<Integer, String> ID_TO_NAME = new HashMap<>();
+    private static final Map<Integer, Integer> ID_TO_ANVIL_COST = new HashMap<>();
+    private static final Map<String, Integer> NAME_TO_ID = new HashMap<>();
+
+    static {
+        try (java.io.Reader r = new java.io.InputStreamReader(
+                new java.io.FileInputStream("data/enchantment.json"),
+                java.nio.charset.StandardCharsets.UTF_8)) {
+            com.google.gson.JsonObject root = com.google.gson.JsonParser.parseReader(r).getAsJsonObject();
+            for (com.google.gson.JsonElement e : root.getAsJsonObject("minecraft:enchantment").getAsJsonArray("value")) {
+                com.google.gson.JsonObject o = e.getAsJsonObject();
+                int id = o.get("id").getAsInt();
+                String name = o.get("name").getAsString();
+                ID_TO_NAME.put(id, name.startsWith("minecraft:") ? name.substring(10) : name);
+                NAME_TO_ID.put(name.startsWith("minecraft:") ? name.substring(10) : name, id);
+                ID_TO_ANVIL_COST.put(id, o.getAsJsonObject("element").get("anvil_cost").getAsInt());
+            }
+        } catch (Exception ignored) {}
+    }
+
+    /** 附魔注册表 id → 最大等级; 未知返回 1。 */
+    public static int maxLevelById(int enchantId) {
+        String n = ID_TO_NAME.get(enchantId);
+        return getEnchantMaxLevel(n);
+    }
+
+    /** 附魔注册表 id → 原版 anvil_cost (铁砧消耗权重); 未知返回 1。 */
+    public static int anvilCostById(int enchantId) {
+        return ID_TO_ANVIL_COST.getOrDefault(enchantId, 1);
+    }
+
+    /** 原版 Enchantment.areCompatible: 同一互斥组(exclusive_set)的两个附魔不兼容。 */
+    public static boolean areCompatibleById(int a, int b) {
+        Def da = a == b ? null : DEFS.get(ID_TO_NAME.get(a));
+        Def db = DEFS.get(ID_TO_NAME.get(b));
+        String ga = da == null ? null : da.group;
+        String gb = db == null ? null : db.group;
+        return ga == null || gb == null || !ga.equals(gb);
+    }
+
     private static String itemCategory(String itemName) {
         if (itemName == null) return "none";
         if (itemName.endsWith("_sword")) return "weapon";

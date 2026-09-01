@@ -207,10 +207,12 @@ public class PacketBuffer {
         }
         if (hasTrim) {
             // #19 minecraft:trim (component id 54): ArmorTrim = material(TrimMaterial holder) + pattern(TrimPattern holder)。
-            // TrimMaterial/TrimPattern 用 ByteBufCodecs.holderRegistry -> VarInt id(+1? 否, 直接 registry id)。
+            // 原版 ArmorTrim.STREAM_CODEC = StreamCodec.composite(TrimMaterial.STREAM_CODEC, TrimPattern.STREAM_CODEC),
+            // 二者均为 ByteBufCodecs.holder(registry, direct) —— 对 REFERENCE holder 仅写 VarInt(registryId+1), 无 present 布尔、无 tooltip 布尔。
+            // trimMaterial/trimPattern 已是原版注册表 id（见 NetworkHandler.trimMaterialId/trimPatternId，取自 dumped_registries reg_4/reg_3.bin）。
             writeVarInt(54);
-            writeVarInt(trimMaterial);
-            writeVarInt(trimPattern);
+            writeVarInt(trimMaterial + 1);
+            writeVarInt(trimPattern + 1);
         }
     }
 

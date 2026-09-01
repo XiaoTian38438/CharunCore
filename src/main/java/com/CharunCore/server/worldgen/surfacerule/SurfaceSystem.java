@@ -52,6 +52,8 @@ public class SurfaceSystem {
     private final BiomeManager biomeManager;
     private final BiFunction<Integer, Integer, Integer> preliminarySurfaceFunc;
     private final BiFunction<Integer, Integer, Integer> heightmapFunc;
+    /** 表面规则只对该方块生效（主世界=stone，下界=netherrack）。 */
+    private final int targetBlock;
 
     public SurfaceSystem(SurfaceRules.RuleSource ruleSource,
                           int seaLevel, int minY, int height,
@@ -62,10 +64,26 @@ public class SurfaceSystem {
                           BiomeManager biomeManager,
                           BiFunction<Integer, Integer, Integer> preliminarySurfaceFunc,
                           BiFunction<Integer, Integer, Integer> heightmapFunc) {
+        this(ruleSource, seaLevel, minY, height, surfaceDepthNoise, surfaceSecondaryNoise,
+            clayBandsOffsetNoise, chunk, chunkX, chunkZ, biomeManager,
+            preliminarySurfaceFunc, heightmapFunc, STONE);
+    }
+
+    public SurfaceSystem(SurfaceRules.RuleSource ruleSource,
+                          int seaLevel, int minY, int height,
+                          NormalNoise surfaceDepthNoise,
+                          NormalNoise surfaceSecondaryNoise,
+                          NormalNoise clayBandsOffsetNoise,
+                          Chunk chunk, int chunkX, int chunkZ,
+                          BiomeManager biomeManager,
+                          BiFunction<Integer, Integer, Integer> preliminarySurfaceFunc,
+                          BiFunction<Integer, Integer, Integer> heightmapFunc,
+                          int targetBlock) {
         this.ruleSource = ruleSource;
         this.seaLevel = seaLevel;
         this.minY = minY;
         this.height = height;
+        this.targetBlock = targetBlock;
         this.surfaceDepthNoise = surfaceDepthNoise;
         this.surfaceSecondaryNoise = surfaceSecondaryNoise;
         this.clayBandsOffsetNoise = clayBandsOffsetNoise;
@@ -200,7 +218,7 @@ public class SurfaceSystem {
                     int stoneDepthBelow = y - stoneDepthBelowStart + 1;
 
                     context.updateY(stoneDepthAbove, stoneDepthBelow, waterHeight, y);
-                    if (block == STONE) {
+                    if (block == targetBlock) {
                         int result = surfaceRule.tryApply(blockX, y, blockZ);
                         if (result != NULL) {
                             chunk.setBlock(lx, y, lz, result);

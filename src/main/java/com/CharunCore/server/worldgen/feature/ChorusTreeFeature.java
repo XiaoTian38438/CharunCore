@@ -5,11 +5,14 @@ import com.CharunCore.server.world.gen.RandomSource;
 import com.CharunCore.server.worldgen.WorldGenLevel;
 
 /**
- * 末地紫颂树 (简化版 ChorusPlantFeature): 在末地外岛 (|x|>100 或 |z|>100) 的末地石
- * 地表上生成 2-5 节主干 + 随机分支 + 顶部紫颂花。
- * 方块: chorus_plant (带 up/down/north/south/east/west 属性) + chorus_flower。
+ * 原版 ChorusPlantFeature + ChorusFlowerBlock.generatePlant/growTreeRecursive 逐行移植。
+ * 灌木式递归生长：主干每层 1..4 格（根层 +1），每层可向四方分支（深度 <4），
+ * 无分支时顶端放置 age=5 成熟紫颂花；植物方块连接态(up/down/nsew)按邻居实时计算。
+ * 仅在外岛生成（主岛半径 ~1000 格内跳过，与原版群系分布一致）。
  */
 public final class ChorusTreeFeature {
+
+    private static final int MAX_DIST = 8;
 
     private ChorusTreeFeature() {}
 
@@ -21,76 +24,105 @@ public final class ChorusTreeFeature {
         for (int attempt = 0; attempt < 4; attempt++) {
             int bx = chunkX * 16 + rnd.nextInt(16);
             int bz = chunkZ * 16 + rnd.nextInt(16);
-            // 原版: 紫颂树只在末地外岛生成
-            if (Math.abs(bx) < 100 && Math.abs(bz) < 100) continue;
+            long dx = bx, dz = bz;
+            if (dx * dx + dz * dz <= 900L * 900L) continue;
 
             int top = findTopEndStone(level, bx, bz);
             if (top < 0) continue;
-
             int y = top + 1;
-            // 主干高度 2-5
-            int height = 2 + rnd.nextInt(4);
-            int[][] placed = new int[16][3];
-            int pc = 0;
-            for (int i = 0; i < height; i++) {
-                int above = level.getBlock(bx, y + 1, bz);
-                if (above != 0) break;
-                int cur = level.getBlock(bx, y, bz);
-                if (cur != 0) break;
-                setPlant(level, bx, y, bz, plant, placed, pc++);
-                // 分支: 每节 40% 向一侧长 1-2 格
-                if (rnd.nextInt(10) < 4 && pc < 14) {
-                    int dir = rnd.nextInt(4);
-                    int dx = dir == 0 ? 1 : dir == 1 ? -1 : 0;
-                    int dz = dir == 2 ? 1 : -1;
-                    int len = 1 + rnd.nextInt(2);
-                    int cx = bx, cz = bz, cy = y;
-                    for (int b = 0; b < len && pc < 14; b++) {
-                        cx += dx; cz += dz;
-                        if (level.getBlock(cx, cy, cz) != 0) break;
-                        setPlant(level, cx, cy, cz, plant, placed, pc++);
-                    }
-                }
-                y++;
-                if (y > 250) break;
-            }
-            if (pc > 0 && level.getBlock(bx, y, bz) == 0) {
-                setFlower(level, bx, y, bz, flower);
-            }
+            if (level.getBlock(bx, y, bz) != 0) continue;
+            if (!isEndStone(level, bx, y - 1, bz)) continue;
+
+            generatePlant(level, bx, y, bz, plant, flower, rnd);
         }
     }
 
-    private static void setPlant(WorldGenLevel level, int x, int y, int z, int plant, int[][] placed, int idx) {
+    /** 原版 ChorusFlowerBlock.generatePlant(level, pos, random, 8)。 */
+    private static void generatePlant(WorldGenLevel level, int x, int y, int z,
+                                      int plant, int flower, RandomSource rnd) {
+        setPlantWithConnections(level, x, y, z, plant, flower);
+        growTreeRecursive(level, x, y, z, x, z, plant, flower, rnd, 0);
+    }
+
+    private static void growTreeRecursive(WorldGenLevel level, int px, int py, int pz,
+                                          int ox, int oz, int plant, int flower,
+                                          RandomSource rnd, int depth) {
+        int h = rnd.nextInt(4) + 1;
+        if (depth == 0) h++;
+
+        for (int i = 1; i <= h; i++) {
+            int ax = px, ay = py + i, az = pz;
+            if (!allNeighborsEmpty(level, ax, ay, az, null)) return;
+            setPlantWithConnections(level, ax, ay, az, plant, flower);
+            setPlantWithConnections(level, ax, ay - 1, az, plant, flower);
+        }
+
+        boolean branched = false;
+        if (depth < 4) {
+            int n = rnd.nextInt(4);
+            if (depth == 0) n++;
+            for (int i = 0; i < n; i++) {
+                int[] dir = HORIZONTAL[rnd.nextInt(4)];
+                int bxx = px + dir[0];
+                int byy = py + h;
+                int bzz = pz + dir[2];
+                if (Math.abs(bxx - ox) >= MAX_DIST || Math.abs(bzz - oz) >= MAX_DIST) continue;
+                if (level.getBlock(bxx, byy, bzz) != 0) continue;
+                if (level.getBlock(bxx, byy - 1, bzz) != 0) continue;
+                int[] back = {-dir[0], 0, -dir[2]};
+                if (!allNeighborsEmpty(level, bxx, byy, bzz, back)) continue;
+                branched = true;
+                setPlantWithConnections(level, bxx, byy, bzz, plant, flower);
+                setPlantWithConnections(level, bxx + back[0], byy + back[1], bzz + back[2], plant, flower);
+                growTreeRecursive(level, bxx, byy, bzz, ox, oz, plant, flower, rnd, depth + 1);
+            }
+        }
+        if (!branched) {
+            level.setBlock(px, py + h, pz, BlockStateHelper.withProp(flower, "age", "5"));
+        }
+    }
+
+    private static final int[][] HORIZONTAL = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+
+    /** 原版 ChorusFlowerBlock.allNeighborsEmpty：水平四邻（排除指定方向）必须全空。 */
+    private static boolean allNeighborsEmpty(WorldGenLevel level, int x, int y, int z, int[] exclude) {
+        for (int[] d : HORIZONTAL) {
+            if (exclude != null && d[0] == exclude[0] && d[2] == exclude[2]) continue;
+            if (level.getBlock(x + d[0], y, z + d[2]) != 0) return false;
+        }
+        return true;
+    }
+
+    /** 原版 ChorusPlantBlock.getStateWithConnections。 */
+    private static void setPlantWithConnections(WorldGenLevel level, int x, int y, int z,
+                                                int plant, int flower) {
+        if (level.getBlock(x, y, z) != 0 && !isChorusLike(level.getBlock(x, y, z))) return;
         int st = plant;
-        int up = level.getBlock(x, y + 1, z);
-        int down = level.getBlock(x, y - 1, z);
-        st = BlockStateHelper.withProp(st, "up", up != 0 ? "true" : "false");
-        st = BlockStateHelper.withProp(st, "down", down != 0 ? "true" : "false");
-        int n = level.getBlock(x, y, z - 1), s = level.getBlock(x, y, z + 1);
-        int e = level.getBlock(x + 1, y, z), w = level.getBlock(x - 1, y, z);
-        st = BlockStateHelper.withProp(st, "north", isChorus(n, "chorus_plant", "chorus_flower") ? "true" : "false");
-        st = BlockStateHelper.withProp(st, "south", isChorus(s, "chorus_plant", "chorus_flower") ? "true" : "false");
-        st = BlockStateHelper.withProp(st, "east", isChorus(e, "chorus_plant", "chorus_flower") ? "true" : "false");
-        st = BlockStateHelper.withProp(st, "west", isChorus(w, "chorus_plant", "chorus_flower") ? "true" : "false");
+        st = BlockStateHelper.withProp(st, "down",
+            isChorusLike(level.getBlock(x, y - 1, z)) || isEndStone(level, x, y - 1, z) ? "true" : "false");
+        st = BlockStateHelper.withProp(st, "up", isChorusLike(level.getBlock(x, y + 1, z)) ? "true" : "false");
+        st = BlockStateHelper.withProp(st, "north", isChorusLike(level.getBlock(x, y, z - 1)) ? "true" : "false");
+        st = BlockStateHelper.withProp(st, "south", isChorusLike(level.getBlock(x, y, z + 1)) ? "true" : "false");
+        st = BlockStateHelper.withProp(st, "west", isChorusLike(level.getBlock(x - 1, y, z)) ? "true" : "false");
+        st = BlockStateHelper.withProp(st, "east", isChorusLike(level.getBlock(x + 1, y, z)) ? "true" : "false");
         level.setBlock(x, y, z, st);
-        if (idx < placed.length) { placed[idx][0] = x; placed[idx][1] = y; placed[idx][2] = z; }
     }
 
-    private static void setFlower(WorldGenLevel level, int x, int y, int z, int flower) {
-        level.setBlock(x, y, z, flower);
-    }
-
-    private static boolean isChorus(int state, String... names) {
+    private static boolean isChorusLike(int state) {
         if (state <= 0) return false;
         String n = BlockStateHelper.getName(state);
-        for (String s : names) if (s.equals(n)) return true;
-        return false;
+        return "chorus_plant".equals(n) || "chorus_flower".equals(n);
+    }
+
+    private static boolean isEndStone(WorldGenLevel level, int x, int y, int z) {
+        int st = level.getBlock(x, y, z);
+        return st > 0 && "end_stone".equals(BlockStateHelper.getName(st));
     }
 
     private static int findTopEndStone(WorldGenLevel level, int bx, int bz) {
-        for (int y = 80; y <= 100; y++) {
-            int st = level.getBlock(bx, y, bz);
-            if (st != 0 && BlockStateHelper.getName(st).equals("end_stone")) {
+        int top = Math.min(level.getHeight() - 2, 250);
+        for (int y = top; y >= 1; y--) {
+            if (level.getBlock(bx, y, bz) != 0 && isEndStone(level, bx, y, bz)) {
                 if (level.getBlock(bx, y + 1, bz) == 0) return y;
             }
         }

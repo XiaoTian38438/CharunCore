@@ -159,7 +159,7 @@ public class EnderDragonEntity extends LivingEntity {
         double tx = CENTER_X + Math.cos(angle) * orbitRadius;
         double tz = CENTER_Z + Math.sin(angle) * orbitRadius;
         moveToward(tx, cruiseY, tz, 0.85);
-        faceMovement();
+        faceMovementDragon();
     }
 
     private void tickCharging() {
@@ -170,7 +170,7 @@ public class EnderDragonEntity extends LivingEntity {
             targetZ = target.z;
         }
         moveToward(targetX, targetY, targetZ, 1.1);
-        faceMovement();
+        faceMovementDragon();
     }
 
     private void tickStrafe() {
@@ -183,12 +183,12 @@ public class EnderDragonEntity extends LivingEntity {
             targetZ = target.z + Math.sin(strafeAngle) * off;
         }
         moveToward(targetX, targetY, targetZ, 1.0);
-        faceMovement();
+        faceMovementDragon();
     }
 
     private void tickTakeoff() {
         moveToward(CENTER_X, cruiseY + 14.0, CENTER_Z, 0.8);
-        faceMovement();
+        faceMovementDragon();
     }
 
     private void tickLanding() {
@@ -199,7 +199,7 @@ public class EnderDragonEntity extends LivingEntity {
             phase = PHASE_PERCHING;
             phaseTimer = 200;
         }
-        faceMovement();
+        faceMovementDragon();
     }
 
     private void tickPerching() {
@@ -214,14 +214,14 @@ public class EnderDragonEntity extends LivingEntity {
                 breathCooldown = 60;
             }
         }
-        faceMovement();
+        faceMovementDragon();
     }
 
     private void tickDeath() {
         vy += 0.03;
         vx *= 0.92;
         vz *= 0.92;
-        faceMovement();
+        faceMovementDragon();
     }
 
     private void breathAttack() {
@@ -250,25 +250,29 @@ public class EnderDragonEntity extends LivingEntity {
         double ax = dx / dist * speed;
         double ay = dy / dist * speed;
         double az = dz / dist * speed;
-        vx += (ax - vx) * 0.15;
-        vy += (ay - vy) * 0.15;
-        vz += (az - vz) * 0.15;
+        // Bug25: 加快 lerp(0.15->0.3) 让龙更快达到目标速度, 原值下龙启动极慢("速度非常慢")。
+        vx += (ax - vx) * 0.3;
+        vy += (ay - vy) * 0.3;
+        vz += (az - vz) * 0.3;
     }
 
     private void faceMovement() {
         double speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
-        if (speed < 0.002) return; // 完全静止才保持朝向, 否则始终面向运动方向(避免"漂移"感)
-        // 水平朝向: 用 vx/vz; 垂直为主时仍按水平分量定向, 保证龙身不卡在一个方向
+        // Bug25: 阈值从 0.002 降到 0.0 -- 曾在低速时跳过 yaw 更新, 龙始终朝一个方向(看起来"倒着飞")。
+        if (speed < 1e-6) return;
         double horiz = Math.sqrt(vx * vx + vz * vz);
-        if (horiz > 0.0001) {
-            // #37 修复: yaw 归一化到 [0,360)。曾允许 atan2 返回负角(-180..180),
-            // 而 0x51 head_rotation 用 (byte)(yaw*256/360) 编码, 负 yaw 字节值错误
-            // -> 客户端龙头朝反方向, 表现为"末影龙倒着飞"。
+        if (horiz > 1e-6) {
             this.yaw = (float) Math.toDegrees(Math.atan2(-vx, vz));
             this.yaw = ((this.yaw % 360) + 360) % 360;
         }
-        // 俯仰: 用整体速度与水平分量的夹角(即使纯垂直移动也有正确俯仰)
-        this.pitch = (float) -Math.toDegrees(Math.atan2(vy, Math.max(horiz, 0.0001)));
+        this.pitch = (float) -Math.toDegrees(Math.atan2(vy, Math.max(horiz, 1e-6)));
+    }
+
+    /** Bug25: 龙模型朝向与普通生物相反(客户端 EnderDragonRenderer 机身轴向翻转),
+     *  按 atan2(-vx,vz) 朝向的龙在客户端看是"倒着飞", 需 +180°。 */
+    private void faceMovementDragon() {
+        faceMovement();
+        this.yaw = (this.yaw + 180.0f) % 360.0f;
     }
 
     private void damageNearbyPlayers() {

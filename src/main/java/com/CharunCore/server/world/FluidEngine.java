@@ -510,9 +510,13 @@ public class FluidEngine {
         if (isSource || level < maxLevel || level == 8) {
             int below = WorldManager.getBlockState(dim, x, y - 1, z);
             if (canDisplace(below)) { // B4: 允许冲走可替换方块（植物/雪等），不仅是纯空气
-                int downState = isSource ? currentState : BlockStateHelper.withProp(currentState, "level", "8");
-                WorldManager.setBlock(dim, x, y - 1, z, downState);
-                NetworkHandler.broadcastBlockChange(x, y - 1, z, downState);
+                // Bug28: 下方一律生成下落水(level=8)。曾水源向下复制完整水源(level=0)
+                // -> 倒一桶水垂直复制出整条源柱(可无限取水, 且源柱彼此互为滋养助长振荡)。
+                int downState = BlockStateHelper.withProp(currentState, "level", "8");
+                if (below != downState) {
+                    WorldManager.setBlock(dim, x, y - 1, z, downState);
+                    NetworkHandler.broadcastBlockChange(x, y - 1, z, downState);
+                }
                 scheduleFluidTick(dim, x, y - 1, z, downState, flowDelay);
                 flowedDown = true;
             }
@@ -531,8 +535,11 @@ public class FluidEngine {
             int[][] spreadNeighbors = {{x+1,y,z}, {x-1,y,z}, {x,y,z+1}, {x,y,z-1}};
             for (int[] nb : spreadNeighbors) {
                 if (canDisplace(WorldManager.getBlockState(dim, nb[0], nb[1], nb[2]))) { // B4
-                    WorldManager.setBlock(dim, nb[0], nb[1], nb[2], spreadState);
-                    NetworkHandler.broadcastBlockChange(nb[0], nb[1], nb[2], spreadState);
+                    // #44: 目标已是该状态则跳过(防振荡期同格反复 set+广播 -> 单块包洪泛)
+                    if (WorldManager.getBlockState(dim, nb[0], nb[1], nb[2]) != spreadState) {
+                        WorldManager.setBlock(dim, nb[0], nb[1], nb[2], spreadState);
+                        NetworkHandler.broadcastBlockChange(nb[0], nb[1], nb[2], spreadState);
+                    }
                     scheduleFluidTick(dim, nb[0], nb[1], nb[2], spreadState, flowDelay);
                 }
             }
@@ -585,13 +592,20 @@ public class FluidEngine {
             if (!fluidName.equals(BlockStateHelper.getName(ns))) continue;
             String lp = BlockStateHelper.getProp(ns, "level");
             int nl = lp == null ? 0 : Integer.parseInt(lp);
-            // #49 修复: 原版流动水只由"水源(0)"或"正上方 y+1 更小 level"滋养, 水平流动水不能互相滋养。
-            // 曾对水平邻居流动水(nl<level)也返回 true -> 堵住水源后已流出的水流相互"续命"不干涸,
-            // 表现为"水源换了一个地方, 再也堵不住"。
-            if (nl == 0) return true;        // 水源直接滋养
+            // 原版 FlowingFluid: 流动水(level>0)由"任意方向 level 更小"的邻居滋养 ——
+            // 水源(0) 自然滋养; 水平相邻 level L-1 滋养 level L(形成 waterfall chain)。
+            // 此前水平邻居仅认 nl==0, 导致 level2 认不到 level1 -> 被判定无滋养而删除,
+            // 下一刻又被 level1 重新铺出 -> "流动后收回"的抖动(Bug29)。
+            // 注意 nl<level 不会产生互保死循环: level 严格递减, 无法成环; 移除水源后
+            // 仍会从最外层(level 最大)向内逐刻干涸(见 processFluid 的干涸级联)。
+            if (nl == 0) return true;        // 水源直接滋养(任意方向)
             if (nl == 8 && d[1] == 1) return true; // 正上方下落水(瀑布)经竖直列回溯到水源
-            if (d[1] == 1 && nl < level) return true; // 正上方更低 level(原版 flowing above feeds)
+            if (d[1] == 1 && (nl < level || nl == 8)) return true; // 正上方更低 level 或下落水
             if (d[1] == -1 && nl == 0) return true;  // 正下方水源(静态水柱)
+            // Bug28: 水平邻居为下落水(level=8, 瀑布底)也应滋养 level=1 的扩散水。
+            // 曾只认 nl<level(8<1 为假) -> 瀑布底铺出的 level1 下一刻被判"无滋养"删除,
+            // 下一刻又被母体重铺 -> "流动的水一会流动一会收回"无限横跳。
+            if (d[1] == 0 && (nl < level || nl == 8)) return true; // 水平更低 level/下落水滋养
         }
         return false;
     }

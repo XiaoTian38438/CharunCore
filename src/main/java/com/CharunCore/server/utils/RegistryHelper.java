@@ -322,7 +322,7 @@ public class RegistryHelper {
         return computeBpe(paletteSize);
     }
 
-    private static String biomeIdToName(int id) {
+    public static String biomeIdToName(int id) {
         String[] names = {
             "badlands", "bamboo_jungle", "basalt_deltas", "beach", "birch_forest",
             "cherry_grove", "cold_ocean", "crimson_forest", "dark_forest", "deep_cold_ocean",
@@ -401,7 +401,9 @@ public class RegistryHelper {
         if (name == null) return 1;
         if (name.startsWith("minecraft:")) name = name.substring(10);
         // 规范化: 材质前缀的告示牌/墙告示牌 -> sign
-        if (name.endsWith("_sign") || name.endsWith("_wall_sign")) name = "sign";
+        // Bug9: 悬挂式告示牌必须先于 _sign 判断(endsWith("_sign") 会误归到 sign)
+        if (name.endsWith("_hanging_sign") || name.endsWith("_wall_hanging_sign")) name = "hanging_sign";
+        else if (name.endsWith("_sign") || name.endsWith("_wall_sign")) name = "sign";
         if (name.endsWith("_bed")) name = "bed";
         if (name.endsWith("_banner")) name = "banner";
         if (name.endsWith("_skull") || name.endsWith("_wall_head") || name.endsWith("_head")) name = "skull";

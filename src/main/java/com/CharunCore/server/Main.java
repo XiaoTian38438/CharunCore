@@ -90,6 +90,7 @@ public class Main {
         }));
 
         scheduler.scheduleAtFixedRate(() -> {
+            try {
             worldAge += 1;
             dayTime   = (dayTime + 1) % 24000;
             tickCount++;
@@ -153,6 +154,11 @@ public class Main {
                     }
                 }
             }
+            } catch (Throwable t) {
+                // Bug34: 时钟线程同样不允许被异常杀死(曾无任何 try -> 一次异常时间永久冻结)。
+                System.err.println("[Tick] 时钟线程本刻异常(已隔离): " + t);
+                t.printStackTrace();
+            }
         }, 50, 50, TimeUnit.MILLISECONDS);
 
         // BUG7: 重型世界 tick 单独一个 50ms 节拍(WorldTickScheduler), 与时钟节拍分离。
@@ -177,27 +183,25 @@ public class Main {
             // 不会因"生成新区块"而卡死, TPS 与服务器时间不再冻结。
             WorldManager.markTickThread();
             try {
-            EntityManager.tick();
-
-            SpawnerSystem.tick();
-
-            EndDragonFight.tick();
-
-            FluidEngine.tick();
-
-            ContainerStore.tick();
-
-            RedstoneEngine.tick();
-
-            RandomTickEngine.tick();
-
-            ServerScheduler.INSTANCE.tick();
-
-            for (NetworkHandler player : NetworkHandler.players.values()) {
-                if (player.ctx != null && player.ctx.channel().isActive()) {
-                    player.tickSurvival();
+                // Bug34: 每个子系统独立 try/catch。scheduleAtFixedRate 的任务一旦抛出未捕获
+                // 异常会被静默永久取消 —— 曾一处异常即杀死整个世界 tick(流体不流/实体不广播/
+                // 容器不走), 且毒数据存盘后重启也复现(症状即"假死后遗症, 重启无效删档才好")。
+                runGuarded("EntityManager", EntityManager::tick);
+                runGuarded("SpawnerSystem", SpawnerSystem::tick);
+                runGuarded("EndDragonFight", EndDragonFight::tick);
+                runGuarded("FluidEngine", FluidEngine::tick);
+                runGuarded("ContainerStore", ContainerStore::tick);
+                runGuarded("RedstoneEngine", RedstoneEngine::tick);
+                runGuarded("RandomTickEngine", RandomTickEngine::tick);
+                runGuarded("LightEngine", com.CharunCore.server.world.light.LightEngine::tick);
+                runGuarded("BeaconEffects", NetworkHandler::beaconEffectTick);
+                runGuarded("ServerScheduler", () -> ServerScheduler.INSTANCE.tick());
+                for (NetworkHandler player : NetworkHandler.players.values()) {
+                    if (player.ctx != null && player.ctx.channel().isActive()) {
+                        NetworkHandler p = player;
+                        runGuarded("tickSurvival(" + p.username + ")", p::tickSurvival);
+                    }
                 }
-            }
             } finally {
                 WorldManager.unmarkTickThread();
             }
@@ -239,6 +243,16 @@ public class Main {
         serverChannel.closeFuture().sync();
         RUNNING = false;
         System.out.println("[系统] 服务器已停止");
+    }
+
+    /** Bug34: 单个 tick 子系统的异常隔离 — 捕获并记录, 绝不让异常逃出杀掉整个周期任务。 */
+    private static void runGuarded(String name, Runnable r) {
+        try {
+            r.run();
+        } catch (Throwable t) {
+            System.err.println("[Tick] 子系统 " + name + " 本刻异常(已隔离, tick 继续): " + t);
+            t.printStackTrace();
+        }
     }
 
     /** 读取 System.in 的守护线程, 把每一行交给 ConsoleCommandHandler 执行。 */

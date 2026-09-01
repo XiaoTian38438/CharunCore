@@ -112,11 +112,51 @@ public final class LightEngine {
         }
 
         java.util.Set<Chunk> touched = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        // Bug40c: 从已算好光的相邻区块边界"拉"光进来并允许写回(修"光源被切割一边亮一边暗")。
+        // 曾只做本区块内部 BFS, 后加载的一侧永远收不到先加载一侧的边界光。
+        importBorderLight(chunk, dim, skyQueue, blockQueue, touched);
         propagate(skyQueue, dim, true, touched);
         propagate(blockQueue, dim, false, touched);
         chunk.markLightComputed();
         for (Chunk other : touched) {
             if (other != chunk) NetworkHandler.broadcastLightUpdate(other);
+        }
+    }
+
+    /** Bug40c: 相邻已照亮相区块 -> 本区块: 边界列逐 y 按邻块光值-不透明度播种进队列。 */
+    private static void importBorderLight(Chunk chunk, DimensionType dim,
+                                          LongFifo skyQueue, LongFifo blockQueue,
+                                          java.util.Set<Chunk> touched) {
+        int[][] sides = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        int top = dim.minY + dim.height - 1;
+        for (int[] side : sides) {
+            Chunk nb = WorldManager.getChunkCached(dim, chunk.getX() + side[0], chunk.getZ() + side[1]);
+            if (nb == null || !nb.isLightComputed()) continue;
+            for (int t = 0; t < 16; t++) {
+                int lx = side[0] == 1 ? 15 : side[0] == -1 ? 0 : t;
+                int lz = side[1] == 1 ? 15 : side[1] == -1 ? 0 : t;
+                int nx = side[0] == 1 ? 0 : side[0] == -1 ? 15 : t;
+                int nz = side[1] == 1 ? 0 : side[1] == -1 ? 15 : t;
+                for (int y = dim.minY; y <= top; y++) {
+                    int op = opacity(chunk.getBlock(lx, y, lz));
+                    if (op >= 15) continue;
+                    int red = Math.max(1, op);
+                    if (dim.hasSkylight) {
+                        int nSky = getSkyLocal(nb, nx, y, nz);
+                        int want = nSky - red;
+                        if (want > getSkyLocal(chunk, lx, y, lz)) {
+                            setSkyLocal(chunk, lx, y, lz, want);
+                            skyQueue.push(packLocal(chunk, lx, y, lz));
+                        }
+                    }
+                    int nBlk = getBlockLightLocal(nb, nx, y, nz);
+                    int wantB = nBlk - red;
+                    if (wantB > getBlockLightLocal(chunk, lx, y, lz)) {
+                        setBlockLocal(chunk, lx, y, lz, wantB);
+                        blockQueue.push(packLocal(chunk, lx, y, lz));
+                    }
+                }
+            }
         }
     }
 
@@ -129,16 +169,61 @@ public final class LightEngine {
         return false;
     }
 
-    public static void onBlockChanged(DimensionType dim, int x, int y, int z, int oldState, int newState) {
+    /** Bug40b: 待补做的方块光照增量(初始光照 BFS 期间到达的放/撤光)。
+     *  曾直接丢弃 -> 火把放下一格亮其余全黑、封闭空间保留旧亮度直到重进。 */
+    private record PendingLight(int x, int y, int z, int oldState, int newState) {}
+    private static final java.util.Map<DimensionType, java.util.List<PendingLight>> pendingLightUpdates =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Bug40 诊断: -Dcharun.debugLight=1 时打印增量光照调用细节 */
+    private static final boolean LIGHT_DEBUG = Boolean.parseBoolean(System.getProperty("charun.debugLight", "0"));
+
+    public static synchronized void onBlockChanged(DimensionType dim, int x, int y, int z, int oldState, int newState) {
+        if (LIGHT_DEBUG) {
+            System.out.println("[光照诊断] onBlockChanged dim=" + dim.key + " (" + x + "," + y + "," + z
+                + ") old=" + oldState + "(" + BlockStateHelper.getName(oldState) + ") op=" + opacity(oldState)
+                + " -> new=" + newState + "(" + BlockStateHelper.getName(newState) + ") op=" + opacity(newState)
+                + " em=" + emission(newState));
+        }
         Chunk chunk = WorldManager.getChunkCached(dim, x >> 4, z >> 4);
-        if (chunk == null || !chunk.isLightComputed()) return;
+        if (chunk == null || !chunk.isLightComputed()) {
+            var list = pendingLightUpdates.computeIfAbsent(dim, d -> java.util.Collections.synchronizedList(new java.util.ArrayList<>()));
+            synchronized (list) { list.add(new PendingLight(x, y, z, oldState, newState)); }
+            return;
+        }
+        applyBlockLight(dim, x, y, z, oldState, newState);
+    }
+
+    /** 每 tick 由世界主循环调用: 补做初始光照计算期间被搁置的方块光照增量。 */
+    public static void tick() {
+        for (var e : pendingLightUpdates.entrySet()) {
+            java.util.List<PendingLight> list = e.getValue();
+            if (list.isEmpty()) continue;
+            java.util.List<PendingLight> batch;
+            synchronized (list) {
+                if (list.isEmpty()) continue;
+                batch = new java.util.ArrayList<>(list);
+                list.clear();
+            }
+            for (PendingLight pl : batch) {
+                Chunk c = WorldManager.getChunkCached(e.getKey(), pl.x() >> 4, pl.z() >> 4);
+                if (c != null && c.isLightComputed()) {
+                    applyBlockLight(e.getKey(), pl.x(), pl.y(), pl.z(), pl.oldState(), pl.newState());
+                }
+                // 区块仍未亮相/已卸载 -> 丢弃, 该区块下次亮相会整块重算。
+            }
+        }
+    }
+
+    private static void applyBlockLight(DimensionType dim, int x, int y, int z, int oldState, int newState) {
         int oldEm = emission(oldState), newEm = emission(newState);
         int oldOp = opacity(oldState), newOp = opacity(newState);
 
         LongFifo removal = new LongFifo(64);
         LongFifo add = new LongFifo(64);
         java.util.Set<Chunk> touched = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
-        touched.add(chunk);
+        Chunk chunk = WorldManager.getChunkCached(dim, x >> 4, z >> 4);
+        if (chunk != null) touched.add(chunk);
 
         int cur = getLight(dim, x, y, z, false);
         if (cur > newEm) {
@@ -177,6 +262,7 @@ public final class LightEngine {
                 pushNeighborLights(skyAdd, dim, x, y, z, true);
             }
             unpropagate(skyRemoval, dim, true, skyAdd, touched);
+            if (LIGHT_DEBUG) System.out.println("[光照诊断] skyRemoval=" + skyRemoval + " touched=" + touched.size());
             propagate(skyAdd, dim, true, touched);
         }
 
@@ -325,6 +411,12 @@ public final class LightEngine {
 
     private static int getSkyLocal(Chunk chunk, int x, int y, int z) {
         byte[] a = lightArray(chunk, (y - chunk.getMinY()) >> 4, true);
+        if (a == null) return 0;
+        return (a[(((y & 15) << 8) | (z << 4) | x) >> 1] >> ((x & 1) << 2)) & 15;
+    }
+
+    private static int getBlockLightLocal(Chunk chunk, int x, int y, int z) {
+        byte[] a = lightArray(chunk, (y - chunk.getMinY()) >> 4, false);
         if (a == null) return 0;
         return (a[(((y & 15) << 8) | (z << 4) | x) >> 1] >> ((x & 1) << 2)) & 15;
     }

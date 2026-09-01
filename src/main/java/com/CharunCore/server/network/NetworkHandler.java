@@ -73,6 +73,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private final java.util.Map<Integer, String[]> openCraftingGrids = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Bug4/33: 工作台网格每槽组件(放入附魔/改名物品再取出/关窗退回时不丢 NBT)。 */
+    private final java.util.Map<Integer, ItemMeta[]> openGridMetas = new java.util.concurrent.ConcurrentHashMap<>();
     // 与 openCraftingGrids 平行的 9 格数量表, 使合成网格支持堆叠
     private final java.util.Map<Integer, int[]> openCraftingCounts = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -169,6 +171,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private int lastChunkX = Integer.MAX_VALUE, lastChunkZ = Integer.MAX_VALUE;
     private final java.util.Set<Long> loadedChunks =
             new ConcurrentHashMap<Long, Boolean>().keySet(true);
+    /** Bug44: 待发送区块队列(每 tick 限量泵送), queuedChunkKeys 防重复入队。 */
+    final java.util.concurrent.ConcurrentLinkedDeque<long[]> pendingChunkSends =
+            new java.util.concurrent.ConcurrentLinkedDeque<>();
+    private final java.util.Set<Long> queuedChunkKeys = ConcurrentHashMap.newKeySet();
     private final int VIEW_DISTANCE = ServerConfig.viewDistance;
     public float health = 20.0f;
 
@@ -259,6 +265,49 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private int carriedTrimMaterial = -1;
     private int carriedTrimPattern = -1;
 
+    /** Bug4/33: 槽位/光标/掉落物通用的物品组件快照, 随物品移动而不再依赖各处手工拷贝。 */
+    public record ItemMeta(java.util.Map<Integer, Integer> enchants, String potion, String customName,
+                           int damage, int trimMaterial, int trimPattern) {
+        public static final ItemMeta EMPTY =
+                new ItemMeta(java.util.Map.of(), null, null, 0, -1, -1);
+        public boolean isEmpty() {
+            return damage == 0 && trimMaterial < 0 && trimPattern < 0
+                    && (potion == null || potion.isEmpty())
+                    && (customName == null || customName.isEmpty())
+                    && (enchants == null || enchants.isEmpty());
+        }
+        public static ItemMeta of(java.util.Map<Integer, Integer> enchants, String potion,
+                                  String customName, int damage, int trimM, int trimP) {
+            ItemMeta m = new ItemMeta(enchants == null ? java.util.Map.of() : enchants,
+                    potion, customName, damage, trimM, trimP);
+            return m.isEmpty() ? EMPTY : m;
+        }
+    }
+
+    private ItemMeta carriedSnapshot() {
+        return ItemMeta.of(carriedEnchants, carriedPotionType, carriedCustomName,
+                carriedDamage, carriedTrimMaterial, carriedTrimPattern);
+    }
+
+    private void loadCarriedFrom(ItemMeta m) {
+        if (m == null) m = ItemMeta.EMPTY;
+        carriedEnchants = m.enchants().isEmpty() ? new java.util.HashMap<>() : new java.util.HashMap<>(m.enchants());
+        carriedPotionType = m.potion();
+        carriedCustomName = m.customName();
+        carriedDamage = m.damage();
+        carriedTrimMaterial = m.trimMaterial();
+        carriedTrimPattern = m.trimPattern();
+    }
+
+    private void clearCarriedMeta() {
+        carriedEnchants = new java.util.HashMap<>();
+        carriedPotionType = null;
+        carriedCustomName = null;
+        carriedDamage = 0;
+        carriedTrimMaterial = -1;
+        carriedTrimPattern = -1;
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
 
     public ChannelHandlerContext ctx;
@@ -271,6 +320,19 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     public void channelActive(ChannelHandlerContext ctx) throws Exception {
         this.ctx = ctx;
         super.channelActive(ctx);
+    }
+
+    /** 客户端异常断线(强退/断网/宿主软件中止连接)时 Netty 会把 IOException 抛到
+     *  pipeline 尾部打整段 WARN 堆栈。这里安静地关闭通道走正常 channelInactive 清理流程。 */
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        if (cause instanceof java.io.IOException) {
+            ctx.close();
+            return;
+        }
+        System.err.println("[网络] " + (username == null ? "未知连接" : username)
+            + " 连接异常: " + cause);
+        ctx.close();
     }
 
     @Override
@@ -616,8 +678,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     pb.writeByte((byte) 0x00);       // dataKept = 0 (死亡重生不保留属性/元数据)
                 });
 
-                // 2. 满血复活
-                sendPacket(ctx, 0x66, pb -> {
+                // 2. 满血复活 (update_health = 0x67, 曾误用 0x66=set_experience -> 客户端断开)
+                sendPacket(ctx, 0x67, pb -> {
                     pb.writeFloat(20.0f); pb.writeVarInt(20); pb.writeFloat(5.0f);
                 });
 
@@ -674,9 +736,20 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 // 否则 F3+F4 切换器权限丢失("没有权限打开游戏模式切换器", 重进游戏才恢复)。
                 sendCommandsPacket(ctx);
 
+                // #1 修复(关键): 客户端权限等级的唯一来源是 entity_event 24+等级
+                // (LocalPlayer.handleEntityEvent: eventId 24..28 -> setPermissionLevel(0..4))。
+                // 登录时已发过一次(见 sendLoginPlay 的 writeByte(28)); 重生后客户端重建
+                // LocalPlayer, 权限态清零且不会从 player_info_update/命令树恢复 ->
+                // F3+F4 报"没有权限打开游戏模式切换器", 重进游戏才好。此处按真实 OP 等级重发。
+                final int fOpLevel = Math.max(0, Math.min(4, opLevel()));
+                sendPacket(ctx, 0x22, pb -> {
+                    pb.writeInt(this.eid);
+                    pb.writeByte((byte) (24 + fOpLevel));
+                });
+
                 // 4. 【修复】重生后需要重新加载周围的chunk数据，否则客户端会无限加载
                 ctx.executor().execute(() -> {
-                    loadedChunks.clear();
+                    resetChunkSendQueue();
                     sendInitialChunks(ctx);
                 });
             }
@@ -693,7 +766,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             double ry = in.getBuffer().readDouble();
             double rz = in.getBuffer().readDouble();
             this.onGround = (in.getBuffer().readByte() & 1) != 0;
-            if (this.riddenEntity == null) { x = rx; y = ry; z = rz; handleMove(); }
+            // Bug34: 拒绝非有限/越界坐标 —— 曾 NaN 直接进 x/y/z 并被存进 playerdata,
+            // 客户端被传送到 NaN 后物理坏死(F5 看不见自己/无法移动/相机错位), 重进仍坏。
+            if (validPlayerPos(rx, ry, rz) && this.riddenEntity == null) { x = rx; y = ry; z = rz; handleMove(); }
         }
         else if (id == 0x1E) { // move_player_pos_rot
             double rx = in.getBuffer().readDouble();
@@ -702,13 +777,18 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             float ryaw = in.getBuffer().readFloat();
             float rpitch = in.getBuffer().readFloat();
             this.onGround = (in.getBuffer().readByte() & 1) != 0;
-            if (this.riddenEntity == null) { x = rx; y = ry; z = rz; yaw = ryaw; pitch = rpitch; handleMove(); }
+            if (validPlayerPos(rx, ry, rz) && this.riddenEntity == null) {
+                x = rx; y = ry; z = rz;
+                if (Float.isFinite(ryaw)) yaw = ryaw;
+                if (Float.isFinite(rpitch)) pitch = rpitch;
+                handleMove();
+            }
         }
         else if (id == 0x1F) { // move_player_rot
-            yaw   = in.getBuffer().readFloat();
-            pitch = in.getBuffer().readFloat();
+            float ryaw = in.getBuffer().readFloat();
+            float rpitch = in.getBuffer().readFloat();
             this.onGround = (in.getBuffer().readByte() & 1) != 0;
-            broadcastMove();
+            if (Float.isFinite(ryaw) && Float.isFinite(rpitch)) { yaw = ryaw; pitch = rpitch; broadcastMove(); }
         }
         else if (id == 0x20) { // move_player_status_only (只报着地状态)
             this.onGround = (in.getBuffer().readByte() & 1) != 0;
@@ -737,20 +817,39 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             }
         }
         else if (id == 0x21) { // vehicle_move (骑乘时客户端上报载具位置/朝向)
-            in.getBuffer().readDouble(); // vehicle x
-            in.getBuffer().readDouble(); // vehicle y
-            in.getBuffer().readDouble(); // vehicle z
+            double vcx = in.getBuffer().readDouble();
+            double vcy = in.getBuffer().readDouble();
+            double vcz = in.getBuffer().readDouble();
             float vyaw = in.getBuffer().readFloat();
-            in.getBuffer().readFloat();  // pitch
+            float vpitch = in.getBuffer().readFloat();
             if (this.riddenEntity instanceof MinecartEntity cart) {
-                cart.lastInputYaw = vyaw;
-                // 玩家朝向投影到轨轴 -> 油门方向(与项目 (-sin,cos) 习惯一致)
-                double fdx = -Math.sin(Math.toRadians(vyaw));
-                double fdz = Math.cos(Math.toRadians(vyaw));
-                double dot = fdx * cart.dirX + fdz * cart.dirZ;
-                if (dot > 0.3) cart.throttle = 1;
-                else if (dot < -0.3) cart.throttle = -1;
-                else cart.throttle = 0;
+                // Bug24 修复: 原版骑乘载具是客户端权威 —— 客户端模拟矿车物理并经
+                // vehicle_move 上报真实位置, 服务端只需采纳并跟随。
+                // 曾服务端自行模拟 + 丢弃上报坐标 -> 服务端/客户端互相拉扯,
+                // 表现为"按移动键开不动 + 沿轨高频小幅抖动"。
+                double ddx = vcx - cart.x, ddy = vcy - cart.y, ddz = vcz - cart.z;
+                double distSq = ddx * ddx + ddy * ddy + ddz * ddz;
+                // Bug34: 拒绝非有限/瞬移坐标, 防 NaN 进入矿车与骑乘者服务端状态
+                // Bug24 二轮: 有油门输入时服务端主导, 忽略客户端位置流(防两套物理对撞)
+                if (cart.throttle != 0) return;
+                if (distSq < 64.0 && Double.isFinite(vcx) && Double.isFinite(vcy) && Double.isFinite(vcz)
+                        && Float.isFinite(vyaw) && Float.isFinite(vpitch)) {
+                    cart.x = vcx; cart.y = vcy; cart.z = vcz;
+                    cart.yaw = vyaw; cart.pitch = vpitch;
+                    cart.clientDriven = true;
+                    cart.clientDrivenGrace = 10;
+                    double hDist = Math.hypot(ddx, ddz);
+                    if (hDist > 0.01) {
+                        int ndx = Math.abs(ddx) >= Math.abs(ddz) ? (ddx > 0 ? 1 : -1) : 0;
+                        int ndz = ndx == 0 ? (ddz > 0 ? 1 : -1) : 0;
+                        if (ndx != 0 || ndz != 0) { cart.dirX = ndx; cart.dirZ = ndz; }
+                        cart.speed = Math.min(0.6, hDist);
+                    } else {
+                        cart.speed = 0.0;
+                    }
+                    // 同步骑乘者坐标(服务端视角)
+                    this.x = vcx; this.y = vcy + 0.7; this.z = vcz;
+                }
             }
         }
 
@@ -1027,6 +1126,15 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             in.readByte();               // face
             int sequence = in.readVarInt();
 
+            // #56 诊断: 下界/末地无法破坏方块 —— 临时追踪服务端视角
+            if (this.currentDim != DimensionType.OVERWORLD) {
+                int dbgState = WorldManager.getBlockState(this.currentDim, pos[0], pos[1], pos[2]);
+                System.out.println("[挖掘诊断] dim=" + this.currentDim.key + " status=" + status
+                    + " pos=" + pos[0] + "," + pos[1] + "," + pos[2]
+                    + " state=" + dbgState + "/" + BlockStateHelper.getName(dbgState)
+                    + " gameMode=" + gameMode);
+            }
+
             // 1. 必须回复 Acknowledge Block Change（否则客户端预测永远不被清除）
             //    ❓ 0x04 = block_changed_ack，通过日志验证
             final int seq = sequence;
@@ -1052,6 +1160,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     }
                 }
                 breakBlockAt(pos[0], pos[1], pos[2]);
+                // Bug59: 挖掘完成/被拒 -> 其他玩家的裂纹消失
+                clearDigProgress();
             }
             else if (status == 0 && gameMode == 0) {
                 // #2 修复: 原版客户端挖「瞬破方块」(硬度 0, 如火把/红石粉/中继器/花/草) 时
@@ -1066,6 +1176,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 } else {
                     digStarts.put(pos[0] + "," + pos[1] + "," + pos[2], System.currentTimeMillis());
                     broadcastBlockBreakProgress(this.eid, pos[0], pos[1], pos[2], 0);
+                    // Bug59: 记录进行中的生存挖掘, tickSurvival 按 elapsed/总时长 广播裂纹阶段
+                    digProgressX = pos[0]; digProgressY = pos[1]; digProgressZ = pos[2];
+                    digProgressStart = System.currentTimeMillis();
+                    digProgressDurMs = Math.max(50.0f, reqSec0 * 1000.0f);
+                    digProgressStage = 0;
                 }
             }
             // status=3 DROP_ALL_ITEMS (Ctrl+Q, 丢整组), status=4 DROP_ITEM (Q, 丢一个)
@@ -1073,35 +1188,50 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 int slot = 36 + heldItemSlot;
                 if (data.inventoryCounts[slot] > 0) {
                     int itemId = data.inventoryIds[slot];
-                    int count = (status == 3) ? data.inventoryCounts[slot] : 1;
+                    ItemMeta dm = playerSlotMeta(slot);
+                    int count = (status == 3 || !dm.isEmpty()) ? data.inventoryCounts[slot] : 1;
                     data.inventoryCounts[slot] -= count;
                     if (data.inventoryCounts[slot] <= 0) {
                         data.inventoryCounts[slot] = 0;
                         data.inventoryIds[slot] = 0;
+                        writePlayerSlotMeta(slot, null);
                     }
                     sendInventoryUpdate();
-                    dropItemInFront(itemId, count);
+                    // Bug4/33: Q 键丢弃携带组件
+                    dropItemInFront(itemId, count, dm);
                 }
             }
             else if (status == 5) { // RELEASE_USE_ITEM (松开弓/盾/弩)
                 releaseBow();
                 releaseCrossbow();
                 this.isBlocking = false;
+                // Bug52: 提前松手取消进食/饮用
+                eatingFinishAt = 0L;
+                eatingSlot = -1;
+                eatingMode = 0;
                 setUsingItem(false);
             }
             else if (status == 6) { // SWAP_ITEM_WITH_OFFHAND
                 int main = 36 + heldItemSlot;
                 int tmpId = data.inventoryIds[main];
                 int tmpCt = data.inventoryCounts[main];
+                ItemMeta tmpMeta = playerSlotMeta(main);
+                ItemMeta offMeta = playerSlotMeta(45);
                 data.inventoryIds[main] = data.inventoryIds[45];
                 data.inventoryCounts[main] = data.inventoryCounts[45];
+                writePlayerSlotMeta(main, offMeta);
                 data.inventoryIds[45] = tmpId;
                 data.inventoryCounts[45] = tmpCt;
+                writePlayerSlotMeta(45, tmpMeta);
                 sendInventoryUpdate();
             }
             // status=1 = 取消挖掘 → 清理挖掘计时
             if (status == 1) {
                 digStarts.remove(pos[0] + "," + pos[1] + "," + pos[2]);
+                // Bug59: 取消挖掘 → 通知其他玩家移除裂纹(stage -1)
+                if (digProgressDurMs > 0.0f) {
+                    clearDigProgress();
+                }
             }
             // status=1 = 取消挖掘 → 什么都不做，客户端已收到 ack 会自动复原
         }
@@ -1361,13 +1491,21 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                             sb.putString("id", "minecraft:mob_spawner");
                             sb.putInt("x", pos[0]); sb.putInt("y", pos[1]); sb.putInt("z", pos[2]);
                         }
-                        // SpawnData: {id: "minecraft:<mob>"}; SpawnPotentials: [{weight:1, data:{id:...}}]
+                        // Bug10 修复: 1.19.3+ 刷怪笼 BE 格式为 SpawnData:{entity:{id:"minecraft:x"}},
+                        // 客户端旋转预览模型读的是 SpawnData.entity; 曾直接写 {id:...} -> 无预览。
                         org.cloudburstmc.nbt.NbtMap spawnData = org.cloudburstmc.nbt.NbtMap.builder()
-                            .putString("id", "minecraft:" + mobName).build();
+                            .putCompound("entity", org.cloudburstmc.nbt.NbtMap.builder()
+                                .putString("id", "minecraft:" + mobName).build())
+                            .build();
                         sb.putCompound("SpawnData", spawnData);
                         sb.putList("SpawnPotentials", org.cloudburstmc.nbt.NbtType.COMPOUND,
                             java.util.List.of(org.cloudburstmc.nbt.NbtMap.builder()
-                                .putInt("weight", 1).putCompound("data", spawnData).build()));
+                                .putInt("weight", 1)
+                                .putCompound("data", org.cloudburstmc.nbt.NbtMap.builder()
+                                    .putCompound("entity", org.cloudburstmc.nbt.NbtMap.builder()
+                                        .putString("id", "minecraft:" + mobName).build())
+                                    .build())
+                                .build()));
                         spChunk.setBlockEntity(pos[0] & 15, pos[1], pos[2] & 15, sb.build());
                         // #14 修复: 广播 block_entity_data(0x09) 让客户端立即刷新刷怪笼渲染,
                         // 否则放蛋后客户端看不到笼内旋转的生物模型(仅服务端数据变了)。
@@ -1535,13 +1673,31 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
             String blockName  = BlockStateHelper.getName(placeStateId);
 
-// 【修复】：处理原版特殊的墙面火把
-            if (blockName.equals("redstone_torch") && face >= 2 && face <= 5) {
-                placeStateId = BlockStateHelper.getDefault("redstone_wall_torch");
-                blockName = "redstone_wall_torch";
-            } else if (blockName.equals("torch") && face >= 2 && face <= 5) {
-                placeStateId = BlockStateHelper.getDefault("wall_torch");
-                blockName = "wall_torch";
+// 【修复】：处理原版特殊的墙面变体(火把/告示牌/头颅/旗帜在侧面点击时切换)
+            if (face >= 2 && face <= 5) {
+                if (blockName.equals("redstone_torch")) {
+                    placeStateId = BlockStateHelper.getDefault("redstone_wall_torch");
+                    blockName = "redstone_wall_torch";
+                } else if (blockName.equals("torch")) {
+                    placeStateId = BlockStateHelper.getDefault("wall_torch");
+                    blockName = "wall_torch";
+                } else if (blockName.endsWith("_hanging_sign")) {
+                    int ns = BlockStateHelper.getDefault(blockName.replace("_hanging_sign", "_wall_hanging_sign"));
+                    if (ns != 0) { placeStateId = ns; blockName = blockName.replace("_hanging_sign", "_wall_hanging_sign"); }
+                } else if (blockName.endsWith("_sign")) {
+                    // Bug32: 立牌点墙面 -> 墙牌变体(原版规则), 否则墙上永远立着悬空告示牌
+                    int ns = BlockStateHelper.getDefault(blockName.substring(0, blockName.length() - 5) + "_wall_sign");
+                    if (ns != 0) { placeStateId = ns; blockName = blockName.substring(0, blockName.length() - 5) + "_wall_sign"; }
+                } else if (blockName.endsWith("_skull")) {
+                    int ns = BlockStateHelper.getDefault(blockName.replace("_skull", "_wall_skull"));
+                    if (ns != 0) { placeStateId = ns; blockName = blockName.replace("_skull", "_wall_skull"); }
+                } else if (blockName.endsWith("_head")) {
+                    int ns = BlockStateHelper.getDefault(blockName.replace("_head", "_wall_head"));
+                    if (ns != 0) { placeStateId = ns; blockName = blockName.replace("_head", "_wall_head"); }
+                } else if (blockName.endsWith("_banner")) {
+                    int ns = BlockStateHelper.getDefault(blockName.replace("_banner", "_wall_banner"));
+                    if (ns != 0) { placeStateId = ns; blockName = blockName.replace("_banner", "_wall_banner"); }
+                }
             }
 
             String facing     = BlockStateHelper.horizontalFacing(this.yaw);
@@ -1556,7 +1712,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     || blockName.equals("activator_rail") || blockName.equals("detector_rail")) {
                 String curShape = BlockStateHelper.getProp(placeStateId, "shape");
                 if (curShape != null) {
-                    String auto = autoRailShape(pp[0], pp[1], pp[2]);
+                    // Bug23: 动力/激活/探测铁轨不能弯折, 仅普通铁轨可生成弯角形状
+                    String auto = autoRailShape(pp[0], pp[1], pp[2], blockName.equals("rail"));
                     if (auto != null) {
                         placeStateId = BlockStateHelper.withProp(placeStateId, "shape", auto);
                     }
@@ -1572,10 +1729,22 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             }
 
             // C7: 放置校验 — 目标格必须是空气/液体/可替换, 且不能落在玩家身体内
-            if (!canPlaceInto(WorldManager.getBlockState(this.currentDim, pp[0], pp[1], pp[2]))) return;
-            if (intersectsPlayer(pp[0], pp[1], pp[2])) return;
-            // #27 修复: 非完整方块(火把/红石粉/压力板/铁轨/火焰/植物等)必须贴实心支撑才能放置,
-            // 原版 canSurvive 否则会立刻破碎掉成掉落物; 曾允许悬空放置 -> "隔空放的非完整方块变掉落物"。
+            if (!canPlaceInto(WorldManager.getBlockState(this.currentDim, pp[0], pp[1], pp[2]))) {
+                // Bug54: 拒绝时回发当前真实方块, 消除客户端预测的幽灵方块
+                broadcastBlockChange(pp[0], pp[1], pp[2],
+                    WorldManager.getBlockState(this.currentDim, pp[0], pp[1], pp[2]));
+                return;
+            }
+            // Bug47 修复: 只有"有碰撞箱"的方块才禁止放在脚下(原版行为);
+            // 火把/红石粉/花等无碰撞方块原版本就可以放在玩家所站格子。
+            boolean collides = BlockManager.hasCollision(blockName);
+            if (collides && intersectsPlayer(pp[0], pp[1], pp[2])) {
+                broadcastBlockChange(pp[0], pp[1], pp[2],
+                    WorldManager.getBlockState(this.currentDim, pp[0], pp[1], pp[2]));
+                return;
+            }
+            // Bug37: 非完整方块无支撑时按原版直接拒绝放置(客户端不预测, 观感=不予响应)。
+            // 曾用"放置后立刻破碎"会白扣手中物品并掉出一个掉落物。
             if (!hasPlacementSupport(pp[0], pp[1], pp[2], blockName, targetStateId)) return;
 
             // ── 多方块结构（床）───────────────────────────
@@ -1619,6 +1788,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             RedstoneEngine.onBlockChanged(this.currentDim, pp[0], pp[1], pp[2]);
             // 放置带方块实体的方块时创建初始 BE NBT(告示牌/刷怪笼/信标等), 否则重启/重载后数据丢失。
             createInitialBlockEntity(pp[0], pp[1], pp[2], blockName);
+            // Bug51: 箱子相邻合并时同步 type 属性(本箱+邻箱), 否则客户端渲染不出大箱子
+            if ("chest".equals(blockName) || "trapped_chest".equals(blockName)) {
+                updateChestType(pp[0], pp[1], pp[2]);
+            }
             // 成就系统：放置方块事件 (P12)
             AdvancementManager.onBlockPlace(this, blockName);
             StatisticsManager.add(this, "used", blockName, 1);
@@ -1697,8 +1870,31 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     return;
                 }
 
-                // ── 饮用药水: 结算状态效果(酿造产出时已写入 inventoryPotion) ──
+                // ── Bug52: 喷溅/滞留药水 = 投掷(不可饮用) ──
+                if ("splash_potion".equals(itemName) || "lingering_potion".equals(itemName)) {
+                    boolean ling = "lingering_potion".equals(itemName);
+                    throwPotion(ling);
+                    if (gameMode == 0) {
+                        data.inventoryCounts[slot]--;
+                        if (data.inventoryCounts[slot] <= 0) {
+                            data.inventoryIds[slot] = 0;
+                            data.inventoryPotion[slot] = null;
+                        }
+                        sendSlotUpdate(0, slot);
+                    }
+                    return;
+                }
+
+                // ── 饮用药水: 延迟 1.6s 结算(原版饮用时长), 立即改背包会打断客户端动画 ──
                 if (isDrinkablePotion(itemName)) {
+                    this.eatingFinishAt = System.currentTimeMillis() + 1600L;
+                    this.eatingSlot = slot;
+                    this.eatingMode = 1;
+                    setUsingItem(true);
+                    return;
+                }
+                if (false) { // legacy instant-drink (disabled)
+                    String ptOld = null;
                     String pt = data.inventoryPotion[slot];
                     if (pt != null) {
                         for (String e : pt.split(",")) {
@@ -1736,6 +1932,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
                 int foodValue = getFoodValue(itemName);
                 if (foodValue > 0 && (data.food < 20 || isAlwaysEdible(itemName))) {
+                    // Bug52: 延迟 1.6s 结算进食, 客户端才能完整播放进食动画
+                    this.eatingFinishAt = System.currentTimeMillis() + 1600L;
+                    this.eatingSlot = slot;
+                    this.eatingMode = 2;
+                    setUsingItem(true);
+                    return;
+                }
+                if (foodValue > 0 && false) { // legacy instant-eat (disabled)
                     data.food = Math.min(20, data.food + foodValue);
                     data.saturation = Math.min(data.food,
                         data.saturation + foodValue * getSaturationModifier(itemName));
@@ -1778,28 +1982,16 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (this.gameMode != 1 && this.gameMode != 3) return;
             short slot  = in.getBuffer().readShort();
             int   count = in.readVarInt();
+            // Bug4/33 根因修复: 曾在此处把组件数据 skipBytes 丢弃、只存 id+count,
+            // parseCreativeSlot 写好了却从未被调用 -> 创造模式拿取的附魔书/药水/改名物品
+            // 服务端从头就没有组件, 关闭背包权威同步后客户端显示"变白"。
             if (count > 0) {
-                int itemId = in.readVarInt();
-                int addedComponents = in.readVarInt();
-                int removedComponents = in.readVarInt();
-                // Skip component data we don't parse (each added component = VarInt(type) + VarInt(dataLength) + data)
-                for (int c = 0; c < addedComponents; c++) {
-                    in.readVarInt(); // component type
-                    int dataLen = in.readVarInt();
-                    in.getBuffer().skipBytes(dataLen);
-                }
-                // Skip removed component types (each is just a VarInt type ID)
-                for (int c = 0; c < removedComponents; c++) {
-                    in.readVarInt(); // component type to remove
-                }
-                if (slot >= 0 && slot < 46) {
-                    data.inventoryIds[slot]  = itemId;
-                    data.inventoryCounts[slot] = count;
-                }
+                parseCreativeSlot(slot, count, in);
             } else {
                 if (slot >= 0 && slot < 46) {
                     data.inventoryIds[slot]  = 0;
                     data.inventoryCounts[slot] = 0;
+                    writePlayerSlotMeta(slot, null);
                 }
             }
             broadcastEquipment();
@@ -1821,8 +2013,12 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
 
         else if (id == 0x33) { // #15 serverbound_set_beacon_effect: 两个 Optional<MobEffect>(registry id, varint id+1, 0=无)
-            int primary = in.readVarInt() - 1;   // 0 = 无效果
-            int secondary = in.readVarInt() - 1;
+            // Bug11: 原版 Optional<Holder<MobEffect>> = bool 前缀 + varint 0 基注册表 id
+            // (曾按 "varint id+1, 无前缀" 解析 -> 读到 bool 当 id, 效果全错/全无)
+            boolean hasP = in.getBuffer().readByte() != 0;
+            int primary = hasP ? in.readVarInt() : -1;
+            boolean hasS = in.getBuffer().readByte() != 0;
+            int secondary = hasS ? in.readVarInt() : -1;
             handleSetBeaconEffect(primary, secondary);
         }
 
@@ -1856,16 +2052,26 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             int carriedItemIdFromPacket = skipHashedStack(in); // carried item 也是 HashedStack
             // 注意: 容器点击不发送 AcknowledgeBlockChange(0x04), 该包仅 UseItem 需要
 
-            // slotNum == -999 表示点击窗口外(丢弃/拖拽结束)
+            // slotNum == -999 表示点击窗口外(丢弃/拖拽开始或结束)
             if (slotNum == -999) {
-                if (clickTypeId == 5) return; // 拖拽结束在 slot==-999 时无操作
+                if (clickTypeId == 5) {
+                    // Bug36: 拖拽的开始(0/4/8)与结束(2/6/10)都在 slot=-999, 曾被直接丢弃
+                    // -> 服务端从未执行分发, 客户端预测被关窗后的全量同步抹掉("退出背包归零")。
+                    handleDragClick(windowId, slotNum, buttonNum);
+                    return;
+                }
                 if (carriedItemCount > 0 && (clickTypeId == 0 || clickTypeId == 4)) {
                     // 原版: 左键(0)=丢整组, 右键(1)=丢一个
-                    int drop = (buttonNum == 0) ? carriedItemCount : 1;
+                    ItemMeta cm = carriedSnapshot();
+                    int drop = (buttonNum == 0 || !cm.isEmpty()) ? carriedItemCount : 1;
                     drop = Math.min(drop, carriedItemCount);
-                    dropItemInFront(carriedItemId, drop);
+                    dropItemInFront(carriedItemId, drop, cm);
                     carriedItemCount -= drop;
-                    if (carriedItemCount <= 0) { carriedItemId = 0; carriedItemCount = 0; }
+                    if (carriedItemCount <= 0) {
+                        carriedItemId = 0;
+                        carriedItemCount = 0;
+                        clearCarriedMeta();
+                    }
                     sendCarriedItem();
                 }
                 return;
@@ -1891,14 +2097,40 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         else if (id == 0x12) { // close_window (serverbound)
             int closedWindowId = in.getBuffer().readByte();
             EVENTS.fire(new InventoryCloseEvent(this, closedWindowId));
+            // Bug43 修复: 关闭玩家背包时, 2x2 合成格(窗口0槽1-4)里的物品必须退回背包。
+            // 这些槽不参与 .dat 持久化(原版语义: 关闭即返还), 曾直接遗留在数组里,
+            // 重进游戏后物品"消失"(实际是存进永不读回的槽位)。
+            if (closedWindowId == 0) {
+                for (int s = 1; s <= 4; s++) {
+                    int gid = data.inventoryIds[s], gcnt = data.inventoryCounts[s];
+                    if (gid > 0 && gcnt > 0) {
+                        ItemMeta gm = playerSlotMeta(s);
+                        int got = pickupItemCount(gid, gcnt, gm.enchants(), gm.potion(), gm.customName(),
+                                gm.damage(), gm.trimMaterial(), gm.trimPattern());
+                        if (got < gcnt) dropItemInFront(gid, gcnt - got, gm);
+                        data.inventoryIds[s] = 0;
+                        data.inventoryCounts[s] = 0;
+                        writePlayerSlotMeta(s, null);
+                    }
+                }
+                sendInventoryUpdate();
+            }
             String[] leftoverGrid = openCraftingGrids.remove(closedWindowId);
             int[] leftoverCounts = openCraftingCounts.remove(closedWindowId);
+            ItemMeta[] leftoverMetas = openGridMetas.remove(closedWindowId);
             if (leftoverGrid != null) {
                 for (int gi = 0; gi < 9; gi++) {
                     if (leftoverGrid[gi] != null) {
                         int lid = BlockManager.getItemIdByName(leftoverGrid[gi]);
                         int lc = (leftoverCounts != null && leftoverCounts[gi] > 0) ? leftoverCounts[gi] : 1;
-                        if (lid > 0) giveItem(lid, lc);
+                        if (lid > 0) {
+                            // Bug4/33: 网格原料的组件(放入附魔/改名物品)退回时不丢
+                            ItemMeta gm = leftoverMetas != null && gi < leftoverMetas.length
+                                    && leftoverMetas[gi] != null ? leftoverMetas[gi] : ItemMeta.EMPTY;
+                            int got = pickupItemCount(lid, lc, gm.enchants(), gm.potion(), gm.customName(),
+                                    gm.damage(), gm.trimMaterial(), gm.trimPattern());
+                            if (got < lc) dropItemInFront(lid, lc - got, gm);
+                        }
                         leftoverGrid[gi] = null;
                     }
                 }
@@ -1917,8 +2149,32 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             openHoppers.remove(closedWindowId);
             ContainerStore.Pos closedDispenser = openDispensers.remove(closedWindowId);
             if (closedDispenser != null) ContainerStore.persistDispenser(closedDispenser);
-            openSmithing.remove(closedWindowId);
-            openEnchanting.remove(closedWindowId);
+            // #50: 锻造台关闭退回三输入槽(模板/底材/附加), 结果槽不退(原版 SmithingMenu.removed)。
+            ContainerStore.Pos closedSmithing = openSmithing.remove(closedWindowId);
+            if (closedSmithing != null) {
+                ContainerStore.SmithingData sd = ContainerStore.peekSmithing(closedSmithing);
+                if (sd != null) {
+                    for (int i = 0; i < 3; i++) {
+                        returnSlotToPlayer(sd.slots[i * 2], sd.slots[i * 2 + 1], contMeta(sd.meta, i));
+                        sd.slots[i * 2] = 0;
+                        sd.slots[i * 2 + 1] = 0;
+                    }
+                    sd.version++;
+                    ContainerStore.removeSmithing(closedSmithing);
+                }
+            }
+            // #50: 附魔台关闭退回物品+青金石(原版 EnchantmentMenu.removed)。
+            ContainerStore.Pos closedEnch = openEnchanting.remove(closedWindowId);
+            if (closedEnch != null) {
+                ContainerStore.EnchantingData ed = ContainerStore.peekEnchanting(closedEnch);
+                if (ed != null) {
+                    returnSlotToPlayer(ed.slots[0], ed.slots[1], contMeta(ed.meta, 0));
+                    returnSlotToPlayer(ed.slots[2], ed.slots[3], contMeta(ed.meta, 1));
+                    ed.slots[0] = 0; ed.slots[1] = 0; ed.slots[2] = 0; ed.slots[3] = 0;
+                    ed.version++;
+                    ContainerStore.removeEnchanting(closedEnch);
+                }
+            }
             // #7: 关闭铁砧菜单时, 把仍留在铁砧里的输入物品退回玩家背包(原版 AnvilMenu.removed)。
             // #4 修复: 只退回两个输入槽(0/1); 派生输出槽(2)不是玩家真正放入的物品, 曾一并退回
             // -> 两根铁剑放进去后再按 esc, 背包里多出第三根(输出)铁剑。
@@ -1928,8 +2184,13 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 for (int i = 0; i < 2; i++) {
                     int itId = ad.slots[i * 2], cnt = ad.slots[i * 2 + 1];
                     if (itId > 0 && cnt > 0) {
-                        if (i == 0) giveItemWithData(itId, cnt, ad.leftEnchants, ad.leftPotion, ad.leftName, ad.leftDamage);
-                        else giveItemWithData(itId, cnt, ad.rightEnchants, ad.rightPotion, ad.rightName, ad.rightDamage);
+                        // 注意: 此时窗口已从 openAnvil 移除, 直接读 AnvilData 字段
+                        ItemMeta am = i == 0
+                                ? ItemMeta.of(ad.leftEnchants, ad.leftPotion, ad.leftName, ad.leftDamage, -1, -1)
+                                : ItemMeta.of(ad.rightEnchants, ad.rightPotion, ad.rightName, ad.rightDamage, -1, -1);
+                        int got = pickupItemCount(itId, cnt, am.enchants(), am.potion(), am.customName(),
+                                am.damage(), am.trimMaterial(), am.trimPattern());
+                        if (got < cnt) dropItemInFront(itId, cnt - got, am);
                         ad.slots[i * 2] = 0;
                         ad.slots[i * 2 + 1] = 0;
                     }
@@ -1958,15 +2219,40 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             // #29 命令方块
             openCommandBlocks.remove(closedWindowId);
             if (commandBlockWindowId == closedWindowId) commandBlockWindowId = -1;
-            openStonecutters.remove(closedWindowId);
-            openGrindstones.remove(closedWindowId);
+            // #50: 切石机/砂轮关闭退回输入槽(原版 StonecutterMenu/GrindstoneMenu.removed)。
+            ContainerStore.Pos closedStonecutter = openStonecutters.remove(closedWindowId);
+            if (closedStonecutter != null) {
+                ContainerStore.StonecutterData sd = ContainerStore.peekStonecutter(closedStonecutter);
+                if (sd != null) {
+                    returnSlotToPlayer(sd.slots[0], sd.slots[1], contMeta(sd.meta, 0));
+                    sd.slots[0] = 0; sd.slots[1] = 0;
+                    sd.version++;
+                    ContainerStore.removeStonecutter(closedStonecutter);
+                }
+            }
+            ContainerStore.Pos closedGrindstone = openGrindstones.remove(closedWindowId);
+            if (closedGrindstone != null) {
+                ContainerStore.GrindstoneData gd = ContainerStore.peekGrindstone(closedGrindstone);
+                if (gd != null) {
+                    returnSlotToPlayer(gd.slots[0], gd.slots[1], contMeta(gd.meta, 0));
+                    returnSlotToPlayer(gd.slots[2], gd.slots[3], contMeta(gd.meta, 1));
+                    gd.slots[0] = 0; gd.slots[1] = 0; gd.slots[2] = 0; gd.slots[3] = 0;
+                    gd.version++;
+                    ContainerStore.removeGrindstone(closedGrindstone);
+                }
+            }
             openMerchants.remove(closedWindowId);
             if (merchantWindowId == closedWindowId) merchantWindowId = -1;
             containerSyncVersion.remove(closedWindowId);
             if (carriedItemCount > 0) {
-                giveItem(carriedItemId, carriedItemCount);
+                // Bug4/33: 光标物品(可能带附魔/改名/耐久)退回背包时携带组件
+                ItemMeta cm = carriedSnapshot();
+                int got = pickupItemCount(carriedItemId, carriedItemCount, cm.enchants(), cm.potion(),
+                        cm.customName(), cm.damage(), cm.trimMaterial(), cm.trimPattern());
+                if (got < carriedItemCount) dropItemInFront(carriedItemId, carriedItemCount - got, cm);
                 carriedItemId = 0;
                 carriedItemCount = 0;
+                clearCarriedMeta();
             }
             // 关闭任意容器后, 主动把主背包(windowId 0)整体重发给客户端,
             // 避免熔炉/箱子交互后客户端背包视图停留在被污染的旧快照(物品看似消失/回退)。
@@ -1988,9 +2274,16 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 // 先把 2×2 现有物品放回背包
                 for (int s : new int[]{1, 2, 3, 4}) {
                     if (data.inventoryIds[s] > 0 && data.inventoryCounts[s] > 0) {
-                        giveItem(data.inventoryIds[s], data.inventoryCounts[s]);
+                        // Bug4/33: 带组件物品退回不丢 NBT
+                        ItemMeta gm = playerSlotMeta(s);
+                        int got = pickupItemCount(data.inventoryIds[s], data.inventoryCounts[s],
+                                gm.enchants(), gm.potion(), gm.customName(), gm.damage(),
+                                gm.trimMaterial(), gm.trimPattern());
+                        if (got < data.inventoryCounts[s])
+                            dropItemInFront(data.inventoryIds[s], data.inventoryCounts[s] - got, gm);
                         data.inventoryIds[s] = 0;
                         data.inventoryCounts[s] = 0;
+                        writePlayerSlotMeta(s, null);
                     }
                 }
                 int[] g2s = {1, 2, 0, 3, 4}; // grid[0..4] → 玩家槽(下标2未用)
@@ -2022,12 +2315,20 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             String[] grid = openCraftingGrids.get(windowId);
             int[] counts = openCraftingCounts.get(windowId);
             // 先把当前网格已有物品放回背包（原实现直接清空 → 已放的原料静默丢失）
+            ItemMeta[] rbMetas = openGridMetas.get(windowId);
             for (int gi = 0; gi < 9; gi++) {
                 if (grid[gi] != null && counts[gi] > 0) {
                     int oldId = BlockManager.getItemIdByName(grid[gi]);
-                    if (oldId > 0) giveItem(oldId, counts[gi]);
+                    if (oldId > 0) {
+                        ItemMeta gm = rbMetas != null && gi < rbMetas.length && rbMetas[gi] != null
+                                ? rbMetas[gi] : ItemMeta.EMPTY;
+                        int got = pickupItemCount(oldId, counts[gi], gm.enchants(), gm.potion(),
+                                gm.customName(), gm.damage(), gm.trimMaterial(), gm.trimPattern());
+                        if (got < counts[gi]) dropItemInFront(oldId, counts[gi] - got, gm);
+                    }
                 }
                 grid[gi] = null; counts[gi] = 0;
+                if (rbMetas != null && gi < rbMetas.length) rbMetas[gi] = null;
             }
             // 逐格从背包找料并扣减（原实现只写快照不扣背包 → 配方书点选=白嫖合成）
             for (int gi = 0; gi < 9; gi++) {
@@ -3132,10 +3433,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 int headSlot = 5;
                 int tmpId = data.inventoryIds[headSlot];
                 int tmpCnt = data.inventoryCounts[headSlot];
+                ItemMeta tmpMeta = playerSlotMeta(headSlot);
+                ItemMeta srcMeta = playerSlotMeta(slot);
                 data.inventoryIds[headSlot] = data.inventoryIds[slot];
                 data.inventoryCounts[headSlot] = data.inventoryCounts[slot];
+                writePlayerSlotMeta(headSlot, srcMeta);
                 data.inventoryIds[slot] = tmpId;
                 data.inventoryCounts[slot] = tmpCnt;
+                writePlayerSlotMeta(slot, tmpMeta);
                 sendInventoryUpdate();
                 sendFeedback("已戴上方块", "gray");
             }
@@ -3644,6 +3949,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             });
             h.sendSoundAt("minecraft:entity.player.death", this.x, this.y + 1.0, this.z, 1.0f, 1.0f);
         }
+        // Bug60: 死亡动画后移除玩家实体模型(原版尸体不滞留到重生)
+        despawnPlayerEntityForTrackers();
+        com.CharunCore.server.world.entity.EntityManager.removeTrackingEverywhere(this.eid);
     }
 
     /** 死亡掉落: 全部物品散落地面, 经验掉落 min(level*7, 100)。 */
@@ -3659,9 +3967,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             int itemId = data.inventoryIds[i];
             int count = data.inventoryCounts[i];
             if (itemId <= 0 || count <= 0) continue;
+            ItemMeta m = playerSlotMeta(i);
             data.inventoryIds[i] = 0;
             data.inventoryCounts[i] = 0;
-            data.inventoryDamage[i] = 0;
+            writePlayerSlotMeta(i, null);
 
             ItemEntity drop =
                 new ItemEntity(
@@ -3672,6 +3981,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             drop.vy = 0.2;
             drop.vz = (rng.nextDouble() - 0.5) * 0.3;
             drop.pickupDelay = 40;
+            if (!m.isEmpty()) {
+                drop.itemDamage = m.damage();
+                drop.itemEnchants = m.enchants().isEmpty() ? null : new java.util.HashMap<>(m.enchants());
+                drop.itemPotion = m.potion();
+                drop.itemCustomName = m.customName();
+                drop.trimMaterial = m.trimMaterial();
+                drop.trimPattern = m.trimPattern();
+            }
             EntityManager.addEntity(drop);
         }
         sendInventoryUpdate();
@@ -3723,6 +4040,15 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             pb.writeFloat(volume);
             pb.writeFloat(pitch);
             pb.writeLong(java.util.concurrent.ThreadLocalRandom.current().nextLong());
+        });
+    }
+
+    /** 停止指定名称的声音 (0x75 stop_sound)。flags=2 表示仅按声音名停止(不含 source)。
+     *  用于唱片机取出唱片时停掉正在播放的曲目 (Bug22)。 */
+    public void sendStopSound(String soundName) {
+        sendPacket(ctx, 0x75, pb -> {
+            pb.writeByte((byte) 2);   // flags: 0x02 = has sound name
+            pb.writeString(soundName);
         });
     }
 
@@ -3831,19 +4157,32 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     // ── 带组件(附魔/药水)的物品栈写出 ──
-    /** 药水类型标记 -> minecraft:potion 注册表 holder id (对齐原版 Potions 注册顺序)。 */
+    /** 药水类型标记 -> minecraft:potion 注册表 holder id (1.21.11 Potions 注册顺序)。 */
     private static final java.util.Map<String, Integer> POTION_TYPE_IDS = new java.util.HashMap<>();
+    private static final java.util.Map<Integer, String> POTION_ID_TO_NAME = new java.util.HashMap<>();
     static {
-        POTION_TYPE_IDS.put("water", 0);
-        POTION_TYPE_IDS.put("mundane", 1);
-        POTION_TYPE_IDS.put("thick", 2);
-        POTION_TYPE_IDS.put("awkward", 3);
+        String[] potionNames = {"water","mundane","thick","awkward",
+            "night_vision","long_night_vision","invisibility","long_invisibility",
+            "leaping","long_leaping","strong_leaping","fire_resistance","long_fire_resistance",
+            "swiftness","long_swiftness","strong_swiftness",
+            "slowness","long_slowness","strong_slowness",
+            "turtle_master","long_turtle_master","strong_turtle_master",
+            "water_breathing","long_water_breathing","healing","strong_healing",
+            "harming","strong_harming","poison","long_poison","strong_poison",
+            "regeneration","long_regeneration","strong_regeneration",
+            "strength","long_strength","strong_strength","weakness","long_weakness",
+            "luck","slow_falling","long_slow_falling","wind_charged","weaving","oozing","infested"};
+        for (int i = 0; i < potionNames.length; i++) {
+            POTION_TYPE_IDS.put(potionNames[i], i);
+            POTION_ID_TO_NAME.put(i, potionNames[i]);
+        }
     }
 
     /** 药水效果名 -> 客户端 mob_effect 注册表 id (与 effectProtocolId 一致)。 */
     private static final java.util.Map<String, Integer> EFFECT_PROTOCOL_IDS = new java.util.HashMap<>();
     static {
-        int[] ids = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33};
+        // Bug52: mob_effect registry ids are 0-based (speed=0, effects.json); was 1-based -> all effects off by one
+        int[] ids = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32};
         String[] names = {"speed","slowness","haste","mining_fatigue","strength","instant_health","instant_damage",
             "jump_boost","nausea","regeneration","resistance","fire_resistance","water_breathing","invisibility",
             "blindness","night_vision","hunger","weakness","poison","wither","health_boost","absorption",
@@ -3886,6 +4225,25 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         int[] pot = parsePotionEx(carriedPotionType);
         pb.writeStackWithComponents(carriedItemId, carriedItemCount, carriedEnchants, book, pot[0], pot[1], pot[2],
             carriedCustomName, carriedDamage, carriedTrimMaterial, carriedTrimPattern, pot[3]);
+    }
+
+    /** 带组件写出箱子/末影箱槽位 (Bug4/33: 附魔/药水/自定义名/耐久随物品同步到客户端)。 */
+    private void writeChestSlot(PacketBuffer pb, ContainerStore.ChestData cd, int s) {
+        int id = cd.slots[2 * s], count = cd.slots[2 * s + 1];
+        if (id <= 0 || count <= 0) { pb.writeSlot(0, 0); return; }
+        writeStackWithMeta(pb, id, count, contMeta(cd.meta, s));
+    }
+
+    /** Bug4/33: 按物品组件写一个完整槽位(count+id+components)。 */
+    private void writeStackWithMeta(PacketBuffer pb, int id, int count, ItemMeta m) {
+        boolean book = "enchanted_book".equals(BlockManager.itemIdToName(id));
+        ItemMeta mm = m == null ? ItemMeta.EMPTY : m;
+        int[] pot = parsePotionEx(mm.potion());
+        pb.writeStackWithComponents(id, count,
+                mm.enchants().isEmpty() ? null : mm.enchants(), book,
+                pot[0], pot[1], pot[2],
+                mm.customName(), mm.damage(),
+                mm.trimMaterial(), mm.trimPattern(), pot[3]);
     }
 
     /**
@@ -3937,9 +4295,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         data.inventoryTrimMaterial[slot] = trimMaterial;
         data.inventoryTrimPattern[slot] = trimPattern;
         if (potionTypeId >= 0) {
-            data.inventoryPotion[slot] = switch (potionTypeId) {
-                case 0 -> "water"; case 1 -> "mundane"; case 2 -> "thick"; case 3 -> "awkward";
-                default -> null; };
+            data.inventoryPotion[slot] = POTION_ID_TO_NAME.getOrDefault(potionTypeId, "water");
         } else if (!effects.isEmpty()) {
             int[] eff = effects.get(0); // [effectId, amplifier, duration]
             String en = effectNameById(eff[0]);
@@ -3984,8 +4340,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             case 49: { // minecraft:potion_contents
                 boolean hasPotion = in.getBuffer().readBoolean();
                 if (hasPotion) {
-                    int pid = in.readVarInt();
-                    if (pid <= 3) p.potionTypeId = pid;
+                    p.potionTypeId = in.readVarInt();
                 }
                 boolean hasColor = in.getBuffer().readBoolean();
                 if (hasColor) in.readInt();
@@ -4002,9 +4357,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 if (hasName) in.readString();
                 return p;
             }
-            case 54: { // minecraft:trim
-                p.trimMaterial = in.readVarInt();
-                p.trimPattern = in.readVarInt();
+            case 54: { // minecraft:trim — 原版 ByteBufCodecs.holder(REFERENCE) 编码为 VarInt(registryId+1)
+                int m = in.readVarInt();
+                int pt = in.readVarInt();
+                p.trimMaterial = m > 0 ? m - 1 : -1;
+                p.trimPattern = pt > 0 ? pt - 1 : -1;
                 return p;
             }
             default:
@@ -4064,7 +4421,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     /** 药水效果注册表 id -> 效果名(用于 client 带入的 custom_effects 反显工具提示)。 */
-    private String effectNameById(int id) {
+    private static String effectNameById(int id) {
         if (id < 0) return null;
         for (java.util.Map.Entry<String, Integer> e : EFFECT_PROTOCOL_IDS.entrySet()) {
             if (e.getValue() == id) return e.getKey();
@@ -4159,12 +4516,24 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private void sendSlotUpdateRaw(int windowId, int slot, int itemId, int count) {
+        // Bug4/33: 容器槽位也带组件下发(附魔/药水/改名物品在箱/炉等界面不再显示为白板)。
+        // 预览槽(合成结果等)无存储组件, readSlotMeta 返回 EMPTY 走原路径。
+        final boolean empty = itemId <= 0 || count <= 0;
+        final ItemMeta m = empty ? ItemMeta.EMPTY : readSlotMeta(windowId, slot);
+        final boolean hasMeta = !m.isEmpty();
         sendPacket(ctx, 0x14, pb -> {
             pb.writeVarInt(windowId);
             pb.writeVarInt(0);
             pb.writeShort(slot);
-            if (windowId == 0 && slot >= 0 && slot < 46) writePlayerSlot(pb, slot);
-            else pb.writeSlot(itemId, count);
+            if (hasMeta) {
+                writeStackWithMeta(pb, itemId, count, m);
+            } else if (windowId == 0 && slot >= 1 && slot < 46 && !empty) {
+                // Bug35: 窗口0槽0是2x2合成结果槽(非玩家背包格), 曾走 writePlayerSlot
+                // 读恒空的 data.inventoryIds[0] -> 背包合成栏永远无输出预览。
+                writePlayerSlot(pb, slot);
+            } else {
+                pb.writeSlot(itemId, count);
+            }
         });
     }
 
@@ -4184,7 +4553,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 pb.writeVarInt(fhw);
                 pb.writeVarInt(0);
                 pb.writeShort(slot);
-                pb.writeSlot(itemId, itemCount);
+                writeChestSlot(pb, ContainerStore.chest(pos), slot);
             });
         }
     }
@@ -4208,18 +4577,23 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (hw < 0) continue;
             final int fhw = hw;
             if (isHopper) {
+                ContainerStore.HopperData hd = h.getHopperData(fhw);
                 int[] contents = h.getHopperContents(fhw);
                 h.sendPacket(h.ctx, 0x12, pb -> {
                     pb.writeVarInt(fhw); pb.writeVarInt(0); pb.writeVarInt(5 + 36);
-                    for (int i = 0; i < 5; i++) pb.writeSlot(contents[i * 2], contents[i * 2 + 1]);
+                    for (int i = 0; i < 5; i++) {
+                        if (hd != null && contents[i * 2] > 0) h.writeStackWithMeta(pb, contents[i * 2], contents[i * 2 + 1], contMeta(hd.meta, i));
+                        else pb.writeSlot(contents[i * 2], contents[i * 2 + 1]);
+                    }
                     for (int ps = 9; ps <= 44; ps++) h.writePlayerSlot(pb, ps);
                     h.writeCarriedSlot(pb);
                 });
             } else {
+                ContainerStore.ChestData cd = ContainerStore.chest(pos);
                 int[] contents = h.getChestContents(fhw);
                 h.sendPacket(h.ctx, 0x12, pb -> {
                     pb.writeVarInt(fhw); pb.writeVarInt(0); pb.writeVarInt(27 + 36);
-                    for (int i = 0; i < 27; i++) pb.writeSlot(contents[i * 2], contents[i * 2 + 1]);
+                    for (int i = 0; i < 27; i++) h.writeChestSlot(pb, cd, i);
                     for (int ps = 9; ps <= 44; ps++) h.writePlayerSlot(pb, ps);
                     h.writeCarriedSlot(pb);
                 });
@@ -4267,10 +4641,16 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void sendRecipeBook(ChannelHandlerContext ctx) {
         // 0x48 recipe_book_add — 统计总条目数(工作台 + 熔炉 + 高炉 + 烟熏炉 + 切石机)
-        var smeltAll = com.CharunCore.server.world.SmeltingSystem.allSmeltingEntries();
-        var blastAll = com.CharunCore.server.world.SmeltingSystem.allBlastingEntries();
-        var smokeAll = com.CharunCore.server.world.SmeltingSystem.allSmokingEntries();
-        var stonecutterEntries = com.CharunCore.server.world.menu.MenuUtil.stonecutterEntries();
+        // Bug5 修复: 先过滤掉物品表里不存在的条目再计数, 否则声明的 total 与实际写入条数不符,
+        // 客户端按 total 读取 -> 解析错位/失败。
+        var smeltAll = com.CharunCore.server.world.SmeltingSystem.allSmeltingEntries().stream()
+                .filter(se -> BlockManager.getItemIdByName(se.input) > 0 && BlockManager.getItemIdByName(se.result) > 0).toList();
+        var blastAll = com.CharunCore.server.world.SmeltingSystem.allBlastingEntries().stream()
+                .filter(se -> BlockManager.getItemIdByName(se.input) > 0 && BlockManager.getItemIdByName(se.result) > 0).toList();
+        var smokeAll = com.CharunCore.server.world.SmeltingSystem.allSmokingEntries().stream()
+                .filter(se -> BlockManager.getItemIdByName(se.input) > 0 && BlockManager.getItemIdByName(se.result) > 0).toList();
+        var stonecutterEntries = com.CharunCore.server.world.menu.MenuUtil.stonecutterEntries().stream()
+                .filter(se -> BlockManager.getItemIdByName(se.input) > 0 && BlockManager.getItemIdByName(se.result) > 0).toList();
         int total = RECIPE_BOOK_ENTRIES.size() + smeltAll.size() + blastAll.size() + smokeAll.size() + stonecutterEntries.size();
         sendPacket(ctx, 0x48, pb -> {
             pb.writeVarInt(total);
@@ -4321,12 +4701,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             // #8/#13 熔炉/高炉/烟熏炉/切石机左侧配方。
             // 原版 FurnaceRecipeDisplay: ingredient + fuel(any_fuel) + result + craftingStation + duration + experience。
             // category 必须按站台归类(4-6 熔炉 / 7-8 高炉 / 9 烟熏炉 / 10 切石机), 否则客户端左侧面板过滤后为空。
+            // Bug5 修复: 无效条目必须在写入任何字节之前 continue —— 曾先写 id/type 再 continue,
+            // 一条无效原料即令整包字节错位, 客户端解析失败 -> 左侧面板全空。
             for (var se : smeltAll) {
-                pb.writeVarInt(idx++);
-                pb.writeVarInt(2); // FurnaceRecipeDisplay
                 int inId = BlockManager.getItemIdByName(se.input);
                 int outId = BlockManager.getItemIdByName(se.result);
                 if (inId <= 0 || outId <= 0) continue;
+                pb.writeVarInt(idx++);
+                pb.writeVarInt(2); // FurnaceRecipeDisplay
                 pb.writeVarInt(2); pb.writeVarInt(inId);       // ingredient (item)
                 pb.writeVarInt(1);                              // fuel (any_fuel)
                 pb.writeVarInt(3); pb.writeSlot(outId, 1);      // result (item_stack)
@@ -4339,11 +4721,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 pb.writeByte(0);                                // flags
             }
             for (var se : blastAll) {
-                pb.writeVarInt(idx++);
-                pb.writeVarInt(2); // FurnaceRecipeDisplay
                 int inId = BlockManager.getItemIdByName(se.input);
                 int outId = BlockManager.getItemIdByName(se.result);
                 if (inId <= 0 || outId <= 0) continue;
+                pb.writeVarInt(idx++);
+                pb.writeVarInt(2); // FurnaceRecipeDisplay
                 pb.writeVarInt(2); pb.writeVarInt(inId);
                 pb.writeVarInt(1);
                 pb.writeVarInt(3); pb.writeSlot(outId, 1);
@@ -4356,11 +4738,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 pb.writeByte(0);
             }
             for (var se : smokeAll) {
-                pb.writeVarInt(idx++);
-                pb.writeVarInt(2); // FurnaceRecipeDisplay
                 int inId = BlockManager.getItemIdByName(se.input);
                 int outId = BlockManager.getItemIdByName(se.result);
                 if (inId <= 0 || outId <= 0) continue;
+                pb.writeVarInt(idx++);
+                pb.writeVarInt(2); // FurnaceRecipeDisplay
                 pb.writeVarInt(2); pb.writeVarInt(inId);
                 pb.writeVarInt(1);
                 pb.writeVarInt(3); pb.writeSlot(outId, 1);
@@ -4376,11 +4758,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             // #13 切石机左侧样式列表: StonecutterRecipeDisplay(3) = input + result + station。
             // category 必须为 10(stonecutter), 曾写 0(建筑) -> 客户端切石机面板过滤后为空, 无法选样式。
             for (var se2 : stonecutterEntries) {
-                pb.writeVarInt(idx++);
-                pb.writeVarInt(3); // StonecutterRecipeDisplay
                 int inId2 = BlockManager.getItemIdByName(se2.input);
                 int outId2 = BlockManager.getItemIdByName(se2.result);
                 if (inId2 <= 0 || outId2 <= 0) continue;
+                pb.writeVarInt(idx++);
+                pb.writeVarInt(3); // StonecutterRecipeDisplay
                 pb.writeVarInt(2); pb.writeVarInt(inId2);       // input (item)
                 pb.writeVarInt(3); pb.writeSlot(outId2, 1);     // result (item_stack)
                 pb.writeVarInt(2); pb.writeVarInt(BlockManager.getItemIdByName("stonecutter")); // station
@@ -4420,6 +4802,84 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             pb.writeBoolean(false); pb.writeBoolean(false); // blast
             pb.writeBoolean(false); pb.writeBoolean(false); // smoker
         });
+    }
+
+    /** #13/#35: declare_recipes(0x83) — 原版 RecipePropertySet(7 个槽位过滤集) + 切石机配方列表。
+     *  1.21.2+ 客户端切石机界面的样式列表数据源就是本包的 stoneCutterRecipes 段,
+     *  从未发送导致切石机中间样式区永远为空(只能靠旧按钮逻辑切出台阶)。 */
+    private void sendDeclareRecipes(ChannelHandlerContext ctx) {
+        var smeltAll = com.CharunCore.server.world.SmeltingSystem.allSmeltingEntries();
+        var blastAll = com.CharunCore.server.world.SmeltingSystem.allBlastingEntries();
+        var smokeAll = com.CharunCore.server.world.SmeltingSystem.allSmokingEntries();
+        var stonecutterEntries = com.CharunCore.server.world.menu.MenuUtil.stonecutterEntries();
+        sendPacket(ctx, 0x83, pb -> {
+            // recipes: map<ResourceKey<RecipePropertySet>, RecipePropertySet>
+            // 值编码 = VarInt 数量 + VarInt 物品注册表 id 列表(Item.STREAM_CODEC list)
+            java.util.LinkedHashMap<String, java.util.List<Integer>> sets = new java.util.LinkedHashMap<>();
+            java.util.List<Integer> smithBase = new java.util.ArrayList<>();
+            for (String s : new String[]{"diamond_pickaxe","diamond_axe","diamond_shovel","diamond_hoe","diamond_sword",
+                    "diamond_helmet","diamond_chestplate","diamond_leggings","diamond_boots",
+                    "leather_helmet","leather_chestplate","leather_leggings","leather_boots",
+                    "chainmail_helmet","chainmail_chestplate","chainmail_leggings","chainmail_boots",
+                    "iron_helmet","iron_chestplate","iron_leggings","iron_boots",
+                    "golden_helmet","golden_chestplate","golden_leggings","golden_boots",
+                    "turtle_helmet","netherite_helmet","netherite_chestplate","netherite_leggings","netherite_boots"}) {
+                int iid = BlockManager.getItemIdByName(s);
+                if (iid > 0) smithBase.add(iid);
+            }
+            java.util.List<Integer> smithAdd = new java.util.ArrayList<>();
+            for (String s : new String[]{"netherite_ingot","amethyst_shard","copper_ingot","diamond","emerald",
+                    "gold_ingot","iron_ingot","lapis_lazuli","nether_quartz","redstone","resin_brick"}) {
+                int iid = BlockManager.getItemIdByName(s);
+                if (iid > 0) smithAdd.add(iid);
+            }
+            java.util.List<Integer> smithTpl = new java.util.ArrayList<>();
+            for (String s : new String[]{"netherite_upgrade_smithing_template",
+                    "sentry_armor_trim_smithing_template","vex_armor_trim_smithing_template","wild_armor_trim_smithing_template",
+                    "coast_armor_trim_smithing_template","dune_armor_trim_smithing_template","wayfinder_armor_trim_smithing_template",
+                    "shaper_armor_trim_smithing_template","raiser_armor_trim_smithing_template","host_armor_trim_smithing_template",
+                    "ward_armor_trim_smithing_template","silence_armor_trim_smithing_template","tide_armor_trim_smithing_template",
+                    "snout_armor_trim_smithing_template","rib_armor_trim_smithing_template","eye_armor_trim_smithing_template",
+                    "spire_armor_trim_smithing_template","bolt_armor_trim_smithing_template","flow_armor_trim_smithing_template"}) {
+                int iid = BlockManager.getItemIdByName(s);
+                if (iid > 0) smithTpl.add(iid);
+            }
+            sets.put("minecraft:smithing_base", smithBase);
+            sets.put("minecraft:smithing_template", smithTpl);
+            sets.put("minecraft:smithing_addition", smithAdd);
+            sets.put("minecraft:furnace_input", itemIdsOf(smeltAll.stream().map(se -> se.input).toList()));
+            sets.put("minecraft:blast_furnace_input", itemIdsOf(blastAll.stream().map(se -> se.input).toList()));
+            sets.put("minecraft:smoker_input", itemIdsOf(smokeAll.stream().map(se -> se.input).toList()));
+            sets.put("minecraft:campfire_input", itemIdsOf(smokeAll.stream().map(se -> se.input).toList()));
+            pb.writeVarInt(sets.size());
+            for (var e : sets.entrySet()) {
+                pb.writeString(e.getKey());
+                java.util.List<Integer> ids = e.getValue().stream().distinct().collect(java.util.stream.Collectors.toList());
+                pb.writeVarInt(ids.size());
+                for (int iid : ids) pb.writeVarInt(iid);
+            }
+            // stoneCutterRecipes: array of { input: IDSet(VarInt count+1 形式), result: SlotDisplay }
+            var filtered = stonecutterEntries.stream()
+                    .filter(se -> BlockManager.getItemIdByName(se.input) > 0 && BlockManager.getItemIdByName(se.result) > 0).toList();
+            pb.writeVarInt(filtered.size());
+            for (var se : filtered) {
+                int inId = BlockManager.getItemIdByName(se.input);
+                int outId = BlockManager.getItemIdByName(se.result);
+                pb.writeVarInt(2);          // IDSet: count+1 = 2 -> 单元素
+                pb.writeVarInt(inId);
+                pb.writeVarInt(3);          // SlotDisplay item_stack
+                pb.writeSlot(outId, 1);
+            }
+        });
+    }
+
+    private static java.util.List<Integer> itemIdsOf(java.util.List<String> names) {
+        java.util.List<Integer> out = new java.util.ArrayList<>();
+        for (String n : names) {
+            int iid = BlockManager.getItemIdByName(n);
+            if (iid > 0) out.add(iid);
+        }
+        return out;
     }
 
     /**
@@ -4600,6 +5060,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return p == null ? null : ContainerStore.dispenser(p);
     }
 
+    private ContainerStore.HopperData getHopperData(int windowId) {
+        ContainerStore.Pos p = openHoppers.get(windowId);
+        return p == null ? null : ContainerStore.hopper(p);
+    }
+
     private int[] getSmithingContents(int windowId) {
         ContainerStore.Pos p = openSmithing.get(windowId);
         if (p == null) return new int[6];
@@ -4638,11 +5103,12 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         java.util.Set<String> pyramid = java.util.Set.of(
             "iron_block", "gold_block", "diamond_block", "emerald_block", "netherite_block");
         int levels = 0;
+        // Bug11 修复: 原版金字塔层尺寸为 3x3 / 5x5 / 7x7 / 9x9 (半宽 = 层数 l)。
+        // 曾用 4/6/8/10 的偶数环 -> 只有把信标"包进" oversized 一层才判定通过。
         for (int l = 1; l <= 4; l++) {
-            int size = 4 + (l - 1) * 2; // 第1层 4x4, 第2层 6x6, ... 第4层 10x10
             boolean ok = true;
-            for (int dx = -size / 2; dx <= size / 2 && ok; dx++) {
-                for (int dz = -size / 2; dz <= size / 2 && ok; dz++) {
+            for (int dx = -l; dx <= l && ok; dx++) {
+                for (int dz = -l; dz <= l && ok; dz++) {
                     int by = y - l;
                     if (by < -64) { ok = false; break; }
                     int st = WorldManager.getBlockStateCached(dim, x + dx, by, z + dz);
@@ -4961,11 +5427,15 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (id <= 0 || cnt <= 0) continue;
             String iname = BlockManager.itemIdToName(id);
             if (iname == null) continue;
-            items.add(org.cloudburstmc.nbt.NbtMap.builder()
+            org.cloudburstmc.nbt.NbtMapBuilder it = org.cloudburstmc.nbt.NbtMap.builder()
                 .putByte("Slot", (byte) i)
                 .putString("id", iname.startsWith("minecraft:") ? iname : "minecraft:" + iname)
-                .putByte("Count", (byte) Math.min(127, cnt))
-                .build());
+                .putByte("Count", (byte) Math.min(127, cnt));
+            // Bug4/33: 箱子物品组件(附魔/药水/自定义名/耐久)一并落盘, 否则重进丢失 NBT
+            org.cloudburstmc.nbt.NbtMap comps = com.CharunCore.server.world.PlayerDataManager.buildItemComponents(
+                iname, d.meta.slotDamage[i], d.meta.slotEnchants[i], d.meta.slotPotion[i], d.meta.slotCustomName[i]);
+            if (!comps.isEmpty()) it.putCompound("components", comps);
+            items.add(it.build());
         }
         org.cloudburstmc.nbt.NbtMap existing = chunk.getBlockEntity(p.x() & 15, p.y(), p.z() & 15);
         org.cloudburstmc.nbt.NbtMapBuilder b = org.cloudburstmc.nbt.NbtMap.builder();
@@ -5121,70 +5591,336 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return new int[]{0, 0};
     }
 
+    // ── Bug4/33: 槽位组件统一读写 ────────────────────────────────────────────
+    // 旧实现把"拿起=组件进光标/放入=组件出光标"散落在 setSlotItem 各分支,
+    // 熔炉/漏斗/发射器/切石机/砂轮/锻造台/附魔台/信标等槽位完全没有组件存储,
+    // shift-click/数字键/丢出/死亡掉落/掉落物拾取也不搬组件 -> NBT 到处丢失。
+    // 现在: readSlotMeta/writeSlotMeta 统一寻址所有窗口槽位, 物品移动一律
+    // "读源组件 → 写目标(setSlotItemFull) → 清源", 光标字段只作为中转。
+
+    private static ItemMeta contMeta(ContainerStore.SlotMeta sm, int s) {
+        return ItemMeta.of(sm.slotEnchants[s], sm.slotPotion[s], sm.slotCustomName[s], sm.slotDamage[s], -1, -1);
+    }
+
+    private ItemMeta playerSlotMeta(int ps) {
+        if (ps < 0 || ps >= 46) return ItemMeta.EMPTY;
+        return ItemMeta.of(data.inventoryEnchants[ps], data.inventoryPotion[ps],
+                data.inventoryCustomName[ps], data.inventoryDamage[ps],
+                data.inventoryTrimMaterial[ps], data.inventoryTrimPattern[ps]);
+    }
+
+    private void writePlayerSlotMeta(int ps, ItemMeta m) {
+        if (ps < 0 || ps >= 46) return;
+        boolean empty = m == null || m.isEmpty();
+        if (empty) {
+            data.inventoryEnchants[ps] = new java.util.HashMap<>();
+            data.inventoryPotion[ps] = null;
+            data.inventoryCustomName[ps] = null;
+            data.inventoryDamage[ps] = 0;
+            data.inventoryTrimMaterial[ps] = -1;
+            data.inventoryTrimPattern[ps] = -1;
+        } else {
+            data.inventoryEnchants[ps] = new java.util.HashMap<>(m.enchants());
+            data.inventoryPotion[ps] = m.potion();
+            data.inventoryCustomName[ps] = m.customName();
+            data.inventoryDamage[ps] = m.damage();
+            data.inventoryTrimMaterial[ps] = m.trimMaterial();
+            data.inventoryTrimPattern[ps] = m.trimPattern();
+        }
+    }
+
+    /** 读任意窗口槽位的物品组件(无则 EMPTY)。 */
+    private ItemMeta readSlotMeta(int windowId, int slot) {
+        if (windowId == 0) return playerSlotMeta(slot);
+        if (openCraftingGrids.containsKey(windowId)) {
+            if (slot >= 1 && slot <= 9) {
+                ItemMeta[] ms = openGridMetas.get(windowId);
+                if (ms == null || slot - 1 >= ms.length || ms[slot - 1] == null) return ItemMeta.EMPTY;
+                return ms[slot - 1];
+            }
+            return playerSlotMeta(craftingToPlayerSlot(slot));
+        }
+        if (openChests.containsKey(windowId)) {
+            ContainerStore.ChestData cd = ContainerStore.chest(openChests.get(windowId));
+            if (slot >= 0 && slot < 27) return contMeta(cd.meta, slot);
+            return playerSlotMeta(chestToPlayerSlot(slot));
+        }
+        if (openEnderChests.containsKey(windowId)) {
+            ContainerStore.ChestData cd = ContainerStore.enderChest(this.uuid);
+            if (slot >= 0 && slot < 27) return contMeta(cd.meta, slot);
+            return playerSlotMeta(chestToPlayerSlot(slot));
+        }
+        if (openFurnaces.containsKey(windowId)) {
+            ContainerStore.FurnaceData fd = getFurnaceData(windowId);
+            if (fd != null && slot >= 0 && slot < 3) return contMeta(fd.meta, slot);
+            return playerSlotMeta(furnaceToPlayerSlot(slot));
+        }
+        if (openHoppers.containsKey(windowId)) {
+            ContainerStore.HopperData hd = getHopperData(windowId);
+            if (hd != null && slot >= 0 && slot < 5) return contMeta(hd.meta, slot);
+            return playerSlotMeta(hopperToPlayerSlot(slot));
+        }
+        if (openDispensers.containsKey(windowId)) {
+            ContainerStore.DispenserData dd = getDispenserData(windowId);
+            if (dd != null && slot >= 0 && slot < 9) return contMeta(dd.meta, slot);
+            return playerSlotMeta(dispenserToPlayerSlot(slot));
+        }
+        if (openStonecutters.containsKey(windowId)) {
+            ContainerStore.StonecutterData sd = getStonecutterData(windowId);
+            if (sd != null && slot >= 0 && slot < 2) return contMeta(sd.meta, slot);
+            return playerSlotMeta(stonecutterToPlayerSlot(slot));
+        }
+        if (openGrindstones.containsKey(windowId)) {
+            ContainerStore.GrindstoneData gd = getGrindstoneData(windowId);
+            if (gd != null && slot >= 0 && slot < 3) return contMeta(gd.meta, slot);
+            return playerSlotMeta(grindstoneToPlayerSlot(slot));
+        }
+        if (openBeacons.containsKey(windowId)) {
+            ContainerStore.BeaconData bd = ContainerStore.beacon(openBeacons.get(windowId));
+            if (slot == 0) return contMeta(bd.meta, 0);
+            return playerSlotMeta(8 + slot);
+        }
+        if (openSmithing.containsKey(windowId)) {
+            ContainerStore.SmithingData sd = getSmithingData(windowId);
+            if (sd != null && slot >= 0 && slot < 4) return contMeta(sd.meta, slot);
+            return playerSlotMeta(9 + (slot - 4));
+        }
+        if (openEnchanting.containsKey(windowId)) {
+            ContainerStore.EnchantingData ed = getEnchantingData(windowId);
+            if (ed != null && slot >= 0 && slot < 2) return contMeta(ed.meta, slot);
+            return playerSlotMeta(9 + (slot - 2));
+        }
+        if (openAnvil.containsKey(windowId)) {
+            ContainerStore.AnvilData ad = getAnvilData(windowId);
+            if (ad != null && slot >= 0 && slot < 3) {
+                if (slot == 0) return ItemMeta.of(ad.leftEnchants, ad.leftPotion, ad.leftName, ad.leftDamage, -1, -1);
+                if (slot == 1) return ItemMeta.of(ad.rightEnchants, ad.rightPotion, ad.rightName, ad.rightDamage, -1, -1);
+                return ItemMeta.of(ad.outEnchants, ad.outPotion, ad.outName, ad.outDamage, -1, -1);
+            }
+            return playerSlotMeta(9 + (slot - 3));
+        }
+        if (openBrewing.containsKey(windowId)) {
+            ContainerStore.BrewingData bd = getBrewingData(windowId);
+            if (bd != null && slot >= 0 && slot < 5) {
+                if (slot < 3) {
+                    return ItemMeta.of(bd.meta.slotEnchants[slot], bd.potionType[slot],
+                            bd.meta.slotCustomName[slot], bd.meta.slotDamage[slot], -1, -1);
+                }
+                return contMeta(bd.meta, slot);
+            }
+            return playerSlotMeta(9 + (slot - 5));
+        }
+        if (openMerchants.containsKey(windowId)) {
+            if (slot < 3) return ItemMeta.EMPTY;
+            return playerSlotMeta(merchantToPlayerSlot(slot));
+        }
+        return ItemMeta.EMPTY;
+    }
+
+    /** 写任意窗口槽位的物品组件; m 为 null/EMPTY 时清空。 */
+    private void writeSlotMeta(int windowId, int slot, ItemMeta m) {
+        boolean empty = m == null || m.isEmpty();
+        if (windowId == 0) { writePlayerSlotMeta(slot, m); return; }
+        if (openCraftingGrids.containsKey(windowId)) {
+            if (slot >= 1 && slot <= 9) {
+                ItemMeta[] ms = openGridMetas.computeIfAbsent(windowId, k -> new ItemMeta[9]);
+                ms[slot - 1] = empty ? null : m;
+                return;
+            }
+            writePlayerSlotMeta(craftingToPlayerSlot(slot), m);
+            return;
+        }
+        if ((openChests.containsKey(windowId) || openEnderChests.containsKey(windowId)) && slot >= 0 && slot < 27) {
+            boolean isEnder = openEnderChests.containsKey(windowId);
+            ContainerStore.ChestData cd = isEnder ? ContainerStore.enderChest(this.uuid) : ContainerStore.chest(openChests.get(windowId));
+            cd.meta.slotDamage[slot] = empty ? 0 : m.damage();
+            cd.meta.slotEnchants[slot] = (empty || m.enchants().isEmpty())
+                    ? new java.util.HashMap<>() : new java.util.HashMap<>(m.enchants());
+            cd.meta.slotPotion[slot] = empty ? null : m.potion();
+            cd.meta.slotCustomName[slot] = empty ? null : m.customName();
+            return;
+        }
+        if (openFurnaces.containsKey(windowId)) {
+            ContainerStore.FurnaceData fd = getFurnaceData(windowId);
+            if (fd != null && slot >= 0 && slot < 3) { writeContMeta(fd.meta, slot, m); return; }
+            writePlayerSlotMeta(furnaceToPlayerSlot(slot), m);
+            return;
+        }
+        if (openHoppers.containsKey(windowId)) {
+            ContainerStore.HopperData hd = getHopperData(windowId);
+            if (hd != null && slot >= 0 && slot < 5) { writeContMeta(hd.meta, slot, m); return; }
+            writePlayerSlotMeta(hopperToPlayerSlot(slot), m);
+            return;
+        }
+        if (openDispensers.containsKey(windowId)) {
+            ContainerStore.DispenserData dd = getDispenserData(windowId);
+            if (dd != null && slot >= 0 && slot < 9) { writeContMeta(dd.meta, slot, m); return; }
+            writePlayerSlotMeta(dispenserToPlayerSlot(slot), m);
+            return;
+        }
+        if (openStonecutters.containsKey(windowId)) {
+            ContainerStore.StonecutterData sd = getStonecutterData(windowId);
+            if (sd != null && slot >= 0 && slot < 2) { writeContMeta(sd.meta, slot, m); return; }
+            writePlayerSlotMeta(stonecutterToPlayerSlot(slot), m);
+            return;
+        }
+        if (openGrindstones.containsKey(windowId)) {
+            ContainerStore.GrindstoneData gd = getGrindstoneData(windowId);
+            if (gd != null && slot >= 0 && slot < 3) { writeContMeta(gd.meta, slot, m); return; }
+            writePlayerSlotMeta(grindstoneToPlayerSlot(slot), m);
+            return;
+        }
+        if (openBeacons.containsKey(windowId)) {
+            ContainerStore.BeaconData bd = ContainerStore.beacon(openBeacons.get(windowId));
+            if (slot == 0) { writeContMeta(bd.meta, 0, m); return; }
+            writePlayerSlotMeta(8 + slot, m);
+            return;
+        }
+        if (openSmithing.containsKey(windowId)) {
+            ContainerStore.SmithingData sd = getSmithingData(windowId);
+            if (sd != null && slot >= 0 && slot < 4) { writeContMeta(sd.meta, slot, m); return; }
+            writePlayerSlotMeta(9 + (slot - 4), m);
+            return;
+        }
+        if (openEnchanting.containsKey(windowId)) {
+            ContainerStore.EnchantingData ed = getEnchantingData(windowId);
+            if (ed != null && slot >= 0 && slot < 2) { writeContMeta(ed.meta, slot, m); return; }
+            writePlayerSlotMeta(9 + (slot - 2), m);
+            return;
+        }
+        if (openAnvil.containsKey(windowId)) {
+            ContainerStore.AnvilData ad = getAnvilData(windowId);
+            if (ad == null) { writePlayerSlotMeta(9 + (slot - 3), m); return; }
+            if (slot == 0) {
+                ad.leftEnchants = empty ? new java.util.HashMap<>() : new java.util.HashMap<>(m.enchants());
+                ad.leftDamage = empty ? 0 : m.damage();
+                ad.leftPotion = empty ? null : m.potion();
+                ad.leftName = empty ? null : m.customName();
+            } else if (slot == 1) {
+                ad.rightEnchants = empty ? new java.util.HashMap<>() : new java.util.HashMap<>(m.enchants());
+                ad.rightDamage = empty ? 0 : m.damage();
+                ad.rightPotion = empty ? null : m.potion();
+                ad.rightName = empty ? null : m.customName();
+            } else if (slot == 2) {
+                ad.outEnchants = empty ? new java.util.HashMap<>() : new java.util.HashMap<>(m.enchants());
+                ad.outDamage = empty ? 0 : m.damage();
+                ad.outPotion = empty ? null : m.potion();
+                ad.outName = empty ? null : m.customName();
+            } else {
+                writePlayerSlotMeta(9 + (slot - 3), m);
+            }
+            return;
+        }
+        if (openBrewing.containsKey(windowId)) {
+            ContainerStore.BrewingData bd = getBrewingData(windowId);
+            if (bd == null) { writePlayerSlotMeta(9 + (slot - 5), m); return; }
+            if (slot >= 0 && slot < 5) {
+                if (slot < 3) {
+                    bd.potionType[slot] = empty ? null : m.potion();
+                    bd.meta.slotDamage[slot] = empty ? 0 : m.damage();
+                    bd.meta.slotEnchants[slot] = (empty || m.enchants().isEmpty())
+                            ? new java.util.HashMap<>() : new java.util.HashMap<>(m.enchants());
+                    bd.meta.slotCustomName[slot] = empty ? null : m.customName();
+                    bd.meta.slotPotion[slot] = null;
+                } else {
+                    writeContMeta(bd.meta, slot, m);
+                }
+                return;
+            }
+            writePlayerSlotMeta(9 + (slot - 5), m);
+            return;
+        }
+        if (openMerchants.containsKey(windowId)) {
+            if (slot < 3) return;
+            writePlayerSlotMeta(merchantToPlayerSlot(slot), m);
+        }
+    }
+
+    private static void writeContMeta(ContainerStore.SlotMeta sm, int s, ItemMeta m) {
+        boolean empty = m == null || m.isEmpty();
+        sm.slotDamage[s] = empty ? 0 : m.damage();
+        sm.slotEnchants[s] = (empty || m.enchants().isEmpty())
+                ? new java.util.HashMap<>() : new java.util.HashMap<>(m.enchants());
+        sm.slotPotion[s] = empty ? null : m.potion();
+        sm.slotCustomName[s] = empty ? null : m.customName();
+    }
+
+    /** 写槽位并携带组件(物品移动的规范入口)。元数据经 pendingWriteMeta 在 setSlotItem
+     *  内部生效, 保证依赖元数据的重算(铁砧/锻造台等)读到的是新值。 */
+    private ItemMeta pendingWriteMeta = null;
+
+    private void setSlotItemFull(int windowId, int slot, int itemId, int count, ItemMeta meta) {
+        boolean empty = itemId <= 0 || count <= 0 || meta == null || meta.isEmpty();
+        pendingWriteMeta = empty ? null : meta;
+        try {
+            setSlotItem(windowId, slot, itemId, count);
+        } finally {
+            pendingWriteMeta = null;
+        }
+    }
+
+    /** 把源槽整个搬到目标槽(id/count+组件), 并清空源槽。 */
+    private void moveSlotFull(int windowId, int src, int dst) {
+        int[] item = getSlotItem(windowId, src);
+        ItemMeta m = readSlotMeta(windowId, src);
+        setSlotItemFull(windowId, dst, item[0], item[1], m);
+        setSlotItem(windowId, src, 0, 0);
+    }
+
+    /** 写槽位(id/count)。组件语义: 清槽时同时清组件; 放入普通物品时覆盖为无组件。
+     *  需要保留/写入组件的场景必须走 setSlotItemFull。 */
     private void setSlotItem(int windowId, int slot, int itemId, int count) {
         boolean emptied = (itemId <= 0 || count <= 0);
-        boolean clearsCarried = true;
         if (windowId == 0) {
-            clearsCarried = false;
             if (slot < 0 || slot >= 46) return;
-            if (emptied) {
-                carriedEnchants = new java.util.HashMap<>(data.inventoryEnchants[slot]);
-                carriedPotionType = data.inventoryPotion[slot];
-                carriedCustomName = data.inventoryCustomName[slot];
-                carriedDamage = data.inventoryDamage[slot];
-                carriedTrimMaterial = data.inventoryTrimMaterial[slot];
-                carriedTrimPattern = data.inventoryTrimPattern[slot];
-                data.inventoryEnchants[slot] = new java.util.HashMap<>();
-                data.inventoryPotion[slot] = null;
-                data.inventoryCustomName[slot] = null;
-                data.inventoryDamage[slot] = 0;
-                data.inventoryTrimMaterial[slot] = -1;
-                data.inventoryTrimPattern[slot] = -1;
-            } else {
-                data.inventoryEnchants[slot] = new java.util.HashMap<>(carriedEnchants);
-                data.inventoryPotion[slot] = carriedPotionType;
-                data.inventoryCustomName[slot] = carriedCustomName;
-                data.inventoryDamage[slot] = carriedDamage;
-                data.inventoryTrimMaterial[slot] = carriedTrimMaterial;
-                data.inventoryTrimPattern[slot] = carriedTrimPattern;
-                carriedEnchants = new java.util.HashMap<>();
-                carriedPotionType = null;
-                carriedCustomName = null;
-                carriedDamage = 0;
-                carriedTrimMaterial = -1;
-                carriedTrimPattern = -1;
-            }
+            writePlayerSlotMeta(slot, pendingWriteMeta);
             data.inventoryIds[slot] = itemId;
             data.inventoryCounts[slot] = count;
-        } else if (openCraftingGrids.containsKey(windowId)) {
+            return;
+        }
+        if (openCraftingGrids.containsKey(windowId)) {
             if (slot >= 1 && slot <= 9) {
                 String[] grid = openCraftingGrids.get(windowId);
                 boolean has = itemId > 0 && count > 0;
                 grid[slot - 1] = has ? BlockManager.itemIdToName(itemId) : null;
                 craftingCounts(windowId)[slot - 1] = has ? count : 0;
+                ItemMeta[] ms = openGridMetas.computeIfAbsent(windowId, k -> new ItemMeta[9]);
+                ms[slot - 1] = (pendingWriteMeta == null || pendingWriteMeta.isEmpty()) ? null : pendingWriteMeta;
             } else if (slot >= 10) {
                 int ps = craftingToPlayerSlot(slot);
                 if (ps < 0) return;
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId;
                 data.inventoryCounts[ps] = count;
-                // [Bug4修复] 容器界面中操作玩家背包槽时，同步更新 window 0（主背包）
-                // 防止关闭容器后客户端回滚玩家背包变更
                 sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        } else if (openChests.containsKey(windowId) || openEnderChests.containsKey(windowId)) {
-            int[] contents = getChestContents(windowId);
+            return;
+        }
+        if (openChests.containsKey(windowId) || openEnderChests.containsKey(windowId)) {
+            boolean isEnder = openEnderChests.containsKey(windowId);
+            ContainerStore.ChestData cd = isEnder ? ContainerStore.enderChest(this.uuid) : ContainerStore.chest(openChests.get(windowId));
             if (slot >= 0 && slot < 27) {
-                contents[slot * 2] = itemId;
-                contents[slot * 2 + 1] = count;
+                // Bug53: 曾一律 setChestSlot(...,0,null,null,null) 把刚放入物品的
+                // 附魔/药水/改名/耐久元数据清空 -> 箱子里的 NBT 物品重进/落盘即变白板。
+                ItemMeta pm = pendingWriteMeta;
+                boolean hasMeta = pm != null && !pm.isEmpty();
+                cd.setChestSlot(slot, Math.max(itemId, 0), Math.max(count, 0),
+                    hasMeta ? pm.damage() : 0,
+                    (hasMeta && !pm.enchants().isEmpty()) ? pm.enchants() : null,
+                    (hasMeta) ? pm.potion() : null,
+                    (hasMeta) ? pm.customName() : null);
+                cd.version++;
             } else {
                 int ps = chestToPlayerSlot(slot);
                 if (ps < 0) return;
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId;
                 data.inventoryCounts[ps] = count;
-                // [Bug4修复] 箱子/木桶/末影箱界面操作玩家背包时，同步到 window 0
                 sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        } else if (openFurnaces.containsKey(windowId)) {
+            return;
+        }
+        if (openFurnaces.containsKey(windowId)) {
             ContainerStore.FurnaceData fd = getFurnaceData(windowId);
             if (fd == null) return;
             int[] contents = fd.slots;
@@ -5196,70 +5932,92 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 }
                 contents[slot * 2] = itemId;
                 contents[slot * 2 + 1] = count;
+                writeContMeta(fd.meta, slot, pendingWriteMeta);
                 fd.version++;
             } else {
                 int ps = furnaceToPlayerSlot(slot);
                 if (ps < 0) return;
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId;
                 data.inventoryCounts[ps] = count;
-                sendSlotUpdateRaw(0, ps, itemId, count); // [Bug4修复] 熔炉界面背包同步
+                sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        } else if (openHoppers.containsKey(windowId)) {
+            return;
+        }
+        if (openHoppers.containsKey(windowId)) {
+            ContainerStore.HopperData hd = getHopperData(windowId);
             int[] contents = getHopperContents(windowId);
             if (slot >= 0 && slot < 5) {
                 contents[slot * 2] = itemId;
                 contents[slot * 2 + 1] = count;
+                if (hd != null) { writeContMeta(hd.meta, slot, pendingWriteMeta); hd.version++; }
             } else {
                 int ps = hopperToPlayerSlot(slot);
                 if (ps < 0) return;
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId;
                 data.inventoryCounts[ps] = count;
-                sendSlotUpdateRaw(0, ps, itemId, count); // [Bug4修复] 漏斗界面背包同步
+                sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        } else if (openDispensers.containsKey(windowId)) {
+            return;
+        }
+        if (openDispensers.containsKey(windowId)) {
             int[] contents = getDispenserContents(windowId);
             if (slot >= 0 && slot < 9) {
                 contents[slot * 2] = itemId;
                 contents[slot * 2 + 1] = count;
                 ContainerStore.DispenserData dd = getDispenserData(windowId);
-                if (dd != null) dd.version++;
+                if (dd != null) { writeContMeta(dd.meta, slot, pendingWriteMeta); dd.version++; }
                 ContainerStore.persistDispenser(openDispensers.get(windowId));
             } else {
                 int ps = dispenserToPlayerSlot(slot);
                 if (ps < 0) return;
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId;
                 data.inventoryCounts[ps] = count;
                 sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        } else if (openStonecutters.containsKey(windowId)) {
+            return;
+        }
+        if (openStonecutters.containsKey(windowId)) {
             int[] contents = getStonecutterContents(windowId);
             if (slot >= 0 && slot < 2) {
                 contents[slot * 2] = itemId;
                 contents[slot * 2 + 1] = count;
+                ContainerStore.StonecutterData sd = getStonecutterData(windowId);
+                if (sd != null) { writeContMeta(sd.meta, slot, pendingWriteMeta); }
                 if (slot == 0) recomputeStonecutter(windowId);
-                else { ContainerStore.StonecutterData sd = getStonecutterData(windowId); if (sd != null) sd.version++; }
+                else if (sd != null) sd.version++;
             } else {
                 int ps = stonecutterToPlayerSlot(slot);
                 if (ps < 0) return;
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId;
                 data.inventoryCounts[ps] = count;
                 sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        } else if (openGrindstones.containsKey(windowId)) {
+            return;
+        }
+        if (openGrindstones.containsKey(windowId)) {
             int[] contents = getGrindstoneContents(windowId);
             if (slot >= 0 && slot < 3) {
                 contents[slot * 2] = itemId;
                 contents[slot * 2 + 1] = count;
+                ContainerStore.GrindstoneData gd = getGrindstoneData(windowId);
+                if (gd != null) { writeContMeta(gd.meta, slot, pendingWriteMeta); }
                 if (slot < 2) recomputeGrindstone(windowId);
-                else { ContainerStore.GrindstoneData gd = getGrindstoneData(windowId); if (gd != null) gd.version++; }
+                else if (gd != null) gd.version++;
             } else {
                 int ps = grindstoneToPlayerSlot(slot);
                 if (ps < 0) return;
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId;
                 data.inventoryCounts[ps] = count;
                 sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        } else if (openBeacons.containsKey(windowId)) {
+            return;
+        }
+        if (openBeacons.containsKey(windowId)) {
             // #15 信标支付物槽: 仅接受原版 BEACON_PAYMENT_ITEMS tag(铁锭/金锭/绿宝石/钻石/下界合金锭)。
             ContainerStore.BeaconData bd = ContainerStore.beacon(openBeacons.get(windowId));
             if (slot == 0) {
@@ -5268,134 +6026,73 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 bd.paymentSlot[0] = itemId;
                 bd.paymentSlot[1] = count;
                 bd.payment = itemId > 0;
+                writeContMeta(bd.meta, 0, pendingWriteMeta);
                 bd.version++;
                 sendSlotUpdate(windowId, 0);
             } else {
                 int ps = 8 + slot;
                 if (ps > 44) return;
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId;
                 data.inventoryCounts[ps] = count;
                 sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        } else if (openSmithing.containsKey(windowId)) {
+            return;
+        }
+        if (openSmithing.containsKey(windowId)) {
             ContainerStore.SmithingData sd = getSmithingData(windowId);
             if (sd == null) return;
             int[] c = sd.slots;
             // #19 4 容器槽(0-3)
-            if (slot >= 0 && slot < 4) { c[slot * 2] = itemId; c[slot * 2 + 1] = count; sd.version++; recomputeSmithing(windowId); }
-            else { int ps = 9 + (slot - 4); if (ps > 44) return; data.inventoryIds[ps] = itemId; data.inventoryCounts[ps] = count; sendSlotUpdateRaw(0, ps, itemId, count); }
-        } else if (openEnchanting.containsKey(windowId)) {
+            if (slot >= 0 && slot < 4) { c[slot * 2] = itemId; c[slot * 2 + 1] = count; writeContMeta(sd.meta, slot, pendingWriteMeta); sd.version++; recomputeSmithing(windowId); }
+            else { int ps = 9 + (slot - 4); if (ps > 44) return; writePlayerSlotMeta(ps, pendingWriteMeta); data.inventoryIds[ps] = itemId; data.inventoryCounts[ps] = count; sendSlotUpdateRaw(0, ps, itemId, count); }
+            return;
+        }
+        if (openEnchanting.containsKey(windowId)) {
             ContainerStore.EnchantingData ed = getEnchantingData(windowId);
             if (ed == null) return;
             int[] c = ed.slots;
             // 附魔台仅 2 容器槽(物品+青金石)，背包从 slot 2 开始。
-            // 曾用 slot<3 + ps=9+(slot-3) → 背包首格被当幻影容器槽吞掉、错位一格。
-            if (slot >= 0 && slot < 2) { c[slot * 2] = itemId; c[slot * 2 + 1] = count; ed.version++; recomputeEnchanting(windowId); }
-            else { int ps = 9 + (slot - 2); if (ps > 44) return; data.inventoryIds[ps] = itemId; data.inventoryCounts[ps] = count; sendSlotUpdateRaw(0, ps, itemId, count); }
-        } else if (openAnvil.containsKey(windowId)) {
+            if (slot >= 0 && slot < 2) { c[slot * 2] = itemId; c[slot * 2 + 1] = count; writeContMeta(ed.meta, slot, pendingWriteMeta); ed.version++; recomputeEnchanting(windowId); }
+            else { int ps = 9 + (slot - 2); if (ps > 44) return; writePlayerSlotMeta(ps, pendingWriteMeta); data.inventoryIds[ps] = itemId; data.inventoryCounts[ps] = count; sendSlotUpdateRaw(0, ps, itemId, count); }
+            return;
+        }
+        if (openAnvil.containsKey(windowId)) {
             ContainerStore.AnvilData ad = getAnvilData(windowId);
             if (ad == null) return;
             int[] c = ad.slots;
             if (slot >= 0 && slot < 3) {
-                if (emptied) {
-                    // 把输入槽物品的附魔/改名/耐久/药水取回到光标(便于移回背包)
-                    if (slot == 0) {
-                        carriedEnchants = new java.util.HashMap<>(ad.leftEnchants); ad.leftEnchants.clear();
-                        carriedDamage = ad.leftDamage; ad.leftDamage = 0;
-                        carriedPotionType = ad.leftPotion; ad.leftPotion = null;
-                        carriedCustomName = ad.leftName; ad.leftName = null;
-                    } else if (slot == 1) {
-                        carriedEnchants = new java.util.HashMap<>(ad.rightEnchants); ad.rightEnchants.clear();
-                        carriedDamage = ad.rightDamage; ad.rightDamage = 0;
-                        carriedPotionType = ad.rightPotion; ad.rightPotion = null;
-                        carriedCustomName = ad.rightName; ad.rightName = null;
-                    }
-                } else {
-                    java.util.Map<Integer, Integer> src = new java.util.HashMap<>(carriedEnchants);
-                    if (slot == 0) {
-                        ad.leftEnchants = src; ad.leftDamage = carriedDamage;
-                        ad.leftPotion = carriedPotionType; ad.leftName = carriedCustomName;
-                    } else if (slot == 1) {
-                        ad.rightEnchants = src; ad.rightDamage = carriedDamage;
-                        ad.rightPotion = carriedPotionType; ad.rightName = carriedCustomName;
-                    }
-                    carriedEnchants = new java.util.HashMap<>();
-                    carriedDamage = 0;
-                    carriedPotionType = null;
-                    carriedCustomName = null;
-                }
-                c[slot * 2] = itemId; c[slot * 2 + 1] = count; ad.version++; recomputeAnvil(windowId);
-            }
-            else {
-                int ps = 9 + (slot - 3); if (ps > 44) return;
-                // #9 修复: 铁砧窗口内点击背包槽拿起/放入物品时同步附魔/耐久/自定义名元数据。
-                // 曾只同步 id/count -> 附魔书从背包拖入右槽时 rightEnchants 为空,
-                // recomputeAnvil 无输出 -> 结果栏空、箭头叉叉、铁砧无法附魔。
-                if (emptied) {
-                    carriedEnchants = new java.util.HashMap<>(data.inventoryEnchants[ps]);
-                    carriedPotionType = data.inventoryPotion[ps];
-                    carriedCustomName = data.inventoryCustomName[ps];
-                    carriedDamage = data.inventoryDamage[ps];
-                    data.inventoryEnchants[ps] = new java.util.HashMap<>();
-                    data.inventoryPotion[ps] = null;
-                    data.inventoryCustomName[ps] = null;
-                    data.inventoryDamage[ps] = 0;
-                } else {
-                    data.inventoryEnchants[ps] = new java.util.HashMap<>(carriedEnchants);
-                    data.inventoryPotion[ps] = carriedPotionType;
-                    data.inventoryCustomName[ps] = carriedCustomName;
-                    data.inventoryDamage[ps] = carriedDamage;
-                    carriedEnchants = new java.util.HashMap<>();
-                    carriedPotionType = null;
-                    carriedCustomName = null;
-                    carriedDamage = 0;
-                }
+                c[slot * 2] = itemId; c[slot * 2 + 1] = count; ad.version++;
+                writeSlotMeta(windowId, slot, pendingWriteMeta);
+                recomputeAnvil(windowId);
+            } else {
+                int ps = 9 + (slot - 3);
+                if (ps > 44) return;
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId; data.inventoryCounts[ps] = count;
                 sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        } else if (openBrewing.containsKey(windowId)) {
+            return;
+        }
+        if (openBrewing.containsKey(windowId)) {
             ContainerStore.BrewingData bd = getBrewingData(windowId);
             if (bd == null) return;
-            clearsCarried = false;
             int[] c = bd.slots;
             if (slot >= 0 && slot < 5) {
-                int s = slot;
-                if (s < 3) {
-                    if (emptied) {
-                        carriedPotionType = bd.potionType[s];
-                        bd.potionType[s] = null;
-                    } else {
-                        bd.potionType[s] = carriedPotionType;
-                    }
-                }
-                carriedEnchants = new java.util.HashMap<>();
                 c[slot * 2] = itemId; c[slot * 2 + 1] = count; bd.version++;
+                writeSlotMeta(windowId, slot, pendingWriteMeta);
             } else {
                 int ps = 9 + (slot - 5);
                 if (ps > 44) return;
-                if (emptied) {
-                    carriedEnchants = new java.util.HashMap<>(data.inventoryEnchants[ps]);
-                    carriedPotionType = data.inventoryPotion[ps];
-                    data.inventoryEnchants[ps] = new java.util.HashMap<>();
-                    data.inventoryPotion[ps] = null;
-                } else {
-                    if (!carriedEnchants.isEmpty() || carriedPotionType != null) {
-                        data.inventoryEnchants[ps] = new java.util.HashMap<>(carriedEnchants);
-                        data.inventoryPotion[ps] = carriedPotionType;
-                    } else {
-                        data.inventoryEnchants[ps] = new java.util.HashMap<>();
-                        data.inventoryPotion[ps] = null;
-                    }
-                    carriedEnchants = new java.util.HashMap<>();
-                    carriedPotionType = null;
-                }
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId; data.inventoryCounts[ps] = count;
-                sendSlotUpdateRaw(0, ps, itemId, count); // [Bug4修复] 酿造台界面背包同步
+                sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        } else if (openMerchants.containsKey(windowId)) {
+            return;
+        }
+        if (openMerchants.containsKey(windowId)) {
             MerchantSession ms = openMerchants.get(windowId);
             if (ms == null) return;
-            clearsCarried = false;
             if (slot >= 0 && slot < 3) {
                 ms.slots[slot * 2] = itemId;
                 ms.slots[slot * 2 + 1] = count;
@@ -5403,14 +6100,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             } else {
                 int ps = merchantToPlayerSlot(slot);
                 if (ps < 0) return;
+                writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId; data.inventoryCounts[ps] = count;
                 sendSlotUpdateRaw(0, ps, itemId, count);
             }
-        }
-        // 任何进入非玩家/非酿造瓶槽的物品都不应携带玩家元数据(容器不保存 per-item 元数据)。
-        if (clearsCarried) {
-            carriedEnchants = new java.util.HashMap<>();
-            carriedPotionType = null;
         }
     }
 
@@ -5463,22 +6156,28 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 if (slotItem[1] > 0) {
                     carriedItemId = slotItem[0];
                     carriedItemCount = slotItem[1];
+                    loadCarriedFrom(readSlotMeta(windowId, slot));
                     setSlotItem(windowId, slot, 0, 0);
                     sendSlotUpdate(windowId, slot);
                     sendCarriedItem();
                 }
             } else {
                 if (slotItem[1] <= 0) {
-                    setSlotItem(windowId, slot, carriedItemId, carriedItemCount);
+                    ItemMeta cm = carriedSnapshot();
+                    setSlotItemFull(windowId, slot, carriedItemId, carriedItemCount, cm);
+                    clearCarriedMeta();
                     carriedItemId = 0;
                     carriedItemCount = 0;
                     sendSlotUpdate(windowId, slot);
                     sendCarriedItem();
                 } else if (slotItem[0] == carriedItemId) {
+                    // Bug4/33: 任一方携带组件即不可并堆(原版带组件物品堆叠上限为 1)
+                    boolean mergeable = readSlotMeta(windowId, slot).isEmpty()
+                            && carriedSnapshot().isEmpty();
                     int max = getMaxStackSize(carriedItemId);
                     int canPlace = Math.min(max - slotItem[1], carriedItemCount);
-                    if (canPlace > 0) {
-                        setSlotItem(windowId, slot, carriedItemId, slotItem[1] + canPlace);
+                    if (mergeable && canPlace > 0) {
+                        setSlotItemFull(windowId, slot, carriedItemId, slotItem[1] + canPlace, ItemMeta.EMPTY);
                         carriedItemCount -= canPlace;
                         if (carriedItemCount <= 0) {
                             carriedItemId = 0;
@@ -5488,7 +6187,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         sendCarriedItem();
                     }
                 } else {
-                    setSlotItem(windowId, slot, carriedItemId, carriedItemCount);
+                    ItemMeta targetMeta = readSlotMeta(windowId, slot);
+                    int curId = carriedItemId, curCnt = carriedItemCount;
+                    setSlotItemFull(windowId, slot, curId, curCnt, carriedSnapshot());
+                    loadCarriedFrom(targetMeta);
                     carriedItemId = slotItem[0];
                     carriedItemCount = slotItem[1];
                     sendSlotUpdate(windowId, slot);
@@ -5502,13 +6204,23 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     carriedItemId = slotItem[0];
                     carriedItemCount = half;
                     int remaining = slotItem[1] - half;
-                    setSlotItem(windowId, slot, remaining > 0 ? slotItem[0] : 0, remaining);
+                    ItemMeta srcMeta = readSlotMeta(windowId, slot);
+                    if (remaining <= 0) {
+                        loadCarriedFrom(srcMeta); // 整组拿走: 组件随光标
+                        setSlotItem(windowId, slot, 0, 0);
+                    } else {
+                        loadCarriedFrom(null);   // 只可能发生在普通可堆叠物品上
+                        setSlotItem(windowId, slot, slotItem[0], remaining);
+                    }
                     sendSlotUpdate(windowId, slot);
                     sendCarriedItem();
                 }
             } else {
                 if (slotItem[1] <= 0) {
-                    setSlotItem(windowId, slot, carriedItemId, 1);
+                    ItemMeta cm = carriedSnapshot();
+                    setSlotItemFull(windowId, slot, carriedItemId, 1,
+                            carriedItemCount == 1 ? cm : ItemMeta.EMPTY);
+                    if (carriedItemCount == 1) { clearCarriedMeta(); carriedItemId = 0; }
                     carriedItemCount--;
                     if (carriedItemCount <= 0) {
                         carriedItemId = 0;
@@ -5516,10 +6228,12 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     }
                     sendSlotUpdate(windowId, slot);
                     sendCarriedItem();
-                } else if (slotItem[0] == carriedItemId) {
+                } else if (slotItem[0] == carriedItemId
+                        && readSlotMeta(windowId, slot).isEmpty()
+                        && carriedSnapshot().isEmpty()) {
                     int max = getMaxStackSize(carriedItemId);
                     if (slotItem[1] < max) {
-                        setSlotItem(windowId, slot, carriedItemId, slotItem[1] + 1);
+                        setSlotItemFull(windowId, slot, carriedItemId, slotItem[1] + 1, ItemMeta.EMPTY);
                         carriedItemCount--;
                         if (carriedItemCount <= 0) {
                             carriedItemId = 0;
@@ -5534,6 +6248,12 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if ((openCraftingGrids.containsKey(windowId) && slot >= 1 && slot <= 9)
                 || (windowId == 0 && slot >= 1 && slot <= 4)) {
             updateCraftingResult(windowId);
+        }
+        // Bug39/40/41 诊断: 玩家 2x2 合成格的点击/放置/回显全链路日志(定位"归零"根因用)
+        if (windowId == 0 && slot >= 1 && slot <= 4) {
+            System.out.println("[2x2诊断] click slot=" + slot + " button=" + button
+                + " -> id=" + data.inventoryIds[slot] + " cnt=" + data.inventoryCounts[slot]
+                + " carried=" + carriedItemId + "x" + carriedItemCount);
         }
     }
 
@@ -5550,17 +6270,34 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         else return;
         int[] out = getSlotItem(windowId, resultSlot);
         if (out[1] <= 0) return;
+        // Bug4/33: 必须在清结果槽之前读出组件(新语义下清槽会同时清组件)
+        ItemMeta outMeta = readSlotMeta(windowId, resultSlot);
+        // Bug36: 经验校验/扣费必须在 setSlotItem 之前完成 —— setSlotItem 会触发
+        // recomputeAnvil 重算并覆盖 ad.cost; 且原实现从不校验经验不足, 生存模式可白拿。
+        int anvilCost = 0;
+        if (isAnvil) {
+            ContainerStore.AnvilData adPre = getAnvilData(windowId);
+            if (adPre != null) anvilCost = adPre.cost;
+            if (anvilCost > 0 && gameMode == 0 && data.xpLevel < anvilCost) {
+                sendFeedback("经验等级不足, 无法从铁砧取出(需要 " + anvilCost + " 级)", "red");
+                return;
+            }
+        }
         if (carriedItemCount > 0 && carriedItemId != out[0]) return; // 光标物品不匹配, 不拿
+        if (carriedItemCount > 0 && !outMeta.isEmpty()) return; // 带组件结果不能并入已有堆
         int max = getMaxStackSize(out[0]);
         int remaining = out[1];
+        boolean mergedIntoCursor = false;
         if (carriedItemCount > 0) {
             int can = Math.min(max - carriedItemCount, remaining);
             if (can <= 0) return;
             carriedItemCount += can;
             remaining -= can;
+            mergedIntoCursor = true;
         } else {
             carriedItemId = out[0];
             carriedItemCount = remaining;
+            loadCarriedFrom(outMeta);
             remaining = 0;
         }
         setSlotItem(windowId, resultSlot, remaining > 0 ? out[0] : 0, remaining);
@@ -5569,12 +6306,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (isAnvil) {
             ContainerStore.AnvilData ad = getAnvilData(windowId);
             if (ad != null) {
-                if (ad.cost > 0) spendXpLevels(ad.cost);
-                // 把合并后的附魔/改名/耐久/药水转移到光标物品
-                carriedEnchants = new java.util.HashMap<>(ad.outEnchants);
-                carriedCustomName = ad.outName;
-                carriedDamage = ad.outDamage;
-                carriedPotionType = ad.outPotion;
+                if (anvilCost > 0 && !mergedIntoCursor && gameMode == 0) spendXpLevels(anvilCost);
+                // 合并后的附魔/改名/耐久/药水已在上面经 outMeta 转移到光标
                 ad.leftEnchants.clear();
                 ad.rightEnchants.clear();
                 ad.leftDamage = 0;
@@ -5583,6 +6316,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 ad.outPotion = null;
                 ad.leftPotion = null;
                 ad.rightPotion = null;
+                ad.outName = null;
+                ad.outId = 0;
+                ad.outCount = 0;
                 ad.leftName = null;
                 ad.rightName = null;
                 ad.rename = "";
@@ -5593,22 +6329,27 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             ContainerStore.SmithingData sd = getSmithingData(windowId);
             if (sd != null) {
                 // #19 纹饰: 若为 trim 合成, 记录 trim 组件到光标物品(原版 DataComponents.TRIM)。
-                if (sd.outTrimMaterial > 0 && sd.outTrimPattern > 0) {
+                // 注意 id 0 是合法值(amethyst/bolt), 哨兵为 -1。
+                if (!mergedIntoCursor && sd.outTrimMaterial >= 0 && sd.outTrimPattern >= 0) {
                     carriedTrimMaterial = sd.outTrimMaterial;
                     carriedTrimPattern = sd.outTrimPattern;
                 }
-                // 消耗模板/基础/附加三输入(槽 0/1/2), 结果槽 3 已取走
-                sd.slots[0] = 0; sd.slots[1] = 0;
-                sd.slots[2] = 0; sd.slots[3] = 0;
-                sd.slots[4] = 0; sd.slots[5] = 0;
+                // Bug45 修复: 原版每次锻造只消耗模板/基础/附加各 1 个, 剩余留在槽内;
+                // 曾整槽清空 -> 放一组只出一件还吞掉整组。
+                consumeOne(sd, 0);
+                consumeOne(sd, 1);
+                consumeOne(sd, 2);
                 sd.version++;
                 recomputeSmithing(windowId);
             }
         } else if (isStonecutter) {
             ContainerStore.StonecutterData sd = getStonecutterData(windowId);
             if (sd != null) {
+                // 切石机产物必为干净物品: 显式清空光标残留组件
+                if (!mergedIntoCursor) clearCarriedMeta();
                 if (sd.slots[1] > 0) sd.slots[1]--;
-                if (sd.slots[1] <= 0) { sd.slots[0] = 0; sd.slots[1] = 0; }
+                if (sd.slots[1] <= 0) { sd.slots[0] = 0; sd.slots[1] = 0; writeContMeta(sd.meta, 0, null); }
+                writeContMeta(sd.meta, 1, null);
                 sd.version++;
                 recomputeStonecutter(windowId);
             }
@@ -5617,14 +6358,12 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (gd != null) {
                 // 磨石结果必为去附魔/去改名的干净物品: 显式清空光标元数据,
                 // 防止上一操作残留的附魔被错误带到结果上。
-                carriedEnchants = new java.util.HashMap<>();
-                carriedCustomName = null;
-                carriedPotionType = null;
-                carriedDamage = 0;
+                if (!mergedIntoCursor) clearCarriedMeta();
                 if (gd.slots[1] > 0) gd.slots[1]--;
-                if (gd.slots[1] <= 0) { gd.slots[0] = 0; gd.slots[1] = 0; }
+                if (gd.slots[1] <= 0) { gd.slots[0] = 0; gd.slots[1] = 0; writeContMeta(gd.meta, 0, null); }
                 if (gd.slots[3] > 0) gd.slots[3]--;
-                if (gd.slots[3] <= 0) { gd.slots[2] = 0; gd.slots[3] = 0; }
+                if (gd.slots[3] <= 0) { gd.slots[2] = 0; gd.slots[3] = 0; writeContMeta(gd.meta, 1, null); }
+                writeContMeta(gd.meta, 2, null);
                 gd.version++;
                 recomputeGrindstone(windowId);
             }
@@ -5632,18 +6371,33 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         sendCarriedItem();
     }
 
+    /** Bug45: 锻造台输入槽消耗 1 个, 耗尽才清槽(组件随槽清空)。 */
+    private static void consumeOne(ContainerStore.SmithingData sd, int slot) {
+        int cnt = sd.slots[slot * 2 + 1];
+        if (cnt <= 0) return;
+        cnt--;
+        sd.slots[slot * 2 + 1] = cnt;
+        if (cnt <= 0) {
+            sd.slots[slot * 2] = 0;
+            writeContMeta(sd.meta, slot, null);
+        }
+    }
+
     private void placeOneItem(int windowId, int slot) {
         int[] slotItem = getSlotItem(windowId, slot);
         boolean placed = false;
         if (slotItem[1] <= 0) {
-            setSlotItem(windowId, slot, carriedItemId, 1);
+            boolean lastOne = carriedItemCount == 1;
+            setSlotItemFull(windowId, slot, carriedItemId, 1, lastOne ? carriedSnapshot() : ItemMeta.EMPTY);
+            if (lastOne) clearCarriedMeta();
             carriedItemCount--;
             if (carriedItemCount <= 0) { carriedItemId = 0; carriedItemCount = 0; }
             sendSlotUpdate(windowId, slot);
             sendCarriedItem();
             placed = true;
-        } else if (slotItem[0] == carriedItemId && slotItem[1] < getMaxStackSize(carriedItemId)) {
-            setSlotItem(windowId, slot, carriedItemId, slotItem[1] + 1);
+        } else if (slotItem[0] == carriedItemId && slotItem[1] < getMaxStackSize(carriedItemId)
+                && readSlotMeta(windowId, slot).isEmpty() && carriedSnapshot().isEmpty()) {
+            setSlotItemFull(windowId, slot, carriedItemId, slotItem[1] + 1, ItemMeta.EMPTY);
             carriedItemCount--;
             if (carriedItemCount <= 0) { carriedItemId = 0; carriedItemCount = 0; }
             sendSlotUpdate(windowId, slot);
@@ -5661,42 +6415,49 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (button == 40) {
             // 副手键(F): 与副手(槽 45)交换; 无悬停槽时与当前选中快捷栏交换
             int other = (slot < 0) ? 36 + heldItemSlot : slot;
+            if ((windowId == 0 && (other < 0 || other >= 46)) || (windowId != 0 && slot < 0)) return;
             int[] a = getSlotItem(windowId, other);
+            ItemMeta ma = readSlotMeta(windowId, other);
             int[] b = getSlotItem(0, 45);
-            setSlotItem(windowId, other, b[0], b[1]);
-            setSlotItem(0, 45, a[0], a[1]);
+            ItemMeta mb = readSlotMeta(0, 45);
+            setSlotItemFull(windowId, other, b[0], b[1], mb);
+            setSlotItemFull(0, 45, a[0], a[1], ma);
             sendSlotUpdate(windowId, other);
             sendSlotUpdate(0, 45);
             return;
         }
         if (button < 0 || button > 8 || slot < 0) return;
         int[] a = getSlotItem(windowId, slot);
+        ItemMeta ma = readSlotMeta(windowId, slot);
         // 数字键 1-9 对应快捷栏槽 36-44 (0-8 是合成格, 不是快捷栏)
         int[] b = getSlotItem(0, 36 + button);
-        setSlotItem(windowId, slot, b[0], b[1]);
-        setSlotItem(0, 36 + button, a[0], a[1]);
+        ItemMeta mb = readSlotMeta(0, 36 + button);
+        setSlotItemFull(windowId, slot, b[0], b[1], mb);
+        setSlotItemFull(0, 36 + button, a[0], a[1], ma);
         sendSlotUpdate(windowId, slot);
         sendSlotUpdate(0, 36 + button);
     }
 
-    /** 创造模式克隆: 把点击槽物品完整复制到光标(不消耗原物品)。 */
+    /** 创造模式克隆: 把点击槽物品完整复制到光标(含组件, 不消耗原物品)。 */
     private void handleCloneClick(int windowId, int slot) {
         if (gameMode != 1 || slot < 0) return;
         int[] item = getSlotItem(windowId, slot);
         if (item[1] <= 0) return;
         carriedItemId = item[0];
-        carriedItemCount = item[1];
+        // Bug36: 创造中键按原版复制满组(原复制当前数量 -> 1 个物品中键只得 1 个)
+        carriedItemCount = getMaxStackSize(item[0]);
+        loadCarriedFrom(readSlotMeta(windowId, slot));
         sendCarriedItem();
     }
 
-    /** Q 键丢出: 从点击槽丢 1(button==0) 或全堆(button==1)。 */
+    /** Q 键丢出: 从点击槽丢 1(button==0) 或全堆(button==1)。带组件物品整组丢(原版堆叠为 1)。 */
     private void handleThrowClick(int windowId, int slot, int button) {
         if (slot < 0) return;
         int[] item = getSlotItem(windowId, slot);
         if (item[1] <= 0) return;
-        int drop = (button == 1) ? item[1] : 1;
-        drop = Math.min(drop, item[1]);
-        dropItemInFront(item[0], drop);
+        ItemMeta m = readSlotMeta(windowId, slot);
+        int drop = (button == 1 || !m.isEmpty()) ? item[1] : Math.min(1, item[1]);
+        dropItemInFront(item[0], drop, m);
         int remain = item[1] - drop;
         setSlotItem(windowId, slot, remain > 0 ? item[0] : 0, remain);
         sendSlotUpdate(windowId, slot);
@@ -5721,7 +6482,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             } catch (Exception e) {
                 continue;
             }
-            if (si[1] > 0 && si[0] == carriedItemId) {
+            if (si[1] > 0 && si[0] == carriedItemId && readSlotMeta(windowId, i).isEmpty()) {
                 int can = Math.min(max - carriedItemCount, si[1]);
                 carriedItemCount += can;
                 int remain = si[1] - can;
@@ -5736,28 +6497,38 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private final java.util.Set<Integer> dragSlots = new java.util.HashSet<>();
     private void handleDragClick(int windowId, int slot, int button) {
         // button: 0=左开始 1=左添加 2=左结束 4=右开始 5=右添加 6=右结束
-        if (button == 0 || button == 4) {
+        //         8=中开始 9=中添加 10=中结束 (创造模式单件分发)
+        if (button == 0 || button == 4 || button == 8) {
             dragSlots.clear();
-        } else if (button == 1 || button == 5) {
+        } else if (button == 1 || button == 5 || button == 9) {
             if (slot >= 0) dragSlots.add(slot);
-        } else if (button == 2 || button == 6) {
+        } else if (button == 2 || button == 6 || button == 10) {
             if (carriedItemCount <= 0) { dragSlots.clear(); return; }
             int total = dragSlots.size();
             if (total == 0) { dragSlots.clear(); return; }
+            // Bug4/33: 光标物品的组件只随第一格放置(带组件物品堆叠为 1, 实际只会放一格)
+            ItemMeta dragMeta = carriedSnapshot();
+            boolean metaLeft = !dragMeta.isEmpty();
             if (button == 2) {
+                // Bug36: 原版左拖均分后余数从第一格起逐格 +1(原整除丢弃余数)
                 int per = carriedItemCount / total;
+                int extra = carriedItemCount % total;
                 int left = carriedItemCount;
                 for (int s : dragSlots) {
+                    if (left <= 0) break;
+                    int give = Math.min(per + (extra > 0 ? 1 : 0), left);
+                    if (extra > 0) extra--;
+                    if (give <= 0) continue;
                     int[] si = getSlotItem(windowId, s);
-                    if (per <= 0) break;
-                    if (si[1] <= 0 && per > 0) {
-                        setSlotItem(windowId, s, carriedItemId, per);
-                        left -= per;
+                    if (si[1] <= 0) {
+                        setSlotItemFull(windowId, s, carriedItemId, give, metaLeft ? dragMeta : ItemMeta.EMPTY);
+                        metaLeft = false;
+                        left -= give;
                         sendSlotUpdate(windowId, s);
-                    } else if (si[0] == carriedItemId) {
+                    } else if (si[0] == carriedItemId && readSlotMeta(windowId, s).isEmpty() && !metaLeft) {
                         int max = getMaxStackSize(carriedItemId);
-                        int can = Math.min(max - si[1], per);
-                        if (can > 0) { setSlotItem(windowId, s, carriedItemId, si[1] + can); left -= can; sendSlotUpdate(windowId, s); }
+                        int can = Math.min(max - si[1], give);
+                        if (can > 0) { setSlotItemFull(windowId, s, carriedItemId, si[1] + can, ItemMeta.EMPTY); left -= can; sendSlotUpdate(windowId, s); }
                     }
                 }
                 carriedItemCount = left;
@@ -5766,17 +6537,19 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     int[] si = getSlotItem(windowId, s);
                     if (carriedItemCount <= 0) break;
                     if (si[1] <= 0) {
-                        setSlotItem(windowId, s, carriedItemId, 1);
+                        setSlotItemFull(windowId, s, carriedItemId, 1, metaLeft ? dragMeta : ItemMeta.EMPTY);
+                        metaLeft = false;
                         carriedItemCount--;
                         sendSlotUpdate(windowId, s);
-                    } else if (si[0] == carriedItemId && si[1] < getMaxStackSize(carriedItemId)) {
-                        setSlotItem(windowId, s, carriedItemId, si[1] + 1);
+                    } else if (si[0] == carriedItemId && si[1] < getMaxStackSize(carriedItemId)
+                            && readSlotMeta(windowId, s).isEmpty() && !metaLeft) {
+                        setSlotItemFull(windowId, s, carriedItemId, si[1] + 1, ItemMeta.EMPTY);
                         carriedItemCount--;
                         sendSlotUpdate(windowId, s);
                     }
                 }
             }
-            if (carriedItemCount <= 0) { carriedItemId = 0; carriedItemCount = 0; }
+            if (carriedItemCount <= 0) { carriedItemId = 0; carriedItemCount = 0; clearCarriedMeta(); }
             sendCarriedItem();
             dragSlots.clear();
             // 拖拽放入合成格后刷新结果预览
@@ -5811,89 +6584,105 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
         int[] item = getSlotItem(windowId, slot);
         if (item[1] <= 0) return;
-        int itemId = item[0];
-        int count = item[1];
+        ItemMeta srcMeta = readSlotMeta(windowId, slot);
 
         if (windowId == 0) {
-            for (int i = 9; i <= 35; i++) {
-                if (data.inventoryIds[i] == 0) {
-                    data.inventoryIds[i] = itemId;
-                    data.inventoryCounts[i] = count;
-                    setSlotItem(windowId, slot, 0, 0);
-                    sendSlotUpdate(windowId, slot);
-                    sendSlotUpdate(windowId, i);
-                    return;
-                } else if (data.inventoryIds[i] == itemId && data.inventoryCounts[i] < getMaxStackSize(itemId)) {
-                    int can = Math.min(getMaxStackSize(itemId) - data.inventoryCounts[i], count);
-                    data.inventoryCounts[i] += can;
-                    count -= can;
-                    if (count <= 0) {
-                        setSlotItem(windowId, slot, 0, 0);
-                        sendSlotUpdate(windowId, slot);
-                        sendSlotUpdate(windowId, i);
-                        return;
-                    }
-                    setSlotItem(windowId, slot, itemId, count);
-                    sendSlotUpdate(windowId, slot);
-                    sendSlotUpdate(windowId, i);
-                    return;
-                }
-            }
+            // 原版: 快捷栏 <-> 主背包 双向
+            int rangeStart = slot >= 36 ? 9 : 36;
+            int rangeEnd = slot >= 36 ? 35 : 44;
+            shiftMoveSlots(windowId, slot, item, srcMeta, rangeStart, rangeEnd, null);
         } else {
-            // 容器区 <-> 玩家区 双向搬运; 目标区间必须按窗口类型区分,
-            // 否则从玩家区 shift 点击会落到 0..0 的无效区间而把源槽清空(物品消失)
-            int targetStart, targetEnd;
-            if (openChests.containsKey(windowId)) {
-                if (slot < 27) { targetStart = 27; targetEnd = 62; }
-                else { targetStart = 0; targetEnd = 26; }
+            // 容器区 <-> 玩家区 双向搬运; 目标区间按窗口类型区分。
+            int containerCount;           // 容器槽总数(0..containerCount-1)
+            int[] forbidden = null;       // 结果槽不可作为目标
+            if (openChests.containsKey(windowId) || openEnderChests.containsKey(windowId)) {
+                containerCount = 27;
             } else if (openCraftingGrids.containsKey(windowId)) {
-                if (slot == 0) { craftAllFromResult(windowId); return; }
-                if (slot <= 9) { targetStart = 10; targetEnd = 45; }
-                else { targetStart = 1; targetEnd = 9; }
-            } else if (openFurnaces.containsKey(windowId)) {
-                if (slot < 3) { targetStart = 3; targetEnd = 38; }
-                else {
-                    String fn = BlockManager.itemIdToName(itemId);
-                    boolean isFuel = fn != null
-                        && SmeltingSystem.getFuelBurnTime(fn) > 0;
-                    targetStart = isFuel ? 1 : 0;
-                    targetEnd = targetStart;
+                // 工作台布局: 0=结果, 1-9=网格, 10-45=玩家区
+                if (slot >= 1 && slot <= 9) {
+                    shiftMoveSlots(windowId, slot, item, srcMeta, 10, 45, new int[]{0});
+                } else {
+                    shiftMoveSlots(windowId, slot, item, srcMeta, 1, 9, new int[]{0});
                 }
+                return;
+            } else if (openFurnaces.containsKey(windowId)) {
+                containerCount = 3;
             } else if (openHoppers.containsKey(windowId)) {
-                if (slot < 5) { targetStart = 5; targetEnd = 40; }
-                else { targetStart = 0; targetEnd = 4; }
+                containerCount = 5;
             } else if (openDispensers.containsKey(windowId)) {
-                if (slot < 9) { targetStart = 9; targetEnd = 44; }
-                else { targetStart = 0; targetEnd = 8; }
+                containerCount = 9;
+            } else if (openStonecutters.containsKey(windowId)) {
+                containerCount = 2; forbidden = new int[]{1};
+            } else if (openGrindstones.containsKey(windowId)) {
+                containerCount = 3; forbidden = new int[]{2};
+            } else if (openSmithing.containsKey(windowId)) {
+                containerCount = 4; forbidden = new int[]{3};
+            } else if (openEnchanting.containsKey(windowId)) {
+                containerCount = 2;
+            } else if (openBeacons.containsKey(windowId)) {
+                containerCount = 1;
+            } else if (openAnvil.containsKey(windowId)) {
+                containerCount = 3; forbidden = new int[]{2};
+            } else if (openBrewing.containsKey(windowId)) {
+                containerCount = 5;
+            } else if (openMerchants.containsKey(windowId)) {
+                containerCount = 3; forbidden = new int[]{0};
             } else {
                 return;
             }
-            for (int i = targetStart; i <= targetEnd; i++) {
-                if (i == slot) continue;
-                int[] target = getSlotItem(windowId, i);
-                if (target[1] <= 0) {
-                    setSlotItem(windowId, i, itemId, count);
-                    setSlotItem(windowId, slot, 0, 0);
-                    sendSlotUpdate(windowId, slot);
-                    sendSlotUpdate(windowId, i);
-                    return;
-                } else if (target[0] == itemId && target[1] < getMaxStackSize(itemId)) {
-                    int can = Math.min(getMaxStackSize(itemId) - target[1], count);
-                    setSlotItem(windowId, i, itemId, target[1] + can);
-                    count -= can;
-                    if (count <= 0) {
-                        setSlotItem(windowId, slot, 0, 0);
-                        sendSlotUpdate(windowId, slot);
-                        sendSlotUpdate(windowId, i);
-                        return;
-                    }
-                    setSlotItem(windowId, slot, itemId, count);
-                    sendSlotUpdate(windowId, slot);
+            if (slot < containerCount) {
+                // 熔炉: 从容器区进背包; 从背包区进熔炉需按物品选输入/燃料槽(下方处理)
+                shiftMoveSlots(windowId, slot, item, srcMeta, containerCount, containerCount + 35, forbidden);
+            } else {
+                if (openFurnaces.containsKey(windowId)) {
+                    String fn = BlockManager.itemIdToName(item[0]);
+                    boolean isFuel = fn != null && SmeltingSystem.getFuelBurnTime(fn) > 0;
+                    int target = isFuel ? 1 : 0;
+                    shiftMoveSlots(windowId, slot, item, srcMeta, target, target, forbidden);
+                } else {
+                    shiftMoveSlots(windowId, slot, item, srcMeta, 0, containerCount - 1, forbidden);
+                }
+            }
+        }
+    }
+
+    /** Bug4/33: shift 移动核心。优先并入同 id 未满堆(仅双方均无组件), 否则放空槽; 组件随物品走。 */
+    private void shiftMoveSlots(int windowId, int src, int[] item, ItemMeta srcMeta,
+                                int start, int end, int[] forbiddenTargets) {
+        boolean hasMeta = !srcMeta.isEmpty();
+        if (!hasMeta) {
+            for (int i = start; i <= end; i++) {
+                if (i == src || isForbiddenTarget(forbiddenTargets, i)) continue;
+                int[] t = getSlotItem(windowId, i);
+                if (t[0] == item[0] && t[1] > 0 && t[1] < getMaxStackSize(item[0])
+                        && readSlotMeta(windowId, i).isEmpty()) {
+                    int can = Math.min(getMaxStackSize(item[0]) - t[1], item[1]);
+                    setSlotItemFull(windowId, i, item[0], t[1] + can, ItemMeta.EMPTY);
+                    int remain = item[1] - can;
+                    setSlotItem(windowId, src, remain > 0 ? item[0] : 0, remain);
+                    sendSlotUpdate(windowId, src);
                     sendSlotUpdate(windowId, i);
                     return;
                 }
             }
         }
+        for (int i = start; i <= end; i++) {
+            if (i == src || isForbiddenTarget(forbiddenTargets, i)) continue;
+            int[] t = getSlotItem(windowId, i);
+            if (t[1] <= 0) {
+                setSlotItemFull(windowId, i, item[0], item[1], srcMeta);
+                setSlotItem(windowId, src, 0, 0);
+                sendSlotUpdate(windowId, src);
+                sendSlotUpdate(windowId, i);
+                return;
+            }
+        }
+    }
+
+    private static boolean isForbiddenTarget(int[] arr, int v) {
+        if (arr == null) return false;
+        for (int x : arr) if (x == v) return true;
+        return false;
     }
 
     private void updateCraftingResult(int windowId) {
@@ -6153,6 +6942,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     public void tickSurvival() {
         if (isDead) return;
 
+        // Bug44: 每 tick 泵送限量区块(生成在 IO 线程逐个做, 压缩/光照负载摊平),
+        // 替代曾一次性倾泻全部视距区块造成的进服初期帧率剧烈波动。
+        pumpChunkSends();
+
         if (invulnTicks > 0) {
             invulnTicks--;
             if (invulnTicks == 0) lastDamageAmount = 0.0f;
@@ -6201,6 +6994,34 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             } else {
                 if (portalTimer < 0) portalTimer++;
                 else portalTimer = 0;
+            }
+        }
+
+        // Bug5/8 修复: 容器进度同步/状态效果必须在游戏模式门控之前执行。
+        // 曾放在 if (gameMode != 0) return 之后 -> 创造/冒险模式下熔炉火焰与烧炼箭头、
+        // 酿造台进度、信标 buff、药水效果全部冻结(每刻同步从未发出)。
+        // Bug59: 生存挖掘裂纹阶段广播
+        tickDigProgress();
+        // Bug52: 延迟进食/饮用结算
+        tickEating();
+        syncOpenFurnaces();
+        syncOpenBrewings();
+        syncAttributesIfNeeded();
+        tickEffects();
+        // #11: 信标 buff 持续(每 ~4 秒重施一次, 原版范围内持续生效)。
+        beaconTickTimer++;
+        if (beaconTickTimer >= 80) {
+            beaconTickTimer = 0;
+            for (var beh : ContainerStore.beaconEntries()) {
+                ContainerStore.Pos bp = beh.getKey();
+                ContainerStore.BeaconData bd = beh.getValue();
+                if (bp == null || bd == null || bd.levels < 1 || bd.primary < 0) continue;
+                if (bp.dim() != this.currentDim) continue;
+                int dx = (int) (this.x - bp.x()), dz = (int) (this.z - bp.z());
+                int range = 10 + bd.levels * 10;
+                if (dx * dx + dz * dz <= range * range) {
+                    applyBeaconEffectToPlayers(bp);
+                }
             }
         }
 
@@ -6341,31 +7162,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             String belowFallName = BlockStateHelper.getName(blockBelowFall);
             if (!"water".equals(belowFallName) && !"hay_block".equals(belowFallName)
                 && !"honey_block".equals(belowFallName) && !"slime_block".equals(belowFallName)) {
-                health -= damage;
-                sendHealthUpdate();
+                // Bug42: 摔落伤害走 damagePlayer —— 曾直接 health-=damage 绕过全部减伤,
+                // 摔落缓冲/保护附魔完全无效("附魔的工具和普通工具没差别"的组成部分)。
+                damagePlayer(damage, "fall");
             }
             fallDistance = 0.0f;
-        }
-
-        syncOpenFurnaces();
-        syncOpenBrewings();
-        syncAttributesIfNeeded();
-        tickEffects();
-        // #11: 信标 buff 持续(每 ~4 秒重施一次, 原版范围内持续生效)。
-        beaconTickTimer++;
-        if (beaconTickTimer >= 80) {
-            beaconTickTimer = 0;
-            for (var beh : ContainerStore.beaconEntries()) {
-                ContainerStore.Pos bp = beh.getKey();
-                ContainerStore.BeaconData bd = beh.getValue();
-                if (bp == null || bd == null || bd.levels < 1 || bd.primary <= 0) continue;
-                if (bp.dim() != this.currentDim) continue;
-                int dx = (int) (this.x - bp.x()), dz = (int) (this.z - bp.z());
-                int range = 10 + bd.levels * 10;
-                if (dx * dx + dz * dz <= range * range) {
-                    applyBeaconEffectToPlayers(bp);
-                }
-            }
         }
 
         if (!onGround && y < lastY) {
@@ -6458,6 +7259,16 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         damagePlayer(damage, source, Double.NaN, Double.NaN);
     }
 
+    /** Bug42: 火矢点燃玩家(火抗药水免疫点燃, 与原版 setRemainingFire 一致)。 */
+    public void ignite(int ticks) {
+        if (gameMode == 1 || gameMode == 3 || hasEffect("fire_resistance")) return;
+        if (ticks > fireTicks) {
+            boolean wasOff = fireTicks <= 0;
+            fireTicks = ticks;
+            if (wasOff) syncOnFire();
+        }
+    }
+
     public void damagePlayer(float damage, String source, double srcX, double srcZ) {
         if (gameMode == 1 || gameMode == 3) return;
         if (isDead) return;
@@ -6515,20 +7326,23 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             }
         }
 
-        // 附魔保护 (protection / fire_protection / blast_protection / projectile_protection)
+        // 附魔保护 (protection / fire_protection / blast_protection / projectile_protection / feather_falling)
         if (!bypassesArmor(source) && !"void".equals(source)) {
-            int prot = 0, fireProt = 0, blastProt = 0, projProt = 0;
+            int prot = 0, fireProt = 0, blastProt = 0, projProt = 0, featherFall = 0;
             for (int s = ARMOR_SLOT_FIRST; s <= ARMOR_SLOT_LAST; s++) {
                 if (data.inventoryIds[s] <= 0) continue;
                 prot     += data.getSlotEnchant(s, BlockManager.getEnchantId("protection"));
                 fireProt += data.getSlotEnchant(s, BlockManager.getEnchantId("fire_protection"));
                 blastProt+= data.getSlotEnchant(s, BlockManager.getEnchantId("blast_protection"));
                 projProt += data.getSlotEnchant(s, BlockManager.getEnchantId("projectile_protection"));
+                // Bug42: 摔落缓冲按原版 EPF=3×等级 只对摔落伤害生效
+                featherFall += data.getSlotEnchant(s, BlockManager.getEnchantId("feather_falling"));
             }
             int epf = prot;
             if ("lava".equals(source) || "fire".equals(source) || "onFire".equals(source)) epf += fireProt;
             if ("explosion".equals(source)) epf += blastProt;
             if ("projectile".equals(source)) epf += projProt;
+            if ("fall".equals(source)) epf += featherFall * 3;
             if (epf > 0) {
                 damage -= damage * Math.min(epf, 20) / 25.0f;
             }
@@ -6579,9 +7393,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     public void knockback(double kx, double kz, double ky) {
-        // 1.21.11 set_entity_motion(entity_velocity): VarInt entityId + velocity(lpVec3)。
+        // entity_velocity = 0x64 (曾误用 0x63=attach_entity -> 客户端解析错乱)。
         // velocity 必须用 lpVec3 编码, 不能用 3×Short(旧格式), 否则客户端 lpVec3 解码器越界崩溃。
-        sendPacket(ctx, 0x63, pb -> {
+        sendPacket(ctx, 0x64, pb -> {
             pb.writeVarInt(this.eid);
             pb.writeLpVec3(kx, ky, kz);
         });
@@ -6692,7 +7506,19 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             pb.writeVarInt(windowId);
             pb.writeVarInt(0);
             pb.writeVarInt(containerSlotCount + 36);
-            for (int i = 0; i < containerSlotCount; i++) pb.writeSlot(slots[i * 2], slots[i * 2 + 1]);
+            for (int i = 0; i < containerSlotCount; i++) {
+                int id = slots[i * 2], cnt = slots[i * 2 + 1];
+                // Bug8: 处理器容器槽(酿造台瓶中药水等)也带组件下发。
+                // 曾一律 writeSlot(无 components) -> 立在酿造台里的药水在 UI 里永远显示
+                // "不可合成的药水"(potion_contents 丢失)。
+                if (id > 0 && cnt > 0) {
+                    ItemMeta m = readSlotMeta(windowId, i);
+                    if (m != null && !m.isEmpty()) writeStackWithMeta(pb, id, cnt, m);
+                    else pb.writeSlot(id, cnt);
+                } else {
+                    pb.writeSlot(id, cnt);
+                }
+            }
             for (int ps = 9; ps <= 44; ps++) writePlayerSlot(pb, ps);
             writeCarriedSlot(pb);
         });
@@ -6878,17 +7704,52 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         });
     }
 
-    /** #29 处理 serverbound update_command_block(0x35): pos + command + mode + flags。 */
+    /** #29 处理 serverbound update_command_block(0x35): pos + command + mode + flags。
+     *  协议 Mode 枚举(原版 CommandBlockEntity.Mode 序数): 0=SEQUENCE(连锁), 1=AUTO(循环), 2=REDSTONE(脉冲)。
+     *  内部 cbd.mode 约定: 1=连锁, 2=循环, 0=脉冲(与 RedstoneEngine 重载回读一致)。 */
     private void handleSetCommandBlock(int[] pos, String command, int mode, byte flags) {
         ContainerStore.Pos cp = new ContainerStore.Pos(this.currentDim, pos[0], pos[1], pos[2]);
         ContainerStore.CommandBlockData cbd = ContainerStore.commandBlock(cp);
         if (!cbd.hasPermission && gameMode != 1 && opLevel() < 2) return; // 无权限拒收
         cbd.command = command == null ? "" : command;
-        cbd.mode = mode;
+        int internalMode = switch (mode) {
+            case 0 -> 1;  // SEQUENCE -> 连锁
+            case 1 -> 2;  // AUTO -> 循环
+            default -> 0; // REDSTONE -> 脉冲
+        };
+        cbd.mode = internalMode;
         cbd.trackOutput = (flags & 1) != 0;
         cbd.conditional = (flags & 2) != 0;
         cbd.auto = (flags & 4) != 0;
         cbd.version++;
+        // Bug19 修复: 原版脉冲/循环/连锁是三个不同方块(command_block/chain/repeating),
+        // 客户端 UI 切模式后经 update_command_block 上报 mode, 服务端必须把方块状态
+        // 换成对应方块(保留朝向等属性)。曾按旧序理解(1=连锁,2=循环) -> 点循环出连锁、
+        // 点连锁出脉冲, 观感即"无法调成循环或连锁"。
+        String wantBlock = switch (internalMode) {
+            case 1 -> "chain_command_block";
+            case 2 -> "repeating_command_block";
+            default -> "command_block";
+        };
+        int curState = WorldManager.getBlockState(this.currentDim, pos[0], pos[1], pos[2]);
+        String curBlock = BlockStateHelper.getName(curState);
+        if ((curBlock.equals("command_block") || curBlock.equals("chain_command_block")
+                || curBlock.equals("repeating_command_block")) && !wantBlock.equals(curBlock)) {
+            int newState = BlockStateHelper.getDefault(wantBlock);
+            for (String prop : new String[]{"facing", "conditional", "powered"}) {
+                String v = BlockStateHelper.getProp(curState, prop);
+                if (v != null && BlockStateHelper.getProp(newState, prop) != null) {
+                    newState = BlockStateHelper.withProp(newState, prop, v);
+                }
+            }
+            String condWant = cbd.conditional ? "true" : "false";
+            if (BlockStateHelper.getProp(newState, "conditional") != null) {
+                newState = BlockStateHelper.withProp(newState, "conditional", condWant);
+            }
+            WorldManager.setBlock(this.currentDim, pos[0], pos[1], pos[2], newState);
+            broadcastBlockChange(pos[0], pos[1], pos[2], newState);
+            RedstoneEngine.onBlockChanged(this.currentDim, pos[0], pos[1], pos[2]);
+        }
         // 写回 BE 持久化
         Chunk cChunk = WorldManager.getChunk(cp.dim(), pos[0] >> 4, pos[2] >> 4);
         if (cChunk != null) {
@@ -6896,7 +7757,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             org.cloudburstmc.nbt.NbtMapBuilder cbb = org.cloudburstmc.nbt.NbtMap.builder();
             if (cbe != null) for (String k : cbe.keySet()) cbb.put(k, cbe.get(k));
             cbb.putString("Command", cbd.command);
-            cbb.putByte("auto", (byte) mode);
+            cbb.putByte("auto", (byte) internalMode);
             cbb.putByte("conditionMet", (byte) (cbd.conditional ? 1 : 0));
             cbb.putByte("TrackOutput", (byte) (cbd.trackOutput ? 1 : 0));
             cChunk.setBlockEntity(pos[0] & 15, pos[1], pos[2] & 15, cbb.build());
@@ -6910,14 +7771,20 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         ContainerStore.Pos pos = openBeacons.get(beaconWindowId);
         if (pos == null) return;
         ContainerStore.BeaconData bd = ContainerStore.beacon(pos);
-        // 原版 BeaconMenu.updateEffects: 需有支付物才生效；主效果需 levels>=1, 副效果需 levels>=4。
+        // Bug11 修复: 选效果时实时重算金字塔层数(曾只在打开 UI 时算一次,
+        // 后补的金字塔/层数变化导致 levels 恒为 0 -> 点击确认永远被拒)。
+        bd.levels = computeBeaconLevels(pos.dim(), pos.x(), pos.y(), pos.z());
+        // #11 二轮诊断: 确认服务端是否收到选择、条件为何被拒
+        System.out.println("[信标诊断] primary=" + primary + " secondary=" + secondary
+            + " levels=" + bd.levels + " payment=" + bd.payment
+            + " payItem=" + bd.paymentSlot[0] + "x" + bd.paymentSlot[1]);
         if (!bd.payment || bd.paymentSlot[0] <= 0) return;
         if (bd.levels < 1) return;
-        if (secondary > 0 && bd.levels < 4) secondary = 0;
-        // 主效果范围(原版主效果可选 1-14 的部分, 简化: 任意合法 id 且 != 副效果)。
-        if (primary < 0 || primary > 31) primary = 0;
-        if (secondary < 0 || secondary > 31) secondary = 0;
-        if (primary == secondary && primary != 0) secondary = 0;
+        if (secondary > -1 && bd.levels < 4) secondary = -1;
+        // 主效果范围: 0 基注册表 id, -1 = 无效果
+        if (primary < -1 || primary > 32) primary = -1;
+        if (secondary < -1 || secondary > 32) secondary = -1;
+        if (primary == secondary && primary != -1) secondary = -1;
 
         bd.primary = primary;
         bd.secondary = secondary;
@@ -6960,17 +7827,42 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
     }
 
+    /** Bug11: 信标 buff 周期性重施加(原版 BeaconBlockEntity 每 80 tick 给范围内玩家上效果,
+     *  曾只在点击确认瞬间施加一次 4 秒 -> 玩家几乎察觉不到 buff = "无法受到该效果的 buff")。 */
+    public static void beaconEffectTick() {
+        for (var e : ContainerStore.beaconEntries()) {
+            ContainerStore.BeaconData bd = e.getValue();
+            if (bd == null || bd.primary < 0 || bd.levels < 1) continue;
+            if ((int) (com.CharunCore.server.Main.worldAge % 80) != 0) continue;
+            ContainerStore.Pos pos = e.getKey();
+            int range = 10 + bd.levels * 10;
+            int duration = (8 + bd.levels * 2) * 20;
+            for (NetworkHandler p : players.values()) {
+                if (p.ctx == null || !p.ctx.channel().isActive() || p.isDead
+                        || p.currentDim != pos.dim()) continue;
+                double dx = p.x - pos.x(), dz = p.z - pos.z();
+                double dy = p.y - pos.y();
+                if (dx * dx + dy * dy + dz * dz > (double) range * range) continue;
+                int primaryAmp = (bd.secondary > 0 && bd.secondary == bd.primary && bd.levels >= 4) ? 1 : 0;
+                p.applyEffectToPlayer(p, bd.primary, primaryAmp, duration);
+                if (bd.secondary > 0 && bd.secondary != bd.primary) {
+                    p.applyEffectToPlayer(p, bd.secondary, 1, duration);
+                }
+            }
+        }
+    }
+
     /** 给玩家施加状态效果（实体状态效果系统的基础实现，供信标/药水共用）。
      *  #11 修复: 同时写入 activeEffects, 让 buff 真正在服务端/客户端生效。 */
-    private void applyEffectToPlayer(NetworkHandler p, int effectId, int amplifier, int durationTicks) {
-        if (effectId <= 0 || p.data == null) return;
+    private static void applyEffectToPlayer(NetworkHandler p, int effectId, int amplifier, int durationTicks) {
+        if (effectId < 0 || p.data == null) return;
         // 原版 ClientboundUpdateMobEffectPacket(0x82 entity_effect):
         // entityId VarInt + effect(registry id, VarInt id+1) + amplifier VarInt + duration VarInt + flags Byte。
         // flags: 1=ambient 2=visible 4=show_icon -> 7 表示可见+图标。
         if (p.ctx == null || !p.ctx.channel().isActive()) return;
         p.sendPacket(p.ctx, 0x82, pb -> {
             pb.writeVarInt(p.eid);
-            pb.writeVarInt(effectId + 1);
+            pb.writeVarInt(effectId); // 0 基 mob_effect 注册表 id
             pb.writeVarInt(amplifier);
             pb.writeVarInt(durationTicks);
             pb.writeByte(7);
@@ -6981,7 +7873,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (o.currentDim != p.currentDim) continue;
             o.sendPacket(o.ctx, 0x82, pb -> {
                 pb.writeVarInt(p.eid);
-                pb.writeVarInt(effectId + 1);
+                pb.writeVarInt(effectId);
                 pb.writeVarInt(amplifier);
                 pb.writeVarInt(durationTicks);
                 pb.writeByte(7);
@@ -6999,24 +7891,24 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     // ── 附魔台书架计数 ──────────────────────────────────────────────────────
     private int computeBookshelfCount(int x, int y, int z) {
+        // Bug41: 原版 EnchantingTableBlock.BOOKSHELF_OFFSETS = [-2..2]^2 环圈(|dx|==2 或 |dz|==2) × dy∈{0,1}
+        // 共 32 个候选位, 中间隔断检查在书架自身高度 dy 处(曾漏同层斜角 -> 满环书架只数到 4 个)。
         int count = 0;
-        int[][] offsets = {
-            {2, 0, 0}, {-2, 0, 0}, {0, 0, 2}, {0, 0, -2},
-            {2, 1, 0}, {-2, 1, 0}, {0, 1, 2}, {0, 1, -2},
-            {2, 1, 1}, {-2, 1, 1}, {2, 1, -1}, {-2, 1, -1},
-            {1, 1, 2}, {-1, 1, 2}, {1, 1, -2}, {-1, 1, -2}
-        };
-        for (int[] o : offsets) {
-            int bx = x + o[0], by = y + o[1], bz = z + o[2];
-            int s = WorldManager.getBlockState(this.currentDim, bx, by, bz);
-            if (!"bookshelf".equals(BlockStateHelper.getName(s))) continue;
-            // 中间隔断需两个空气格 (y 与 y+1), 否则书架无法为附魔台供能(原版 isValidBookShelf)
-            int mx = x + Integer.signum(o[0]);
-            int mz = z + Integer.signum(o[2]);
-            int m  = WorldManager.getBlockState(this.currentDim, mx, y, mz);
-            int mUp = WorldManager.getBlockState(this.currentDim, mx, y + 1, mz);
-            if ("air".equals(BlockStateHelper.getName(m))
-                    && "air".equals(BlockStateHelper.getName(mUp))) count++;
+        for (int dy = 0; dy <= 1; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    if (Math.abs(dx) != 2 && Math.abs(dz) != 2) continue;
+                    int s = WorldManager.getBlockState(this.currentDim, x + dx, y + dy, z + dz);
+                    String sn = BlockStateHelper.getName(s);
+                    if (!"bookshelf".equals(sn) && !"chiseled_bookshelf".equals(sn)) continue;
+                    // 中间隔断须为可穿透方块(原版 #enchantment_power_transmitter: air/水/花草等)
+                    int m = WorldManager.getBlockState(this.currentDim, x + dx / 2, y + dy, z + dz / 2);
+                    String mn = BlockStateHelper.getName(m);
+                    boolean transmitter = "air".equals(mn) || "water".equals(mn)
+                        || (mn != null && BlockStateHelper.isReplaceable(mn));
+                    if (transmitter) count++;
+                }
+            }
         }
         return Math.min(15, count);
     }
@@ -7040,24 +7932,30 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (buttonId < 0 || buttonId > 2) return;
         ContainerStore.EnchantingData ed = getEnchantingData(windowId);
         if (ed == null) return;
-        if (ed.optionEnchant[buttonId] <= 0 || ed.optionCost[buttonId] <= 0) return;
-        if (data.xpLevel < ed.optionCost[buttonId]) return;
+        if (ed.optionEnchList[buttonId] == null || ed.optionEnchList[buttonId].isEmpty()) return;
+        boolean creative = gameMode == 1;
+        int cost = ed.optionCost[buttonId];
+        // Bug26 修复: 原版 hasInfiniteMaterials(创造)无视经验等级与青金石数量限制,
+        // 曾一律按生存校验 -> 创造模式点击选项无任何反应。
+        if (!creative && data.xpLevel < cost) return;
         int lapisCount = ed.slots[3];
         int lapisNeed = buttonId + 1; // 原版: 顶部1/中部2/底部3
-        if (lapisCount < lapisNeed) return; // 青金石不足
+        if (!creative && lapisCount < lapisNeed) return; // 青金石不足
         int inId = ed.slots[0], inCount = ed.slots[1];
         if (inId <= 0 || inCount <= 0) return;
-        if (!hasEmptySlot()) return; // 背包需有空位
+        if (!creative && !hasEmptySlot()) return; // 背包需有空位
 
-        // 扣经验等级
-        data.xpLevel -= ed.optionCost[buttonId];
-        sendExperienceUpdate();
-        // 扣青金石 n+1
-        ed.slots[3] -= lapisNeed;
-        if (ed.slots[3] <= 0) { ed.slots[2] = 0; ed.slots[3] = 0; }
-        // 扣输入物品
-        ed.slots[1]--;
-        if (ed.slots[1] <= 0) { ed.slots[0] = 0; ed.slots[1] = 0; }
+        // 扣经验等级 / 扣青金石 / 扣输入物品
+        if (!creative) {
+            data.xpLevel -= cost;
+            sendExperienceUpdate();
+            ed.slots[3] -= lapisNeed;
+            if (ed.slots[3] <= 0) { ed.slots[2] = 0; ed.slots[3] = 0; }
+            ed.slots[1]--;
+            if (ed.slots[1] <= 0) { ed.slots[0] = 0; ed.slots[1] = 0; writeContMeta(ed.meta, 0, null); }
+        } else {
+            // 创造: 输入物品不消耗, 附魔结果直接进背包
+        }
         ed.version++;
 
         giveEnchantedItem(inId, 1, ed.optionEnchList[buttonId]);
@@ -7154,7 +8052,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (sd == null) return;
         int templateId = sd.slots[0], baseId = sd.slots[2], addId = sd.slots[4];
         sd.slots[6] = 0; sd.slots[7] = 0;
-        sd.outTrimMaterial = 0; sd.outTrimPattern = 0;
+        sd.outTrimMaterial = -1; sd.outTrimPattern = -1;
+        // Bug14: 结果槽组件继承基础装备组件(下界合金升级/纹饰都要保留附魔/改名/耐久)
+        writeContMeta(sd.meta, 3, contMeta(sd.meta, 1));
         if (baseId > 0 && addId > 0) {
             String baseName = BlockManager.itemIdToName(baseId);
             String addName = BlockManager.itemIdToName(addId);
@@ -7172,33 +8072,50 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     && isArmorForTrim(baseName) && isTrimMaterial(addName)) {
                 // 盔甲纹饰: 模板(非升级) + 盔甲 + 材料 -> 输出盔甲(带 trim 组件)。
                 // 原版 SmithingTrimRecipe: 附加材料经 TrimMaterials.getFromIngredient 匹配。
-                sd.slots[6] = baseId; sd.slots[7] = 1;
-                sd.outTrimMaterial = trimMaterialId(addName);
-                sd.outTrimPattern = trimPatternId(templateName);
+                // trimMaterialId/trimPatternId 返回 0 基注册表 id(amethyst/bolt=0), 仅在均有效时出结果。
+                int tm = trimMaterialId(addName);
+                int tp = trimPatternId(templateName);
+                if (tm >= 0 && tp >= 0) {
+                    sd.slots[6] = baseId; sd.slots[7] = 1;
+                    sd.outTrimMaterial = tm;
+                    sd.outTrimPattern = tp;
+                }
             }
         }
         sd.version++;
         sendSmithingContent(windowId, sd);
     }
 
-    /** 锻造台窗口: 结果槽带组件(纹饰 trim)下发, 修复"纹饰后结果仍是原版盔甲"的预览。 */
+    /** 锻造台窗口: 结果槽带完整组件(继承基础装备 + 纹饰 trim)下发。 */
     private void sendSmithingContent(int windowId, ContainerStore.SmithingData sd) {
         int[] c = sd.slots;
         int tpl = c[0], tpc = c[1], base = c[2], bc = c[3], add = c[4], ac = c[5], res = c[6], rc = c[7];
-        boolean baseBook = "enchanted_book".equals(BlockManager.itemIdToName(base));
-        boolean resBook = "enchanted_book".equals(BlockManager.itemIdToName(res));
         boolean tplBook = "enchanted_book".equals(BlockManager.itemIdToName(tpl));
         boolean addBook = "enchanted_book".equals(BlockManager.itemIdToName(add));
+        ItemMeta tplMeta = contMeta(sd.meta, 0);
+        ItemMeta baseMeta = contMeta(sd.meta, 1);
+        ItemMeta addMeta = contMeta(sd.meta, 2);
+        ItemMeta resMeta = contMeta(sd.meta, 3);
+        boolean resBook = "enchanted_book".equals(BlockManager.itemIdToName(res));
+        boolean hasTrim = sd.outTrimMaterial >= 0 && sd.outTrimPattern >= 0;
         sendPacket(ctx, 0x12, pb -> {
             pb.writeVarInt(windowId);
             pb.writeVarInt(0);
             pb.writeVarInt(4 + 36);
-            pb.writeStackWithComponents(tpl, tpc, null, tplBook, 0, 0, 0, null, 0, -1, -1);
-            pb.writeStackWithComponents(base, bc, null, baseBook, 0, 0, 0, null, 0, -1, -1);
-            pb.writeStackWithComponents(add, ac, null, addBook, 0, 0, 0, null, 0, -1, -1);
-            pb.writeStackWithComponents(res, rc, null, resBook, 0, 0, 0, null, 0,
-                sd.outTrimMaterial >= 0 && sd.outTrimPattern >= 0 ? sd.outTrimMaterial : -1,
-                sd.outTrimPattern >= 0 ? sd.outTrimPattern : -1);
+            writeStackWithMeta(pb, tpl, tpc, tplMeta);
+            writeStackWithMeta(pb, base, bc, baseMeta);
+            writeStackWithMeta(pb, add, ac, addMeta);
+            // Bug4/33: 模板/附加材料也按存储组件下发(放入带附魔物品不再显示白板)。
+            // 结果槽 = 继承的基础组件 + 可选 trim。
+            if (hasTrim) {
+                int[] rp = parsePotionEx(resMeta.potion());
+                pb.writeStackWithComponents(res, rc,
+                        resMeta.enchants().isEmpty() ? null : resMeta.enchants(), resBook,
+                        rp[0], rp[1], rp[2], resMeta.customName(), resMeta.damage(),
+                        sd.outTrimMaterial, sd.outTrimPattern, rp[3]);
+            } else {
+                writeStackWithMeta(pb, res, rc, resMeta);
+            }
             for (int ps = 9; ps <= 44; ps++) writePlayerSlot(pb, ps);
             writeCarriedSlot(pb);
         });
@@ -7221,119 +8138,165 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         };
     }
 
+    // 原版 1.21.11 trim_material 注册表 id（来自 dumped_registries/reg_4.bin 的真实客户端注册顺序）。
+    // 客户端按此 bin 顺序分配 id: amethyst=0,copper=1,diamond=2,emerald=3,gold=4,iron=5,lapis=6,netherite=7,quartz=8,redstone=9,resin=10
     private static int trimMaterialId(String name) {
-        // 1.21.11 原版 TrimMaterials 注册顺序: quartz,iron,netherite,redstone,copper,gold,emerald,diamond,lapis,amethyst,resin
         return switch (name) {
-            case "quartz" -> 0; case "iron_ingot" -> 1; case "netherite_ingot" -> 2;
-            case "redstone" -> 3; case "copper_ingot" -> 4; case "gold_ingot" -> 5;
-            case "emerald" -> 6; case "diamond" -> 7; case "lapis_lazuli" -> 8;
-            case "amethyst_shard" -> 9; case "resin_brick" -> 10; default -> -1;
+            case "amethyst_shard" -> 0;
+            case "copper_ingot" -> 1;
+            case "diamond" -> 2;
+            case "emerald" -> 3;
+            case "gold_ingot" -> 4;
+            case "iron_ingot" -> 5;
+            case "lapis_lazuli" -> 6;
+            case "netherite_ingot" -> 7;
+            case "quartz" -> 8;
+            case "redstone" -> 9;
+            case "resin_brick" -> 10;
+            default -> -1;
         };
     }
 
+    // 原版 1.21.11 trim_pattern 注册表 id（来自 dumped_registries/reg_3.bin 的真实客户端注册顺序）。
+    // bolt=0,coast=1,dune=2,eye=3,flow=4,host=5,raiser=6,rib=7,sentry=8,shaper=9,silence=10,snout=11,
+    // spire=12,tide=13,vex=14,ward=15,wayfinder=16,wild=17
     private static int trimPatternId(String templateName) {
         return switch (templateName) {
-            case "sentry_armor_trim_smithing_template" -> 0;
-            case "dune_armor_trim_smithing_template" -> 1;
-            case "coast_armor_trim_smithing_template" -> 2;
-            case "wild_armor_trim_smithing_template" -> 3;
-            case "ward_armor_trim_smithing_template" -> 4;
-            case "eye_armor_trim_smithing_template" -> 5;
-            case "vex_armor_trim_smithing_template" -> 6;
-            case "tide_armor_trim_smithing_template" -> 7;
-            case "snout_armor_trim_smithing_template" -> 8;   // 猪鼻纹饰
-            case "rib_armor_trim_smithing_template" -> 9;
-            case "spire_armor_trim_smithing_template" -> 10;
-            case "wayfinder_armor_trim_smithing_template" -> 11;
-            case "shaper_armor_trim_smithing_template" -> 12;
-            case "silence_armor_trim_smithing_template" -> 13;
-            case "raiser_armor_trim_smithing_template" -> 14;
-            case "host_armor_trim_smithing_template" -> 15;
+            case "bolt_armor_trim_smithing_template" -> 0;
+            case "coast_armor_trim_smithing_template" -> 1;
+            case "dune_armor_trim_smithing_template" -> 2;
+            case "eye_armor_trim_smithing_template" -> 3;
+            case "flow_armor_trim_smithing_template" -> 4;
+            case "host_armor_trim_smithing_template" -> 5;
+            case "raiser_armor_trim_smithing_template" -> 6;
+            case "rib_armor_trim_smithing_template" -> 7;
+            case "sentry_armor_trim_smithing_template" -> 8;
+            case "shaper_armor_trim_smithing_template" -> 9;
+            case "silence_armor_trim_smithing_template" -> 10;
+            case "snout_armor_trim_smithing_template" -> 11;   // 猪鼻纹饰
+            case "spire_armor_trim_smithing_template" -> 12;
+            case "tide_armor_trim_smithing_template" -> 13;
+            case "vex_armor_trim_smithing_template" -> 14;
+            case "ward_armor_trim_smithing_template" -> 15;
+            case "wayfinder_armor_trim_smithing_template" -> 16;
+            case "wild_armor_trim_smithing_template" -> 17;
             default -> -1;
         };
     }
 
     // ── 铁砧: 重命名 + 附魔书合并 + 同种物品修复/合并(原版行为) ──
+    /** Bug3/6/12/31: 按原版 AnvilMenu.createResult 重写。
+     *  原版逻辑(mapping/remapped_server_1.21.11.jar.src/net/minecraft/world/inventory/AnvilMenu.java):
+     *  - 同种可损伤物品合并: 剩余耐久 = r1 + r2 + max*12%, 新损伤 = max - n (clamp>=0, 仅在变好时生效, +2 级)
+     *  - 附魔书/物品附魔转移: 同级则 +1, 否则取高; clamp 到 max_level; 消耗 = anvil_cost(书减半,min 1) * 结果等级
+     *  - 互斥组附魔冲突时该条不施加(且全部冲突+无修复 -> 无结果)
+     *  - 改名: 与当前显示名不同才计 1 级; 清空输入框 = 去掉自定义名
+     *  - 可堆叠非工具同物合并: 原版不允许(直接无结果) */
     private void recomputeAnvil(int windowId) {
         ContainerStore.AnvilData ad = getAnvilData(windowId);
         if (ad == null) return;
         int leftId = ad.slots[0], leftCount = ad.slots[1];
         int rightId = ad.slots[2], rightCount = ad.slots[3];
         ad.slots[4] = 0; ad.slots[5] = 0; ad.cost = 0;
-        ad.outId = 0; ad.outCount = 0; ad.outEnchants = new java.util.HashMap<>();
+        ad.outId = 0; ad.outCount = 0;
+        java.util.Map<Integer, Integer> freshOut = new java.util.HashMap<>();
+        ad.outEnchants = freshOut;
         ad.outName = null;
         ad.outDamage = 0;
 
-        if (leftId <= 0) { ad.version++; sendProcessorContent(windowId, ad.slots, 3); return; }
+        if (leftId <= 0) { ad.version++; sendAnvilContent(windowId); return; }
 
         String leftName = BlockManager.itemIdToName(leftId);
         String rightName = rightId > 0 ? BlockManager.itemIdToName(rightId) : null;
+        boolean rightIsBook = rightId > 0 && "enchanted_book".equals(rightName);
 
-        // 输出 = 左物品(同 id/数量), 附魔从 leftEnchants 起步, 耐久从 leftDamage 起步
         int outId = leftId;
         int outCount = leftCount;
         int outDamage = ad.leftDamage;
         String outPotion = ad.leftPotion;
         java.util.Map<Integer, Integer> outEnch = new java.util.HashMap<>(ad.leftEnchants);
         int cost = 0;
+        boolean changedAny = false;
 
-        // 1) 重命名: 任何非空名字(含与原名相同)都算一次改名
-        if (ad.rename != null && !ad.rename.isEmpty()) {
+        if (rightId > 0) {
+            int maxDmg = getMaxDurability(leftName);
+            boolean sameDamageable = !rightIsBook && rightId == leftId && maxDmg > 0;
+            if (!rightIsBook && !sameDamageable) {
+                // 原版: 非书、非同种可损伤物品 -> 无结果(材料修复暂未实现)
+                ad.version++;
+                sendAnvilContent(windowId);
+                return;
+            }
+            if (sameDamageable) {
+                int j = maxDmg - ad.leftDamage;
+                int k = maxDmg - ad.rightDamage;
+                int n = j + k + maxDmg * 12 / 100;
+                int newDmg = Math.max(maxDmg - n, 0);
+                if (newDmg < ad.leftDamage) {
+                    outDamage = newDmg;
+                    changedAny = true;
+                    cost += 2;
+                }
+            }
+            // 附魔转移/合并(附魔书或带附魔的同种物品)
+            boolean anyApplied = false;
+            boolean anyConflict = false;
+            for (java.util.Map.Entry<Integer, Integer> e : ad.rightEnchants.entrySet()) {
+                int enchId = e.getKey();
+                int curLvl = outEnch.getOrDefault(enchId, 0);
+                int srcLvl = e.getValue();
+                // 原版: 目标已有同级 -> 提升一级; 否则取高
+                int newLvl = (curLvl == srcLvl) ? srcLvl + 1 : Math.max(srcLvl, curLvl);
+                boolean canApply = true;
+                for (Integer have : outEnch.keySet()) {
+                    if (!have.equals(enchId) && !EnchantSystem.areCompatibleById(have, enchId)) {
+                        canApply = false;
+                        cost++;
+                    }
+                }
+                if (!canApply) { anyConflict = true; continue; }
+                anyApplied = true;
+                int cap = EnchantSystem.maxLevelById(enchId);
+                if (newLvl > cap) newLvl = cap;
+                outEnch.put(enchId, newLvl);
+                int unit = EnchantSystem.anvilCostById(enchId);
+                if (rightIsBook) unit = Math.max(1, unit / 2);
+                cost += unit * newLvl;
+            }
+            if (anyConflict && !anyApplied) {
+                // 全部冲突且无其它变更 -> 无结果(原版 bool3&&!bool2)
+                ad.version++;
+                sendAnvilContent(windowId);
+                return;
+            }
+            changedAny |= anyApplied;
+        }
+
+        // 改名: 输入框为空且物品有自定义名 -> 去名(+1); 非空且与现名不同 -> 改名(+1)
+        String currentName = ad.leftName == null ? "" : ad.leftName;
+        if (ad.rename == null || ad.rename.isBlank()) {
+            if (ad.leftName != null) {
+                ad.outName = null;
+                cost += 1;
+                changedAny = true;
+            } else {
+                ad.outName = null;
+            }
+        } else if (!ad.rename.equals(currentName)) {
             ad.outName = ad.rename;
             cost += 1;
-        } else {
-            ad.outName = null;
+            changedAny = true;
         }
 
-        // 2) 附魔书/附魔物品合并
-        boolean rightIsBook = "enchanted_book".equals(rightName);
-        if (rightId > 0 && (rightIsBook || !ad.rightEnchants.isEmpty())) {
-            for (java.util.Map.Entry<Integer, Integer> e : ad.rightEnchants.entrySet()) {
-                int id = e.getKey(), lvl = e.getValue();
-                int cur = outEnch.getOrDefault(id, 0);
-                if (cur == 0) outEnch.put(id, lvl);          // 新附魔直接并入
-                else outEnch.put(id, Math.max(cur, lvl));     // 已有取高等级
-            }
-            if (rightIsBook) {
-                cost += 1 + outEnch.size();                   // 附魔书合并经验消耗
-            } else {
-                cost += 2;                                    // 物品附魔转移
-            }
-        }
-
-        // 3) 同种可损伤物品(非书)合并/修复: 输出仍是 1 件(不可堆叠), 耐久度相加 + 12% 奖励。
-        //    曾把 outCount 设为 leftCount+rightCount -> 输出两件堆叠(铁砧不可堆叠物品出错)。
-        if (rightId > 0 && rightId == leftId && !rightIsBook) {
-            int maxDmg = getMaxDurability(leftName);
-            if (maxDmg > 0) {
-                // 损伤类工具/装备合并: 修复耐久, 数量始终为 1
-                int leftDmg = ad.leftDamage;
-                int rightDmg = ad.rightDamage;
-                int repaired = maxDmg - leftDmg + (maxDmg - rightDmg) + (int)(maxDmg * 0.12);
-                repaired = Math.min(maxDmg, repaired);
-                ad.outDamage = maxDmg - repaired;
-                outCount = 1;
-                cost += 2;
-            } else {
-                // 可堆叠同物(如盾牌外的普通方块)合并: 数量相加
-                outCount = Math.min(64, leftCount + rightCount);
-                cost += 2;
-            }
-        }
-
-        // 必须有实质改变(改名或附魔或合并或修复)才出结果
-        boolean changed = ad.outName != null
-            || !outEnch.equals(ad.leftEnchants)
-            || (rightId > 0 && rightId == leftId && !rightIsBook)
-            || outDamage != ad.leftDamage;
-        if (changed) {
+        if (changedAny && cost > 0 && cost < 40) {
+            // 原版: 消耗 >= 40 级时生存模式无结果(onlyRenaming 时钳到 39 的分支略去)
             ad.outId = outId;
-            ad.outCount = outCount;
+            ad.outCount = Math.min(outCount, 64);
             ad.outEnchants = outEnch;
             ad.outDamage = outDamage;
             ad.outPotion = outPotion;
-            ad.slots[4] = outId; ad.slots[5] = outCount;
-            ad.cost = Math.max(1, cost);
+            ad.slots[4] = outId; ad.slots[5] = ad.outCount;
+            ad.cost = cost;
         }
         ad.version++;
         sendAnvilContent(windowId);
@@ -7373,7 +8336,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 ContainerStore.peekBrewing(pos);
             if (b == null) continue;
             sendContainerProperty(windowId, 0, b.brewTime);
-            sendContainerProperty(windowId, 1, b.fuelTime > 0 ? 1 : 0);
+            // 原版属性1 = fuel(0-20 刻度), 客户端气泡按它渲染
+            sendContainerProperty(windowId, 1, b.fuelTotal > 0
+                ? (int) Math.min(20, (long) b.fuelTime * 20 / b.fuelTotal) : 0);
             int known = containerSyncVersion.getOrDefault(windowId, -1);
             if (known != b.version) {
                 containerSyncVersion.put(windowId, b.version);
@@ -7397,7 +8362,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     public void sendHealthUpdate() {
-        sendPacket(ctx, 0x66, pb -> {
+        // Bug: 曾用 0x66(set_experience) 发血量/饱食度 -> 客户端按经验格式解析多 3 字节直接断开
+        // (disconnect-*.txt: "set_experience was larger than I expected, found 3 bytes extra")。
+        // 正确包号: update_health = 0x67。
+        sendPacket(ctx, 0x67, pb -> {
             pb.writeFloat(health);
             pb.writeVarInt(data.food);
             pb.writeFloat(data.saturation);
@@ -7411,7 +8379,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (fireTicks > 0) flags |= 0x01;
         byte pose = (byte)(isSneaking ? 5 : 0); // 5=crouching, 0=standing
         final byte fFlags = flags, fPose = pose;
-        this.sendPacket(this.ctx, 0x61, pb -> {
+        this.sendPacket(this.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
             pb.writeVarInt(this.eid);
             pb.writeByte(0); pb.writeVarInt(0); pb.writeByte(fFlags);
             pb.writeByte(6); pb.writeVarInt(20); pb.writeVarInt(fPose);
@@ -7419,7 +8387,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         });
         for (NetworkHandler h : players.values()) {
             if (h == this || h.ctx == null) continue;
-            h.sendPacket(h.ctx, 0x61, pb -> {
+            h.sendPacket(h.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(this.eid);
                 pb.writeByte(0); pb.writeVarInt(0); pb.writeByte(fFlags);
                 pb.writeByte(6); pb.writeVarInt(20); pb.writeVarInt(fPose);
@@ -7432,15 +8400,15 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private static int effectProtocolId(String name) {
         String n = name.startsWith("minecraft:") ? name.substring(10) : name;
         return switch (n) {
-            case "speed" -> 1; case "slowness" -> 2; case "haste" -> 3; case "mining_fatigue" -> 4;
-            case "strength" -> 5; case "instant_health" -> 6; case "instant_damage" -> 7; case "jump_boost" -> 8;
-            case "nausea" -> 9; case "regeneration" -> 10; case "resistance" -> 11; case "fire_resistance" -> 12;
-            case "water_breathing" -> 13; case "invisibility" -> 14; case "blindness" -> 15; case "night_vision" -> 16;
-            case "hunger" -> 17; case "weakness" -> 18; case "poison" -> 19; case "wither" -> 20;
-            case "health_boost" -> 21; case "absorption" -> 22; case "saturation" -> 23; case "glow" -> 24;
-            case "levitation" -> 25; case "luck" -> 26; case "bad_luck" -> 27; case "slow_falling" -> 28;
-            case "conduit_power" -> 29; case "dolphins_grace" -> 30; case "bad_omen" -> 31;
-            case "hero_of_the_village" -> 32; case "darkness" -> 33;
+            case "speed" -> 0; case "slowness" -> 1; case "haste" -> 2; case "mining_fatigue" -> 3;
+            case "strength" -> 4; case "instant_health" -> 5; case "instant_damage" -> 6; case "jump_boost" -> 7;
+            case "nausea" -> 8; case "regeneration" -> 9; case "resistance" -> 10; case "fire_resistance" -> 11;
+            case "water_breathing" -> 12; case "invisibility" -> 13; case "blindness" -> 14; case "night_vision" -> 15;
+            case "hunger" -> 16; case "weakness" -> 17; case "poison" -> 18; case "wither" -> 19;
+            case "health_boost" -> 20; case "absorption" -> 21; case "saturation" -> 22; case "glow" -> 23;
+            case "levitation" -> 24; case "luck" -> 25; case "bad_luck" -> 26; case "slow_falling" -> 27;
+            case "conduit_power" -> 28; case "dolphins_grace" -> 29; case "bad_omen" -> 30;
+            case "hero_of_the_village" -> 31; case "darkness" -> 32;
             default -> -1;
         };
     }
@@ -7603,7 +8571,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private void sendExperienceUpdate() {
-        sendPacket(ctx, 0x65, pb -> {
+        // Bug34 相关: 0x65 是 entity_equipment(给实体穿装备), 经验包是 0x66!
+        // 曾把经验更新发成 0x65 -> 客户端给自己的 LocalPlayer 应用乱码装备数据。
+        sendPacket(ctx, 0x66, pb -> {
             pb.writeFloat(data.xpProgress);
             pb.writeVarInt(data.xpLevel);
             pb.writeVarInt(data.xpTotal);
@@ -7858,27 +8828,46 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     /** 给物品(含附魔/药水/改名/耐久等组件数据, 供铁砧关闭退回等场景保留 NBT)。 */
     private int giveItemWithData(int itemId, int count, java.util.Map<Integer, Integer> enchants,
                                  String potion, String name, int damage) {
+        int max = Math.max(1, BlockManager.getStackSize(itemId));
+        ItemMeta in = ItemMeta.of(enchants, potion, name, damage, -1, -1);
+        int left = count;
+        if (in.isEmpty()) {
+            // Bug47: 无组件物品先并堆, 且目标槽必须同样无组件
+            for (int i : PICKUP_SLOT_ORDER) {
+                if (left <= 0) break;
+                if (data.inventoryIds[i] == itemId && data.inventoryCounts[i] > 0
+                        && data.inventoryCounts[i] < max && playerSlotMeta(i).isEmpty()) {
+                    int add = Math.min(max - data.inventoryCounts[i], left);
+                    data.inventoryCounts[i] += add;
+                    left -= add;
+                    sendSlotUpdate(0, i);
+                }
+            }
+        }
         int slot = -1;
         for (int i : PICKUP_SLOT_ORDER) {
-            if (data.inventoryIds[i] == itemId && data.inventoryCounts[i] > 0
-                    && data.inventoryCounts[i] < BlockManager.getStackSize(itemId)) { slot = i; break; }
-            if (data.inventoryIds[i] == 0) { slot = i; break; }
+            if (left <= 0) break;
+            if (data.inventoryIds[i] == 0 || data.inventoryCounts[i] <= 0) { slot = i; break; }
         }
+        if (left <= 0) return count;
         if (slot < 0) {
             ItemEntity it = new ItemEntity(EntityManager.allocateId(),
-                this.x, this.y + 0.5, this.z, itemId, count);
+                this.x, this.y + 0.5, this.z, itemId, left);
             it.dim = this.currentDim;
             it.vx = 0; it.vy = 0.15; it.vz = 0;
             it.pickupDelay = 20;
+            if (!in.isEmpty()) {
+                it.itemEnchants = in.enchants().isEmpty() ? null : new java.util.HashMap<>(in.enchants());
+                it.itemPotion = in.potion();
+                it.itemCustomName = in.customName();
+                it.itemDamage = in.damage();
+            }
             EntityManager.addEntity(it);
-            return -1;
+            return count - left;
         }
         data.inventoryIds[slot] = itemId;
-        data.inventoryCounts[slot] = Math.min(BlockManager.getStackSize(itemId), count);
-        data.inventoryEnchants[slot] = enchants == null ? new java.util.HashMap<>() : new java.util.HashMap<>(enchants);
-        data.inventoryPotion[slot] = potion;
-        data.inventoryCustomName[slot] = name;
-        data.inventoryDamage[slot] = damage;
+        data.inventoryCounts[slot] = Math.min(max, left);
+        writePlayerSlotMeta(slot, in);
         sendSlotUpdate(0, slot);
         return slot;
     }
@@ -8047,10 +9036,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (targetDim == DimensionType.THE_END) {
             targetX = 100; targetZ = 0;
         } else if (fromDim == DimensionType.THE_END) {
-            // 从末地返回主世界: 原版回到玩家重生点(床/重生锚), 否则世界出生点
+            // Bug58: 从末地返回主世界 —— 原版回到玩家重生点(床/重生锚), 无则回到世界出生点。
+            // 曾硬编码 (0,0) -> 出现在出生点之外的随机位置(那里可能恰好有之前建造的平台)。
             if (data.respawnY != Integer.MIN_VALUE) {
                 targetX = data.respawnX; targetZ = data.respawnZ;
-            } else { targetX = 0; targetZ = 0; }
+            } else {
+                double[] sp = WorldManager.resolveWorldSpawn();
+                targetX = (int) sp[0]; targetZ = (int) sp[2];
+            }
         }
 
         String dimName = targetDim.key;
@@ -8079,6 +9072,23 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         });
 
         this.currentDim = targetDim;
+        // Bug1: 维度切换后客户端重建 LocalPlayer, 权限等级(F3+F4/命令方块编辑)丢失。
+        // 与登录时一样补发 entity_event 24+opLevel, 并在 1 秒后兜底重发一次。
+        final int dimOpLevel = Math.max(0, Math.min(4, opLevel()));
+        sendPacket(ctx, 0x22, pb -> {
+            pb.writeInt(eid);
+            pb.writeByte((byte) (24 + dimOpLevel));
+        });
+        final ChannelHandlerContext dimCtx = ctx;
+        ctx.executor().schedule(() -> {
+            if (dimCtx.channel().isActive() && !isDead && this.currentDim == targetDim) {
+                int lvl = Math.max(0, Math.min(4, opLevel()));
+                sendPacket(dimCtx, 0x22, pb -> {
+                    pb.writeInt(this.eid);
+                    pb.writeByte((byte) (24 + lvl));
+                });
+            }
+        }, 1, java.util.concurrent.TimeUnit.SECONDS);
         // 成就系统：进入维度事件 (P12)
         AdvancementManager.onEnterDimension(this, dimName);
         this.x = targetX + 0.5;
@@ -8133,6 +9143,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         sendPacket(ctx, 0x6F, pb -> { pb.writeLong(age); pb.writeLong(time); pb.writeBoolean(true); });
 
         loadedChunks.clear();
+        resetChunkSendQueue();
         ctx.executor().execute(() -> sendInitialChunks(ctx));
     }
 
@@ -8180,7 +9191,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         });
         sendSoundAt("minecraft:block.end_gateway.spawn", this.x, this.y, this.z, 1.0f, 1.0f);
 
-        loadedChunks.clear();
+        resetChunkSendQueue();
         ctx.executor().execute(() -> sendInitialChunks(ctx));
     }
 
@@ -8341,7 +9352,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private void broadcastMetadata() {
         for (NetworkHandler h : players.values()) {
             if (h == this || h.ctx == null) continue;
-            h.sendPacket(h.ctx, 0x61, pb -> {
+            h.sendPacket(h.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(this.eid);
 
                 // Index 0: Entity Flags (type 0 = byte)
@@ -8430,7 +9441,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         for (NetworkHandler other : players.values()) {
             if (other == this || other.ctx == null) continue;
-            other.sendPacket(other.ctx, 0x61, pb -> {  // ❓ verify 0x57
+            other.sendPacket(other.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)  // ❓ verify 0x57
                 pb.writeVarInt(this.eid);
 
                 // Entry 1: flags byte (index 0, type 0 = byte)
@@ -8466,7 +9477,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         int pose = isSneaking ? 5 : 0;
         for (NetworkHandler other : players.values()) {
             if (other == this || other.ctx == null) continue;
-            other.sendPacket(other.ctx, 0x61, pb -> {
+            other.sendPacket(other.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(this.eid);
                 pb.writeByte(0);      // metadata index 0
                 pb.writeVarInt(0);    // type = byte
@@ -8506,36 +9517,24 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (curX != lastChunkX || curZ != lastChunkZ) {
             // update_view_position: 通知客户端新的区块中心(移动时必须保留)
             sendPacket(ctx, 0x5C, pb -> { pb.writeVarInt(curX); pb.writeVarInt(curZ); });
-            int radius = VIEW_DISTANCE, count = 0;
+            // Bug44: 区块发送改为每 tick 预算泵送(见 tickSurvival 的 pumpChunkSends),
+            // 曾一次性把视距内全部区块丢进 IO 线程 -> 每包同步 zlib 压缩 + 完整光照 BFS
+            // 造成进服/跨区块后客户端帧率 40-200 剧烈波动。
+            int radius = VIEW_DISTANCE;
             java.util.List<long[]> chunkOrder = new java.util.ArrayList<>();
             for (int dx = -radius; dx <= radius; dx++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     int nx = curX + dx, nz = curZ + dz;
                     long key = ((long) nx << 32) | (nz & 0xFFFFFFFFL);
-                    if (!loadedChunks.contains(key)) {
+                    if (!loadedChunks.contains(key) && !queuedChunkKeys.contains(key)) {
                         chunkOrder.add(new long[]{dx * dx + dz * dz, key, nx, nz});
-                        count++;
                     }
                 }
             }
             chunkOrder.sort((a, b) -> Long.compare(a[0], b[0]));
-            // 每个 chunk 独立在 IO 线程生成并以 ctx 线程发送, 单个 chunk 异常不影响其余
             for (long[] entry : chunkOrder) {
-                final int nx = (int) entry[2], nz = (int) entry[3];
-                WorldManager.getIoExecutor().execute(() -> {
-                    try {
-                        Chunk c = WorldManager.getChunk(this.currentDim, nx, nz);
-                        FluidEngine.scheduleChunkFluids(this.currentDim, c);
-                        long key = ((long) nx << 32) | (nz & 0xFFFFFFFFL);
-                        loadedChunks.add(key);
-                        ctx.executor().execute(() -> {
-                            if (ctx.channel().isActive())
-                                sendPacket(ctx, 0x2C, pb -> ChunkEncoder.writeChunkPacket(pb, c));
-                        });
-                    } catch (Exception e) {
-                        System.err.println("[区块] 移动生成异常 (" + nx + "," + nz + "): " + e.getMessage());
-                    }
-                });
+                queuedChunkKeys.add(entry[1]);
+                pendingChunkSends.add(new long[]{entry[1], entry[2], entry[3]});
             }
             // 注意: 移动时不再发送 chunk_batch_start/finished(0x0C/0x0B),
             // 否则客户端会反复进入"加载地形中"界面而无法退出(该配对仅用于登录/重生初始加载)
@@ -8550,6 +9549,54 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             lastChunkX = curX; lastChunkZ = curZ;
         }
         broadcastMove();
+    }
+
+    /** Bug44: 每 tick 最多提交 CHUNK_SEND_BUDGET 个区块任务(生成+光照在 IO 线程逐个做,
+     *  压缩/发送经 event loop), 摊平进服/跨区块的突发负载。
+     *  注意: 生成必须回到 IO 线程 —— getChunk 在世界 tick 线程只读缓存(BUG7 防同步生成),
+     *  未加载的区块直接返回 null, 曾在 tick 线程生成导致整个发送队列全部 NPE 失败。 */
+    private static final int CHUNK_SEND_BUDGET = 6;
+
+    private void pumpChunkSends() {
+        if (pendingChunkSends.isEmpty() || ctx == null || !ctx.channel().isActive()) return;
+        int budget = CHUNK_SEND_BUDGET;
+        long[] entry;
+        while (budget-- > 0 && (entry = pendingChunkSends.poll()) != null) {
+            final long key = entry[0];
+            final int nx = (int) entry[1], nz = (int) entry[2];
+            queuedChunkKeys.remove(key);
+            if (loadedChunks.contains(key)) continue;
+            // 玩家已走远(卸载圈外) -> 丢弃过期排队项
+            if (lastChunkX != Integer.MAX_VALUE
+                    && (Math.abs(nx - lastChunkX) > VIEW_DISTANCE + 2 || Math.abs(nz - lastChunkZ) > VIEW_DISTANCE + 2)) {
+                continue;
+            }
+            final DimensionType dim = this.currentDim;
+            WorldManager.getIoExecutor().execute(() -> {
+                try {
+                    Chunk c = WorldManager.getChunk(dim, nx, nz);
+                    if (c == null) return;
+                    FluidEngine.scheduleChunkFluids(dim, c);
+                    loadedChunks.add(key);
+                    ctx.executor().execute(() -> {
+                        if (ctx.channel().isActive()) {
+                            sendPacket(ctx, 0x2C, pb -> ChunkEncoder.writeChunkPacket(pb, c));
+                        }
+                    });
+                } catch (Exception e) {
+                    System.err.println("[区块] 生成异常 (" + nx + "," + nz + "): " + e.getMessage());
+                }
+            });
+        }
+    }
+
+    /** 维度切换/重生/登录时清空区块发送队列并复位扫描中心,
+     *  防止旧维度的排队条目被当作新维度的坐标生成(浪费)或被距离检查误杀(缺区块)。 */
+    private void resetChunkSendQueue() {
+        pendingChunkSends.clear();
+        queuedChunkKeys.clear();
+        lastChunkX = Integer.MAX_VALUE;
+        lastChunkZ = Integer.MAX_VALUE;
     }
 
     /** Broadcast position + head rotation to all other online players. */
@@ -8603,7 +9650,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         broadcastBlockChange(DimensionType.OVERWORLD, x, y, z, blockStateId);
     }
 
-    /** 维度感知广播：只发给位于同一维度的玩家（防下界/末地变化错发主世界） */
+    /** 维度感知广播：只发给位于同一维度的玩家（防下界/末地变化错发主世界）。
+     *  Bug48: 单块更新统一经玩家 event loop 队列发送, 与 0x2C 区块包严格保序 ——
+     *  曾 0x08 从 tick 线程直写、0x2C 从 IO 线程入队, 乱序时新区块包覆盖客户端已收到的
+     *  方块改动, 表现为大量透明/缺方块区块。 */
     public static void broadcastBlockChange(DimensionType dim, int x, int y, int z, int blockStateId) {
         int chunkX = x >> 4, chunkZ = z >> 4;
         long chunkKey = ((long) chunkX << 32) | (chunkZ & 0xFFFFFFFFL);
@@ -8611,15 +9661,19 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (player.ctx == null || !player.ctx.channel().isActive()) continue;
             if (player.currentDim != dim) continue;
             if (player.loadedChunks.contains(chunkKey)) {
-                player.sendPacket(player.ctx, 0x08, pb -> {
-                    pb.writePosition(x, y, z);
-                    pb.writeVarInt(blockStateId);
+                player.ctx.executor().execute(() -> {
+                    if (player.ctx.channel().isActive()) {
+                        player.sendPacket(player.ctx, 0x08, pb -> {
+                            pb.writePosition(x, y, z);
+                            pb.writeVarInt(blockStateId);
+                        });
+                    }
                 });
             }
         }
     }
 
-    /** 光照更新广播 (0x2F ClientboundLightUpdatePacket): 发给已加载该区块的同维度玩家。 */
+    /** 光照更新广播 (0x2F ClientboundLightUpdatePacket): 发给已加载该区块的同维度玩家(经 event loop 保序)。 */
     public static void broadcastLightUpdate(Chunk chunk) {
         DimensionType dim = chunk.dim;
         long chunkKey = ((long) chunk.getX() << 32) | (chunk.getZ() & 0xFFFFFFFFL);
@@ -8627,7 +9681,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (player.ctx == null || !player.ctx.channel().isActive()) continue;
             if (player.currentDim != dim) continue;
             if (player.loadedChunks.contains(chunkKey)) {
-                player.sendPacket(player.ctx, 0x2F, pb -> ChunkEncoder.writeLightUpdate(pb, chunk));
+                player.ctx.executor().execute(() -> {
+                    if (player.ctx.channel().isActive()) {
+                        player.sendPacket(player.ctx, 0x2F, pb -> ChunkEncoder.writeLightUpdate(pb, chunk));
+                    }
+                });
             }
         }
     }
@@ -8658,6 +9716,18 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             int dx = (int) (player.x - x), dz = (int) (player.z - z);
             if (dx * dx + dz * dz > 16384) continue;
             player.sendSoundAt(soundName, x, y, z, volume, pitch);
+        }
+    }
+
+    /** 维度感知停止声音 (0x75 stop_sound): 发给同维度 128 格内玩家 (Bug22 唱片机停播)。 */
+    public static void broadcastStopSound(DimensionType dim, double x, double y, double z,
+                                          String soundName) {
+        for (NetworkHandler player : players.values()) {
+            if (player.ctx == null || !player.ctx.channel().isActive()) continue;
+            if (player.currentDim != dim) continue;
+            int dx = (int) (player.x - x), dz = (int) (player.z - z);
+            if (dx * dx + dz * dz > 16384) continue;
+            player.sendStopSound(soundName);
         }
     }
 
@@ -8703,6 +9773,22 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     public static void broadcastBlockBreakProgress(int breakerId, int x, int y, int z, int stage) {
         for (NetworkHandler player : players.values()) {
             if (player.ctx == null || !player.ctx.channel().isActive()) continue;
+            int dx = (int) player.x - x;
+            int dz = (int) player.z - z;
+            if (dx * dx + dz * dz > 16384) continue;
+            player.sendPacket(player.ctx, 0x05, pb -> {
+                pb.writeVarInt(breakerId);
+                pb.writePosition(x, y, z);
+                pb.writeByte((byte) stage);
+            });
+        }
+    }
+
+    /** Bug59: crack stages to other players only (own client renders locally), dimension-filtered. */
+    private void broadcastBlockBreakProgressExceptSelf(int breakerId, int x, int y, int z, int stage) {
+        for (NetworkHandler player : players.values()) {
+            if (player == this || player.ctx == null || !player.ctx.channel().isActive()) continue;
+            if (player.currentDim != this.currentDim) continue;
             int dx = (int) player.x - x;
             int dz = (int) player.z - z;
             if (dx * dx + dz * dz > 16384) continue;
@@ -8769,7 +9855,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (target.isSneaking || target.fireTicks > 0) {
             byte tf = (byte) ((target.isSneaking ? 0x02 : 0) | (target.fireTicks > 0 ? 0x01 : 0));
             byte tp = (byte)(target.isSneaking ? 5 : 0);
-            this.sendPacket(this.ctx, 0x61, pb -> {
+            this.sendPacket(this.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(target.eid);
                 pb.writeByte(0); pb.writeVarInt(0); pb.writeByte(tf);
                 pb.writeByte(6); pb.writeVarInt(20); pb.writeVarInt(tp);
@@ -8795,7 +9881,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
      *   slot 高位 1 = 还有后续条目；0 = 最后一条
      *   slot 编号：0=主手, 1=副手, 2=靴, 3=护腿, 4=胸甲, 5=头盔
      *
-     * ❓ 0x64 = set_equipment，通过 wiki/protocol.json 验证
+     * entity_equipment = 0x65 (曾误用 0x64=entity_velocity -> 客户端把装备数据当速度解析)
      */
     private static void sendEquipmentTo(NetworkHandler receiver, NetworkHandler source) {
         if (receiver.ctx == null || source.data == null) return;
@@ -8819,12 +9905,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         };
 
         // 至少主手要发（空也发，让别人看到拿东西）
-        receiver.sendPacket(receiver.ctx, 0x64, pb -> { // ❓verify
+        int[] eqSlots = {mhSlot, 45, 8, 7, 6, 5};
+        receiver.sendPacket(receiver.ctx, 0x65, pb -> {
             pb.writeVarInt(source.eid);
             for (int i = 0; i < 6; i++) {
                 boolean last = (i == 5);
                 pb.writeByte(last ? i : (i | 0x80)); // 高bit=1表示还有后续
-                pb.writeSlot(eqIds[i], eqCnt[i]);
+                // Bug44: 装备按完整组件下发(纹饰/附魔在他人视角与自身身上可见)
+                source.writeStackWithMeta(pb, eqIds[i], eqCnt[i], source.playerSlotMeta(eqSlots[i]));
             }
         });
     }
@@ -9094,7 +10182,6 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private boolean tryIgniteNetherPortal(int fireX, int fireY, int fireZ) {
-        System.out.println("[DBG ignite] fire=" + fireX + "," + fireY + "," + fireZ);
         int obsidian = BlockStateHelper.getDefault("obsidian");
         int portal = BlockStateHelper.getDefault("nether_portal");
 
@@ -9155,7 +10242,6 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             }
             return true;
         }
-        System.out.println("[DBG ignite] -> false (no valid frame)");
         return false;
     }
 
@@ -9199,6 +10285,20 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         int max = getMaxDurability(name);
         if (max <= 0) return;
 
+        // Bug42: 耐久附魔(unbreaking)按原版 1/(等级+1) 概率免耗
+        int unb = data.getSlotEnchant(slot, BlockManager.getEnchantId("unbreaking"));
+        if (unb > 0) {
+            int effective = 0;
+            for (int i = 0; i < amount; i++) {
+                if (java.util.concurrent.ThreadLocalRandom.current().nextInt(unb + 1) == 0) effective++;
+            }
+            if (effective == 0) {
+                sendSlotUpdate(0, slot); // 耐久条保持
+                return;
+            }
+            amount = effective;
+        }
+
         data.inventoryDamage[slot] += amount;
         if (data.inventoryDamage[slot] >= max) {
             data.inventoryDamage[slot] = 0;
@@ -9230,7 +10330,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         final byte flags = (byte) (using ? 0x01 : 0x00);
         for (NetworkHandler p : players.values()) {
             if (p.ctx == null || p.currentDim != this.currentDim) continue;
-            p.sendPacket(p.ctx, 0x61, pb -> {
+            p.sendPacket(p.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
                 pb.writeVarInt(this.eid);
                 pb.writeByte(8);      // index 8 = living entity flags
                 pb.writeVarInt(0);    // type: byte
@@ -9277,6 +10377,13 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         double vy = dy / len * speed + rng.nextGaussian() * inacc;
         double vz = dz / len * speed + rng.nextGaussian() * inacc;
 
+        // Bug42: 弓附魔 —— 力量(power)加伤/冲击(punch)击退/火矢(flame)点燃/无限(infinity)不耗箭
+        int bowSlot = slot;
+        int powerLvl = data.getSlotEnchant(bowSlot, BlockManager.getEnchantId("power"));
+        int punchLvl = data.getSlotEnchant(bowSlot, BlockManager.getEnchantId("punch"));
+        int flameLvl = data.getSlotEnchant(bowSlot, BlockManager.getEnchantId("flame"));
+        int infinityLvl = data.getSlotEnchant(bowSlot, BlockManager.getEnchantId("infinity"));
+
         ArrowEntity arrow =
             new ArrowEntity(
                 EntityManager.allocateId(),
@@ -9284,12 +10391,19 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         arrow.dim = this.currentDim;
         arrow.isCritical = power >= 1.0f;
         arrow.pickupable = gameMode != 1;
+        // 力量: 额外伤害 0.25×(等级+1)×每格速度, 交给箭矢结算时使用
+        arrow.bonusDamage = powerLvl > 0 ? 0.25 * (powerLvl + 1) : 0.0;
+        arrow.knockbackStrength = punchLvl;
+        if (flameLvl > 0) arrow.fireTicks = 20 * 8;
         EntityManager.addEntity(arrow);
 
-        if (gameMode == 0 || gameMode == 2) {
+        boolean infinity = infinityLvl > 0 && gameMode == 0;
+        if (gameMode == 0 && !infinity) {
             data.inventoryCounts[arrowSlot]--;
             if (data.inventoryCounts[arrowSlot] <= 0) data.inventoryIds[arrowSlot] = 0;
             sendSlotUpdate(0, arrowSlot);
+        }
+        if (gameMode == 0 || gameMode == 2) {
             damageHeldItem(slot, 1);
         }
 
@@ -9523,9 +10637,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             int st = WorldManager.getBlockState(this.currentDim, bx, by, bz);
             String ground = BlockStateHelper.getName(st);
             if ("soul_sand".equals(ground) || "soul_soil".equals(ground)) {
-                int bootId = data.inventoryIds[5];
+                // Bug42: 靴子槽位是 8(5=头盔 6=胸甲 7=护腿 8=靴子), 曾读 5(头盔) -> 灵魂疾行无效
+                int bootId = data.inventoryIds[8];
                 if (bootId > 0) {
-                    int ss = data.getSlotEnchant(5, BlockManager.getEnchantId("soul_speed"));
+                    int ss = data.getSlotEnchant(8, BlockManager.getEnchantId("soul_speed"));
                     if (ss > 0) target = 0.1f + 0.06f * ss;
                 }
             }
@@ -9595,6 +10710,13 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         dropContainerContents(x, y, z);
         WorldManager.setBlock(this.currentDim, x, y, z, 0);
         broadcastBlockChange(x, y, z, 0);
+        // Bug51: 破坏大箱子的一半后, 邻箱 type 回退 single
+        if ("chest".equals(preName) || "trapped_chest".equals(preName)) {
+            updateChestType(x + 1, y, z);
+            updateChestType(x - 1, y, z);
+            updateChestType(x, y, z + 1);
+            updateChestType(x, y, z - 1);
+        }
         // 成就系统：破坏方块事件 (P12)
         AdvancementManager.onBlockBreak(this, preName);
         StatisticsManager.add(this, "mined", preName, 1);
@@ -9642,6 +10764,12 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private void dropItemInFront(int itemId, int count) {        if (itemId <= 0 || count <= 0) return;
+        dropItemInFront(itemId, count, ItemMeta.EMPTY);
+    }
+
+    /** Bug4/33: 带组件丢出(附魔/药水/自定义名/耐久随掉落物保留)。 */
+    public void dropItemInFront(int itemId, int count, ItemMeta meta) {
+        if (itemId <= 0 || count <= 0) return;
         var dropEvent = EVENTS.fire(new PlayerDropItemEvent(this, itemId, count));
         if (dropEvent.isCancelled()) return;
         double yawRad = Math.toRadians(this.yaw);
@@ -9655,7 +10783,71 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         drop.vy = -Math.sin(pitchRad) * 0.3 + 0.1;
         drop.vz = Math.cos(yawRad) * Math.cos(pitchRad) * 0.3;
         drop.pickupDelay = 40;
+        if (meta != null && !meta.isEmpty()) {
+            drop.itemDamage = meta.damage();
+            drop.itemEnchants = meta.enchants().isEmpty() ? null : new java.util.HashMap<>(meta.enchants());
+            drop.itemPotion = meta.potion();
+            drop.itemCustomName = meta.customName();
+            drop.trimMaterial = meta.trimMaterial();
+            drop.trimPattern = meta.trimPattern();
+        }
         EntityManager.addEntity(drop);
+    }
+
+    /** Bug4/33: 拾取带组件的掉落物。返回实际拾取数量(0=背包满一个都拿不动)。
+     *  Bug47: 先并入背包中同物品且组件一致的堆(无附魔/药水/改名/耐久/纹饰才可并堆),
+     *  余量再放空槽; 组件不一致的物品永不并堆。 */
+    public int pickupItemCount(int itemId, int count, java.util.Map<Integer, Integer> enchants,
+                               String potion, String customName, int damage,
+                               int trimMaterial, int trimPattern) {
+        ItemMeta m = ItemMeta.of(enchants, potion, customName, damage, trimMaterial, trimPattern);
+        int max = Math.max(1, getMaxStackSize(itemId));
+        int picked = 0;
+        if (m.isEmpty()) {
+            for (int i : PICKUP_SLOT_ORDER) {
+                if (count - picked <= 0) break;
+                if (data.inventoryIds[i] == itemId && data.inventoryCounts[i] > 0
+                        && data.inventoryCounts[i] < max && playerSlotMeta(i).isEmpty()) {
+                    int add = Math.min(max - data.inventoryCounts[i], count - picked);
+                    data.inventoryCounts[i] += add;
+                    picked += add;
+                    sendSlotUpdate(0, i);
+                }
+            }
+        }
+        for (int i : PICKUP_SLOT_ORDER) {
+            if (count - picked <= 0) break;
+            if (data.inventoryIds[i] == 0 || data.inventoryCounts[i] <= 0) {
+                int add = Math.min(max, count - picked);
+                data.inventoryIds[i] = itemId;
+                data.inventoryCounts[i] = add;
+                writePlayerSlotMeta(i, m);
+                picked += add;
+                sendSlotUpdate(0, i);
+            }
+        }
+        if (picked > 0) {
+            String iname = BlockManager.itemIdToName(itemId);
+            if (iname != null) StatisticsManager.add(this, "picked_up", iname, picked);
+            sendSoundAt("minecraft:entity.item.pickup", this.x, this.y + 1.0, this.z, 0.3f, 1.0f);
+        }
+        return picked;
+    }
+
+    /** 拾取带组件的掉落物。背包满返回 false(物品留在地上, 原版行为)。 */
+    public boolean pickupItemWithData(int itemId, int count, java.util.Map<Integer, Integer> enchants,
+                                      String potion, String customName, int damage,
+                                      int trimMaterial, int trimPattern) {
+        return pickupItemCount(itemId, count, enchants, potion, customName, damage,
+                trimMaterial, trimPattern) >= count;
+    }
+
+    /** #50: 关容器退物(原版 clearContainer): 退回背包, 放不下掉在脚前。 */
+    private void returnSlotToPlayer(int itemId, int count, ItemMeta m) {
+        if (itemId <= 0 || count <= 0) return;
+        int got = pickupItemCount(itemId, count, m.enchants(), m.potion(), m.customName(),
+                m.damage(), m.trimMaterial(), m.trimPattern());
+        if (got < count) dropItemInFront(itemId, count - got, m);
     }
 
     private void throwEyeOfEnder() {
@@ -9786,15 +10978,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         // Logger 之类水平朝向方块: 面向玩家视线方向(原版多数方块 FACING = 玩家视线)。
         if (name.endsWith("_log") || name.equals("hay_block") || name.equals("bone_block")
                 || name.equals("pumpkin") || name.equals("carved_pumpkin") || name.equals("melon")
-                || name.equals("jack_o_lantern") || name.equals("end_rod") || name.equals("chain")
+                || name.equals("jack_o_lantern") || name.equals("chain")
                 || name.equals("quartz_pillar") || name.equals("purpur_pillar")) {
             String pf2;
             if (face == 0) pf2 = "y"; else if (face == 1) pf2 = "y";
             else pf2 = facing;
             stateId = BlockStateHelper.withProp(stateId, "axis", pf2.equals("north") || pf2.equals("south") ? "z"
                 : pf2.equals("east") || pf2.equals("west") ? "x" : "y");
-        } else if (name.equals("furnace") || name.equals("blast_furnace") || name.equals("smoker")
-                || name.equals("brewing_stand") || name.equals("barrel")
+        } else if (name.equals("brewing_stand") || name.equals("barrel")
                 || name.equals("crafting_table") || name.equals("fletching_table")
                 || name.equals("cartography_table") || name.equals("smithing_table")
                 || name.equals("loom") || name.equals("grindstone")) {
@@ -9819,28 +11010,104 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             else pf = facing;
             stateId = BlockStateHelper.withProp(stateId, "facing", pf);
         }
+        // Bug32: 墙面挂件(墙牌/墙旗/墙头)朝向 = 被点击面
+        if (name.endsWith("_wall_sign") || name.endsWith("_wall_hanging_sign")
+                || name.endsWith("_wall_banner") || name.endsWith("_wall_head")
+                || name.endsWith("_wall_skull") || name.equals("ladder")) {
+            stateId = BlockStateHelper.withProp(stateId, "facing",
+                face == 2 ? "north" : face == 3 ? "south" : face == 4 ? "west" : face == 5 ? "east" : facing);
+        }
+        // Bug32: 立式告示牌/旗帜/头颅 rotation(0-15) 按玩家视线取 16 分度
+        if (BlockStateHelper.getProp(stateId, "rotation") != null
+                && !name.contains("wall")) {
+            int rot = (int) Math.floor((this.yaw * 16.0 / 360.0) + 0.5) & 15;
+            stateId = BlockStateHelper.withProp(stateId, "rotation", String.valueOf(rot));
+        }
+        // Bug32: 活板门 facing+half(点击底面=贴天花板 top)
+        if (name.endsWith("_trapdoor")) {
+            String tf = face == 2 ? "north" : face == 3 ? "south" : face == 4 ? "west" : face == 5 ? "east" : facing;
+            stateId = BlockStateHelper.withProp(stateId, "facing", tf);
+            String half = face == 0 ? "top" : "bottom";
+            if (BlockStateHelper.getProp(stateId, "half") != null) {
+                stateId = BlockStateHelper.withProp(stateId, "half", half);
+            }
+        }
+        // Bug32: 箱子类/讲台/营火 朝向 = 玩家视线反向(开口朝玩家, 原版 horizontalDirection.getOpposite)
+        if (name.equals("chest") || name.equals("trapped_chest") || name.equals("ender_chest")
+                || name.equals("lectern") || name.equals("campfire") || name.equals("soul_campfire")) {
+            String pOpp = switch (facing) {
+                case "north" -> "south"; case "south" -> "north";
+                case "east" -> "west"; case "west" -> "east";
+                default -> facing;
+            };
+            if (BlockStateHelper.getProp(stateId, "facing") != null) {
+                stateId = BlockStateHelper.withProp(stateId, "facing", pOpp);
+            }
+        }
+        // Bug32: 铁砧朝向 = 玩家水平朝向
+        if (name.endsWith("_anvil") && BlockStateHelper.getProp(stateId, "facing") != null) {
+            stateId = BlockStateHelper.withProp(stateId, "facing", facing);
+        }
+        // Bug32: 末地烛/避雷针 全向 facing(曾错误地归入 axis 组)
+        if (name.equals("end_rod") || name.equals("lightning_rod") || name.equals("rod")) {
+            String rf = face == 1 ? "up" : face == 0 ? "down"
+                : face == 2 ? "north" : face == 3 ? "south" : face == 4 ? "west" : "east";
+            stateId = BlockStateHelper.withProp(stateId, "facing", rf);
+        }
+        // Bug32: 灯笼 hanging 属性(点方块底面=挂式)
+        if (name.equals("lantern") || name.equals("soul_lantern")) {
+            if (BlockStateHelper.getProp(stateId, "hanging") != null) {
+                stateId = BlockStateHelper.withProp(stateId, "hanging", face == 0 ? "true" : "false");
+            }
+        }
         return stateId;
     }
 
     /** #35 铁轨自动连接: 检查目标位置 4 方向相邻铁轨, 返回连接 shape。
      *  原版 RailState.updateDir 自动连线: 直线/弯道。返回 null 表示无相邻铁轨(用玩家朝向)。
      */
-    private String autoRailShape(int x, int y, int z) {
-        boolean north = isRailAt(x, y, z - 1);
-        boolean south = isRailAt(x, y, z + 1);
-        boolean west  = isRailAt(x - 1, y, z);
-        boolean east  = isRailAt(x + 1, y, z);
-        int count = (north ? 1 : 0) + (south ? 1 : 0) + (west ? 1 : 0) + (east ? 1 : 0);
-        if (count == 0) return null;
-        if (north && south && !west && !east) return "north_south";
-        if (west && east && !north && !south) return "east_west";
-        if (north && east) return "north_east";
-        if (north && west) return "north_west";
-        if (south && east) return "south_east";
-        if (south && west) return "south_west";
-        // 3+ 方向或对角: 取两个相对方向优先, 否则取玩家视线
-        if (north || south) return "north_south";
-        return "east_west";
+    /** Bug23: 铁轨放置自适应朝向。检测四方向同层/上一层/下一层的相邻铁轨:
+     *  相邻轨在本侧上一层 -> 该方向爬升(ascending_X); 弯角形状仅普通铁轨(canCurve)允许。 */
+    private String autoRailShape(int x, int y, int z, boolean canCurve) {
+        // 返回值: 0=无, 1=同层, +2=上一层(爬升), -3=下一层(下降)
+        int n = railSideOffset(x, y, z - 1);
+        int s = railSideOffset(x, y, z + 1);
+        int w = railSideOffset(x - 1, y, z);
+        int e = railSideOffset(x + 1, y, z);
+        boolean north = n != 0, south = s != 0, west = w != 0, east = e != 0;
+        if (!north && !south && !west && !east) return null;
+
+        // 爬升: 本侧相邻轨在上一层 -> ascending_该方向; 或本侧在下一层且对侧有轨 -> 对侧爬升
+        if (n == 2) return "ascending_north";
+        if (s == 2) return "ascending_south";
+        if (e == 2) return "ascending_east";
+        if (w == 2) return "ascending_west";
+        if (s == -3 && n != 0) return "ascending_north";
+        if (n == -3 && s != 0) return "ascending_south";
+        if (w == -3 && e != 0) return "ascending_east";
+        if (e == -3 && w != 0) return "ascending_west";
+
+        boolean ns = north || south;
+        boolean ew = east || west;
+        if (ns && ew) {
+            if (canCurve) {
+                String a = n != 0 ? "north" : "south";
+                String b = e != 0 ? "east" : "west";
+                return a + "_" + b;
+            }
+            return "north_south";
+        }
+        if (ns) return "north_south";
+        if (ew) return "east_west";
+        return null;
+    }
+
+    /** 检测 (x,y,z) 一格的相邻铁轨: 0=无 1=同层 2=上一层 -3=下一层 */
+    private int railSideOffset(int x, int y, int z) {
+        if (isRailAt(x, y, z)) return 1;
+        if (isRailAt(x, y + 1, z)) return 2;
+        if (isRailAt(x, y - 1, z)) return -3;
+        return 0;
     }
 
     private boolean isRailAt(int x, int y, int z) {
@@ -9937,6 +11204,72 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             b = org.cloudburstmc.nbt.NbtMap.builder();
             b.putString("id", "minecraft:ender_chest");
             b.putByte("facing", (byte) 2);
+        } else if (blockName.endsWith("_bed")) {
+            // Bug9: 床/旗帜/头颅等 BE 渲染方块必须建壳 BE, 否则客户端 BlockEntityRenderer
+            // 无数据可渲染 -> 整块透明。
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:bed");
+        } else if (blockName.endsWith("_banner") || blockName.endsWith("_wall_banner")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:banner");
+        } else if (blockName.endsWith("_skull") || blockName.endsWith("_head")
+                || blockName.endsWith("_wall_head")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:skull");
+        } else if (blockName.endsWith("_hanging_sign") || blockName.endsWith("_wall_hanging_sign")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:hanging_sign");
+            for (String side : new String[]{"front_text", "back_text"}) {
+                org.cloudburstmc.nbt.NbtMapBuilder tb = org.cloudburstmc.nbt.NbtMap.builder();
+                tb.putList("messages", org.cloudburstmc.nbt.NbtType.STRING,
+                    java.util.List.of("", "", "", ""));
+                tb.putString("color", "black");
+                tb.putBoolean("has_glowing_text", false);
+                b.put(side, tb.build());
+            }
+        } else if (blockName.equals("lectern")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:lectern");
+        } else if (blockName.equals("bell")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:bell");
+        } else if (blockName.equals("comparator")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:comparator");
+        } else if (blockName.equals("daylight_detector")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:daylight_detector");
+        } else if (blockName.equals("conduit")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:conduit");
+        } else if (blockName.equals("decorated_pot")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:decorated_pot");
+        } else if (blockName.equals("chiseled_bookshelf")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:chiseled_bookshelf");
+        } else if (blockName.equals("crafter")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:crafter");
+        } else if (blockName.equals("trial_spawner")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:trial_spawner");
+        } else if (blockName.equals("vault")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:vault");
+        } else if (blockName.equals("beehive") || blockName.equals("bee_nest")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:beehive");
+        } else if (blockName.equals("suspicious_sand") || blockName.equals("suspicious_gravel")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:brushable_block");
+        } else if (blockName.equals("sculk_sensor") || blockName.equals("calibrated_sculk_sensor")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:" + blockName);
+        } else if (blockName.equals("sculk_shrieker") || blockName.equals("sculk_catalyst")
+                || blockName.equals("creaking_heart")) {
+            b = org.cloudburstmc.nbt.NbtMap.builder();
+            b.putString("id", "minecraft:" + blockName);
         }
         if (b == null) return;
         if (!b.containsKey("x")) b.putInt("x", x);
@@ -9976,6 +11309,17 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         tb.putString("color", "black");
         tb.putBoolean("has_glowing_text", false);
         b.put(side, tb.build());
+        // Bug7 修复: 另一侧缺失时补默认空文本。旧存档/旧版本创建的告示牌 BE 只有
+        // 单侧(或 legacy Text1-4 字段), 1.20+ 渲染器只认 front_text/back_text ->
+        // 重进后"只有最后编辑的一面有字"。
+        String otherSide = isFront ? "back_text" : "front_text";
+        if (!b.containsKey(otherSide)) {
+            b.put(otherSide, org.cloudburstmc.nbt.NbtMap.builder()
+                .putList("messages", org.cloudburstmc.nbt.NbtType.STRING, java.util.List.of("", "", "", ""))
+                .putString("color", "black")
+                .putBoolean("has_glowing_text", false)
+                .build());
+        }
         org.cloudburstmc.nbt.NbtMap updated = b.build();
         chunk.setBlockEntity(x & 15, y, z & 15, updated);
         // 广播 block_update(0x09 block_entity_data) 让附近客户端刷新告示牌渲染
@@ -10516,7 +11860,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 pb.writeVarInt(0);
                 pb.writeVarInt(63);
                 for (int i = 0; i < 27; i++) {
-                    pb.writeSlot(fSlotIds[i], fSlotCounts[i]);
+                    writeChestSlot(pb, chestData, i);
                 }
                 for (int s = 27; s <= 62; s++) {
                     int ps = s - 18;
@@ -10700,6 +12044,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 new ContainerStore.Pos(this.currentDim, x, y, z);
             ContainerStore.AnvilData ad =
                 ContainerStore.anvil(ap);
+            ad.rename = ""; // Bug31: 每次打开铁砧清掉上一次会话残留的改名文本(原版菜单为一次性实例)
             openAnvil.put(windowId, ap);
             containerSyncVersion.put(windowId, ad.version);
             org.cloudburstmc.nbt.NbtMap atitle = org.cloudburstmc.nbt.NbtMap.builder()
@@ -10760,6 +12105,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 for (int ps = 9; ps <= 44; ps++) writePlayerSlot(pb, ps);
                 writeCarriedSlot(pb);
             });
+            // Bug11: 从区块 BE 回读已保存的效果(曾只在选择时写 BE, 打开时不读 -> 重启后效果丢失)
+            Chunk bch = WorldManager.getChunk(this.currentDim, x >> 4, z >> 4);
+            org.cloudburstmc.nbt.NbtMap bbe = bch != null
+                ? bch.getBlockEntity(x & 15, y, z & 15) : null;
+            if (bbe != null) {
+                if (bbe.containsKey("Primary")) bd.primary = bbe.getInt("Primary", 0);
+                if (bbe.containsKey("Secondary")) bd.secondary = bbe.getInt("Secondary", 0);
+            }
             // 发送信标数据: 0=levels(金字塔层) 1=primary 2=secondary (原版 BeaconMenu DATA_COUNT=3)。
             // 层级需实时计算: 原版按下方基岩/铁块/金块/绿宝石块/钻石块金字塔判定 1-4 层。
             int levels = computeBeaconLevels(this.currentDim, x, y, z);
@@ -10833,6 +12186,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         org.cloudburstmc.nbt.NbtMap rec = jbe.getCompound("RecordItem");
                         String recId = rec.getString("id", "");
                         if (recId.startsWith("minecraft:")) recId = recId.substring(10);
+                        String songEvent = recId.startsWith("music_disc_")
+                            ? "minecraft:music_disc." + recId.substring("music_disc_".length()) : null;
                         int recItemId = BlockManager.getItemIdByName(recId);
                         if (recItemId > 0) dropItemInFront(recItemId, 1);
                         org.cloudburstmc.nbt.NbtMapBuilder jb = org.cloudburstmc.nbt.NbtMap.builder();
@@ -10844,6 +12199,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                             int ns2 = BlockStateHelper.withProp(jState2, "has_record", "false");
                             WorldManager.setBlock(this.currentDim, x, y, z, ns2);
                             broadcastBlockChange(x, y, z, ns2);
+                        }
+                        // Bug22 修复: 取出唱片时停掉正在播放的曲目 (原只复位 has_record 不发送 stop_sound
+                        // -> 客户端唱片机循环音效持续播放不停止)。
+                        if (songEvent != null) {
+                            NetworkHandler.broadcastStopSound(this.currentDim, x + 0.5, y + 0.5, z + 0.5, songEvent);
                         }
                         NetworkHandler.broadcastSoundAt(this.currentDim, x + 0.5, y + 0.5, z + 0.5,
                             "minecraft:block.note_block.hat", 1.0f, 1.0f);
@@ -10915,21 +12275,42 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         sendPacket(ctx, 0x18, pb -> { pb.writeString("minecraft:brand"); pb.writeString("CharunCore"); });
 
-        // Recipe book: BUG2 改为渐进解锁 — 仅开启配方书面板, 解锁在背包同步后由
-        // checkRecipeUnlocks() 按已持有物品增量推送(拿到对应物品才出现)。
-        sendRecipeBookSettings(ctx);
+        // Recipe book: #13/#35 — 登录时全量推送配方显示(0x48, 含切石机/熔炉显示条目) +
+        // declare_recipes(0x83, 槽位过滤集 + 切石机界面样式列表数据源), 之后再开启配方书面板。
+        sendRecipeBook(ctx);
+        sendDeclareRecipes(ctx);
 
         // Time, abilities, center chunk
         // 用真实 dayTime(非固定 6000), 否则进服先收到正午再被 tick 广播真实时间 -> 天空闪一下。
         sendPacket(ctx, 0x6F, pb -> { pb.writeLong(Main.worldAge); pb.writeLong(Main.dayTime); pb.writeBoolean(true); });
-        sendPacket(ctx, 0x22, pb -> { pb.writeInt(eid); pb.writeByte(28); });
+        // entity_event 24+等级 = 客户端权限等级(F3+F4/命令方块编辑等以此判定)。
+        // 注意: ops.json 非空时按名单严格匹配(名字或UUID); 名单里没有的玩家=0 权限,
+        // 不再像旧硬编码 28 一样人人 Lv4。控制台打印便于排查"F3+F4 无权限"。
+        int loginOpLevel = Math.max(0, Math.min(4, opLevel()));
+        System.out.println("[权限] " + username + " opLevel=" + loginOpLevel
+            + " (uuid=" + this.uuid + ")");
+        sendPacket(ctx, 0x22, pb -> {
+            pb.writeInt(eid);
+            pb.writeByte((byte) (24 + loginOpLevel));
+        });
+        // 兜底: 进服后 1 秒重发一次, 覆盖客户端 LocalPlayer 重建导致的权限态丢失
+        final ChannelHandlerContext loginCtx = ctx;
+        ctx.executor().schedule(() -> {
+            if (loginCtx.channel().isActive() && !isDead) {
+                int lvl = Math.max(0, Math.min(4, opLevel()));
+                sendPacket(loginCtx, 0x22, pb -> {
+                    pb.writeInt(this.eid);
+                    pb.writeByte((byte) (24 + lvl));
+                });
+            }
+        }, 1, java.util.concurrent.TimeUnit.SECONDS);
         sendPacket(ctx, 0x26, pb -> { pb.writeByte(13); pb.writeFloat(0.0f); });
         sendPacket(ctx, 0x5C, pb -> { pb.writeVarInt((int) this.x >> 4); pb.writeVarInt((int) this.z >> 4); });
 
         // Inventory
         sendPacket(ctx, 0x12, pb -> {
             pb.writeVarInt(0); pb.writeVarInt(1); pb.writeVarInt(46);
-            for (int i = 0; i < 46; i++) pb.writeSlot(data.inventoryIds[i], data.inventoryCounts[i]);
+            for (int i = 0; i < 46; i++) writePlayerSlot(pb, i);
             writeCarriedSlot(pb);
         });
 
@@ -11022,39 +12403,37 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             e.printStackTrace();
         }
 
-        // ---- 异步发送其余区块 ----
+        // ---- 其余区块入队, 由 tickSurvival 的 pumpChunkSends 每 tick 限量发送 ----
+        // Bug44: 曾一次性把全部视距区块丢进 IO 线程同步生成+压缩 -> 进服初期帧率剧烈波动。
         int radius = VIEW_DISTANCE;
-        java.util.concurrent.CompletableFuture.runAsync(() -> {
-            int sent = 0;
-            for (int d = 0; d <= radius * 2; d++) {
-                int dx = (d <= radius) ? -d : d - radius - 1;
-                for (int dz = -radius; dz <= radius; dz++) {
-                    if (Math.abs(dx) > radius) continue;
-                    if (dx == 0 && dz == 0) continue; // 中心块已发
-                    if (this.currentDim != sendDim || !ctx.channel().isActive()) return;
-                    try {
-                        Chunk c = WorldManager.getChunk(sendDim, centerX + dx, centerZ + dz);
-                        FluidEngine.scheduleChunkFluids(sendDim, c);
-                        long key = ((long)(centerX + dx) << 32) | ((centerZ + dz) & 0xFFFFFFFFL);
-                        loadedChunks.add(key);
-                        ctx.executor().execute(() -> {
-                            if (this.currentDim == sendDim && ctx.channel().isActive())
-                                sendPacket(ctx, 0x2C, pb -> ChunkEncoder.writeChunkPacket(pb, c));
-                        });
-                        sent++;
-                    } catch (Exception e) {
-                        System.err.println("[区块] 异步生成异常 (" + (centerX+dx) + "," + (centerZ+dz) + "): " + e.getMessage());
-                    }
+        java.util.List<long[]> order = new java.util.ArrayList<>();
+        for (int d = 0; d <= radius * 2; d++) {
+            int dx = (d <= radius) ? -d : d - radius - 1;
+            for (int dz = -radius; dz <= radius; dz++) {
+                if (Math.abs(dx) > radius) continue;
+                if (dx == 0 && dz == 0) continue; // 中心块已发
+                int nx = centerX + dx, nz = centerZ + dz;
+                long key = ((long) nx << 32) | (nz & 0xFFFFFFFFL);
+                if (!loadedChunks.contains(key) && !queuedChunkKeys.contains(key)) {
+                    order.add(new long[]{(long) dx * dx + dz * dz, key, nx, nz});
                 }
             }
-            final int fc = sent;
-            ctx.executor().execute(() -> {
-                if (this.currentDim == sendDim && ctx.channel().isActive()) {
-                    sendPacket(ctx, 0x0B, pb -> pb.writeVarInt(fc + 1));
-                    System.out.println("[区块] 初始加载完成, 共发送 " + (fc + 1) + " 个区块(含中心块), 维度=" + sendDim);
-                }
-            });
-        }, WorldManager.getIoExecutor());
+        }
+        order.sort((a, b) -> Long.compare(a[0], b[0]));
+        for (long[] e : order) {
+            queuedChunkKeys.add(e[1]);
+            pendingChunkSends.add(new long[]{e[1], e[2], e[3]});
+        }
+        // ChunkBatchFinished: 中心块已同步发出, 客户端可立即退出"加载地形中"界面,
+        // 其余区块随后每 tick 流式补发(与原版渐进加载一致)。
+        final int fc = order.size();
+        final DimensionType batchDim = sendDim;
+        ctx.executor().execute(() -> {
+            if (this.currentDim == batchDim && ctx.channel().isActive()) {
+                sendPacket(ctx, 0x0B, pb -> pb.writeVarInt(fc + 1));
+                System.out.println("[区块] 初始加载排队完成, 共 " + (fc + 1) + " 个区块(含中心块), 维度=" + batchDim);
+            }
+        });
     }
 
     // =========================================================================
@@ -11149,9 +12528,192 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return BlockStateHelper.isReplaceable(n);
     }
 
+    /** Bug51: 箱子/陷阱箱相邻合并时同步原版 type 属性(single/left/right)。
+     *  客户端靠该属性渲染大箱子模型, 曾不设置 → 两个箱子永远各自独立, 无法成大箱子。
+     *  规则(原版 ChestBlock): 邻箱在 facing 顺时针侧 → 本箱 left/邻箱 right; 逆时针侧反之。
+     *  任一箱上方有实体方块则不合并。 */
+    private void updateChestType(int x, int y, int z) {
+        int st = WorldManager.getBlockState(this.currentDim, x, y, z);
+        String name = BlockStateHelper.getName(st);
+        if (!"chest".equals(name) && !"trapped_chest".equals(name)) return;
+        String facing = BlockStateHelper.getProp(st, "facing");
+        if (facing == null || BlockStateHelper.getProp(st, "type") == null) return;
+        String cw = switch (facing) {
+            case "north" -> "east"; case "east" -> "south";
+            case "south" -> "west"; default -> "north";
+        };
+        int cwX = x + ("east".equals(cw) ? 1 : "west".equals(cw) ? -1 : 0);
+        int cwZ = z + ("south".equals(cw) ? 1 : "north".equals(cw) ? -1 : 0);
+        int ccwX = x - ("east".equals(cw) ? 1 : "west".equals(cw) ? -1 : 0);
+        int ccwZ = z - ("south".equals(cw) ? 1 : "north".equals(cw) ? -1 : 0);
+        String nbCw = BlockStateHelper.getName(WorldManager.getBlockState(this.currentDim, cwX, y, cwZ));
+        String nbCcw = BlockStateHelper.getName(WorldManager.getBlockState(this.currentDim, ccwX, y, ccwZ));
+        int aboveState = WorldManager.getBlockState(this.currentDim, x, y + 1, z);
+        boolean blocked = BlockStateHelper.isSolidOpaque(aboveState);
+        String myType = "single";
+        String otherType = "single";
+        int[] otherPos = null;
+        if (!blocked && name.equals(nbCw)) {
+            myType = "left"; otherType = "right"; otherPos = new int[]{cwX, y, cwZ};
+        } else if (!blocked && name.equals(nbCcw)) {
+            myType = "right"; otherType = "left"; otherPos = new int[]{ccwX, y, ccwZ};
+        }
+        String curType = BlockStateHelper.getProp(st, "type");
+        if (!myType.equals(curType)) {
+            int ns = BlockStateHelper.withProp(st, "type", myType);
+            WorldManager.setBlock(this.currentDim, x, y, z, ns);
+            broadcastBlockChange(x, y, z, ns);
+        }
+        if (otherPos != null) {
+            int os = WorldManager.getBlockState(this.currentDim, otherPos[0], otherPos[1], otherPos[2]);
+            if (!otherType.equals(BlockStateHelper.getProp(os, "type"))) {
+                int ns = BlockStateHelper.withProp(os, "type", otherType);
+                WorldManager.setBlock(this.currentDim, otherPos[0], otherPos[1], otherPos[2], ns);
+                broadcastBlockChange(otherPos[0], otherPos[1], otherPos[2], ns);
+            }
+        }
+    }
+
+    /** Bug60: 玩家死亡时向所有追踪者移除玩家实体模型(原版死亡动画后实体消失)。 */
+    // Bug52: delayed eating/drinking state
+    private long eatingFinishAt = 0L;
+    private int eatingSlot = -1;
+    private int eatingMode = 0; // 1=drink 2=eat
+
+    private void tickEating() {
+        if (eatingFinishAt == 0L) return;
+        if (System.currentTimeMillis() < eatingFinishAt) return;
+        int slot = eatingSlot;
+        eatingFinishAt = 0L;
+        eatingSlot = -1;
+        int mode = eatingMode;
+        eatingMode = 0;
+        setUsingItem(false);
+        if (slot < 0 || slot >= 46 || data.inventoryCounts[slot] <= 0) return;
+        int itemId = data.inventoryIds[slot];
+        String itemName = BlockManager.itemIdToName(itemId);
+        sendSoundAt("minecraft:entity.player.burp", x, y, z, 0.5f, 1.0f);
+        if (mode == 1) {
+            String pt = data.inventoryPotion[slot];
+            if (pt != null) {
+                for (String e : pt.split(",")) {
+                    String[] kv = e.split("\\|");
+                    if (kv.length >= 3) {
+                        try { addEffect(kv[0], Integer.parseInt(kv[1]), Integer.parseInt(kv[2])); }
+                        catch (NumberFormatException ignored) {}
+                    }
+                }
+            }
+            data.inventoryCounts[slot]--;
+            if (data.inventoryCounts[slot] <= 0) {
+                data.inventoryIds[slot] = 0;
+                data.inventoryEnchants[slot] = new java.util.HashMap<>();
+                data.inventoryPotion[slot] = null;
+            }
+            giveItem(BlockManager.getItemIdByName("glass_bottle"), 1);
+            sendInventoryUpdate();
+            return;
+        }
+        int foodValue = getFoodValue(itemName);
+        if (foodValue <= 0) return;
+        data.food = Math.min(20, data.food + foodValue);
+        data.saturation = Math.min(data.food,
+            data.saturation + foodValue * getSaturationModifier(itemName));
+        if (itemName.equals("golden_apple") || itemName.equals("enchanted_golden_apple")) {
+            health = Math.min(20.0f, health + 4.0f);
+            if (itemName.equals("enchanted_golden_apple")) {
+                addEffect("regeneration", 1, 600);
+                addEffect("absorption", 3, 4800);
+                addEffect("resistance", 0, 6000);
+                addEffect("fire_resistance", 0, 6000);
+            } else {
+                addEffect("regeneration", 1, 100);
+                addEffect("absorption", 0, 2400);
+            }
+        }
+        if (itemName.equals("rotten_flesh") || itemName.equals("spider_eye")
+            || itemName.equals("poisonous_potato")) {
+            addExhaustion(2.0f);
+        }
+        if (itemName.equals("chorus_fruit")) {
+            chorusFruitTeleport();
+        }
+        sendHealthUpdate();
+        data.inventoryCounts[slot]--;
+        if (data.inventoryCounts[slot] <= 0) {
+            data.inventoryIds[slot] = 0;
+        }
+        if (itemName.endsWith("_bucket") && !itemName.equals("milk_bucket")) {
+            giveItem(BlockManager.getItemIdByName("bucket"), 1);
+        }
+        AdvancementManager.onConsumeItem(this, itemName);
+        sendInventoryUpdate();
+    }
+
+    /** Bug52: throw splash/lingering potion. */
+    private void throwPotion(boolean lingering) {
+        double yawRad = Math.toRadians(this.yaw);
+        double pitchRad = Math.toRadians(this.pitch);
+        double dx = -Math.sin(yawRad) * Math.cos(pitchRad);
+        double dy = -Math.sin(pitchRad);
+        double dz = Math.cos(yawRad) * Math.cos(pitchRad);
+        double len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (len < 1.0E-6) return;
+        double speed = 0.5;
+        int slot = 36 + heldItemSlot;
+        PotionEntity pot = new PotionEntity(EntityManager.allocateId(),
+            lingering ? "lingering_potion" : "splash_potion",
+            this.x, this.y + 1.5, this.z,
+            dx / len * speed, dy / len * speed + 0.1, dz / len * speed,
+            this, lingering, data.inventoryPotion[slot]);
+        EntityManager.addEntity(pot);
+        sendSoundAt("minecraft:entity.potion.throw", this.x, this.y + 1.5, this.z, 0.5f, 0.5f);
+    }
+
+    // Bug59: ongoing survival dig crack sync
+    private int digProgressX, digProgressY, digProgressZ;
+    private long digProgressStart;
+    private float digProgressDurMs;
+    private int digProgressStage = -1;
+
+    private void clearDigProgress() {
+        if (digProgressDurMs > 0.0f) {
+            broadcastBlockBreakProgressExceptSelf(this.eid,
+                digProgressX, digProgressY, digProgressZ, (byte) -1);
+        }
+        digProgressDurMs = 0.0f;
+        digProgressStage = -1;
+    }
+
+    private void tickDigProgress() {
+        if (digProgressDurMs <= 0.0f) return;
+        long elapsed = System.currentTimeMillis() - digProgressStart;
+        if (elapsed > digProgressDurMs + 500) {
+            clearDigProgress();
+            return;
+        }
+        int stage = (int) (elapsed / digProgressDurMs * 10.0f);
+        if (stage < 0) stage = 0;
+        if (stage > 9) stage = 9;
+        if (stage != digProgressStage) {
+            digProgressStage = stage;
+            broadcastBlockBreakProgressExceptSelf(this.eid,
+                digProgressX, digProgressY, digProgressZ, (byte) stage);
+        }
+    }
+
+    private void despawnPlayerEntityForTrackers() {
+        for (NetworkHandler p : players.values()) {
+            if (p == this || p.ctx == null || p.currentDim != this.currentDim) continue;
+            p.sendPacket(p.ctx, 0x4B, pb -> {
+                pb.writeVarInt(1);
+                pb.writeVarInt(this.eid);
+            });
+        }
+    }
+
     /** 目标格是否落在玩家碰撞箱(AABB)内, 防止把方块放进自己身体。 */
-    private boolean intersectsPlayer(int bx, int by, int bz) {
-        double pminX = x - 0.3, pmaxX = x + 0.3;
+    private boolean intersectsPlayer(int bx, int by, int bz) {        double pminX = x - 0.3, pmaxX = x + 0.3;
         double pminZ = z - 0.3, pmaxZ = z + 0.3;
         double pminY = y, pmaxY = y + 1.8;
         return (bx + 1 > pminX && bx < pmaxX)
@@ -11159,64 +12721,35 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             && (by + 1 > pminY && by < pmaxY);
     }
 
-    /** 该非完整方块是否需要实心支撑才能放置(原版 canSurvive)。
-     *  火把/红石粉/压力板/铁轨/植物等悬空放置会立刻破碎掉成掉落物, 原版直接拒绝放置。 */
+    /** 该非完整方块是否需要实心支撑才能放置(原版 canSurvive)。统一走 SupportEngine。 */
     private static boolean blockNeedsSupport(String name) {
-        if (name == null) return false;
-        if (name.endsWith("_torch") || name.equals("redstone_wire")
-                || name.endsWith("_pressure_plate") || name.equals("pressure_plate")
-                || name.equals("rail") || name.equals("powered_rail")
-                || name.equals("activator_rail") || name.equals("detector_rail")
-                || name.endsWith("_button") || name.equals("lever")
-                || name.endsWith("_sapling") || name.endsWith("_flower")
-                || name.equals("short_grass") || name.equals("tall_grass")
-                || name.equals("fern") || name.equals("large_fern")
-                || name.equals("dead_bush") || name.equals("vine")
-                || name.equals("fire") || name.equals("soul_fire")
-                || name.endsWith("_carpet") || name.equals("moss_carpet")) {
-            return true;
-        }
-        return false;
+        return com.CharunCore.server.world.SupportEngine.needsSupport(name);
     }
 
-    /** 某方块是否可为非完整方块提供支撑(原版 canSurvive 的近似)。
-     *  允许完整方块/台阶/楼梯/玻璃/树叶等(可站立的顶面); 拒绝空气/液体/植物/可替换/小件
-     *  (火把/红石粉/压力板/铁轨/按钮/告示牌/旗帜/地毯/火焰等)。 */
+    /** 某方块是否可为非完整方块提供支撑(原版 canSurvive 的近似)。统一走 SupportEngine。 */
     private static boolean isSupportBlock(int state) {
-        if (state == 0) return false;
-        String n = BlockStateHelper.getName(state);
-        if (n == null) return false;
-        if (n.startsWith("minecraft:")) n = n.substring(10);
-        if (BlockStateHelper.isReplaceable(n)) return false;
-        if (n.equals("water") || n.equals("lava") || n.equals("air")
-                || n.equals("cave_air") || n.equals("void_air")) return false;
-        if (n.contains("torch") || n.contains("rail") || n.endsWith("_button")
-                || n.endsWith("_pressure_plate") || n.equals("pressure_plate")
-                || n.contains("sign") || n.contains("banner") || n.contains("flower")
-                || n.contains("sapling") || n.contains("fern") || n.contains("mushroom")
-                || n.contains("vine") || n.contains("carpet") || n.contains("ladder")
-                || n.contains("fire") || n.contains("_sprout") || n.contains("seagrass")
-                || n.contains("kelp") || n.endsWith("_spawn_egg")) return false;
-        return true;
+        return com.CharunCore.server.world.SupportEngine.isSupportBlock(state);
     }
 
-    /** 校验非完整方块的支撑面。clicks = 被点击的方块(state), 用于墙面支撑。 */
+    /** 校验非完整方块的支撑面。clicks = 被点击的方块(state), 用于墙面支撑。统一走 SupportEngine。 */
     private boolean hasPlacementSupport(int ppX, int ppY, int ppZ, String blockName, int clickedState) {
         if (!blockNeedsSupport(blockName)) return true;
-        // 墙面支撑: 放置面紧贴被点击的方块(墙火把/红石火把/按钮/拉杆)
-        boolean wallMounted = blockName.endsWith("_torch")
-            || blockName.endsWith("_button") || blockName.equals("lever");
-        if (wallMounted) {
-            return isSupportBlock(clickedState);
-        }
-        // 下方支撑: 正下方必须是可支撑方块(火把/红石粉/压力板/铁轨/植物/火)
-        int below = WorldManager.getBlockState(this.currentDim, ppX, ppY - 1, ppZ);
-        return isSupportBlock(below);
+        return com.CharunCore.server.world.SupportEngine.hasSupport(this.currentDim, ppX, ppY, ppZ, blockName);
+    }
+
+    /** Bug34: 移动包坐标合法性 —— 非有限值/越界/单包瞬移>512 格一律拒收。 */
+    private static boolean validPlayerPos(double rx, double ry, double rz) {
+        return Double.isFinite(rx) && Double.isFinite(ry) && Double.isFinite(rz)
+            && Math.abs(rx) <= 3.2e7 && Math.abs(rz) <= 3.2e7
+            && ry > -2048.0 && ry < 2048.0;
     }
 
     private void savePlayerData() {
         if (this.data == null || this.uuid == null) return;
-        data.x = x; data.y = y; data.z = z;
+        // Bug34: 绝不把非有限坐标写进 playerdata(否则重启后玩家出生在 NaN, 物理坏死)。
+        if (Double.isFinite(x) && Double.isFinite(y) && Double.isFinite(z)) {
+            data.x = x; data.y = y; data.z = z;
+        }
         data.gameMode = this.gameMode;
         data.dimension = this.currentDim.key;
         data.username = this.username;
@@ -11236,6 +12769,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
      * Uses a single contiguous ByteBuf to avoid the wrappedBuffer refCount bug
      * that caused IllegalReferenceCountException: refCnt: 0.
      */
+    private static final boolean PACKET_LOG = Boolean.parseBoolean(System.getProperty("charun.debugPkt", "0"));
+    private int pktSeq = 0;
+
     public void sendPacket(ChannelHandlerContext ctx, int id, java.util.function.Consumer<PacketBuffer> action) {
         // 1. Write body (packetId + payload) into a temporary buffer
         ByteBuf bodyBuf = Unpooled.buffer();
@@ -11243,6 +12779,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         bodyPb.writeVarInt(id);
         action.accept(bodyPb);
         int bodyLen = bodyBuf.readableBytes();
+
+        if (PACKET_LOG && ctx != null) {
+            System.out.println("[pkt] seq=" + (pktSeq++) + " id=0x" + Integer.toHexString(id)
+                + " bodyLen=" + bodyLen + " player=" + username);
+        }
 
         // 2. Write header (length VarInt) + body into the final buffer,
         //    applying zlib framing when compression has been negotiated.

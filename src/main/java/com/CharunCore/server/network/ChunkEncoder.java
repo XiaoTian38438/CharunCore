@@ -29,18 +29,38 @@ public class ChunkEncoder {
         // 原版 ClientboundLevelChunkPacketData.BlockEntityInfo 线序 (1.21.11):
         //   packedXZ = (x & 15) | ((z & 15) << 4);  y 为 short;  typeId 为
         //   block_entity_type 注册表 id;  tag 为不含 id/x/y/z 的更新数据。
-        java.util.Collection<org.cloudburstmc.nbt.NbtMap> bes = chunk.getBlockEntities();
-        pb.writeVarInt(bes.size());
-        for (org.cloudburstmc.nbt.NbtMap be : bes) {
-            int x = be.getInt("x", 0);
-            int y = be.getInt("y", 0);
-            int z = be.getInt("z", 0);
+        // Bug9: 位置一律取自 blockEntityMap 的 key —— 曾从 BE NBT 的 x/y/z 读取,
+        // 而 createInitialBlockEntity 多数分支不写坐标 -> 全部发到 (0,0,0),
+        // 客户端把 BE 实例化在错误位置, 原位置的告示牌/床等 BE 方块重进后透明。
+        java.util.Map<Long, org.cloudburstmc.nbt.NbtMap> beMap = chunk.getBlockEntityMap();
+        // Bug9 诊断开关: -Dcharun.debugBe=1 时打印区块包携带的 BE(名称/坐标/typeId)
+        if (BE_DEBUG && !beMap.isEmpty()) {
+            StringBuilder sb = new StringBuilder("[BE诊断] chunk(" + chunk.getX() + "," + chunk.getZ()
+                + ") be=" + beMap.size() + ":");
+            int n = 0;
+            for (var entry : beMap.entrySet()) {
+                if (n++ >= 4) { sb.append(" ..."); break; }
+                long k = entry.getKey();
+                int rx = (int)(k & 15), rz = (int)((k >> 4) & 15), yy = (int)((k >> 16) & 0xFFFF) - 64;
+                String id = entry.getValue().getString("id", "?");
+                sb.append(" ").append(id.replace("minecraft:", "")).append("@")
+                  .append(rx).append(",").append(yy).append(",").append(rz);
+            }
+            System.out.println(sb);
+        }
+        pb.writeVarInt(beMap.size());
+        for (java.util.Map.Entry<Long, org.cloudburstmc.nbt.NbtMap> beEntry : beMap.entrySet()) {
+            long beKey = beEntry.getKey();
+            int rx = (int) (beKey & 15);
+            int rz = (int) ((beKey >> 4) & 15);
+            int y = (int) ((beKey >> 16) & 0xFFFF) - 64;
+            org.cloudburstmc.nbt.NbtMap be = beEntry.getValue();
             String id = be.getString("id", "minecraft:chest");
             if (id.startsWith("minecraft:")) id = id.substring(10);
             // 用 RegistryHelper.blockEntityTypeId 统一规范化(oak_sign->sign, *_bed->bed 等),
             // 旧私有 blockEntityTypeId 不规范化材质前缀 -> 告示牌/床等返回 chest -> 客户端渲染错误/透明。
             int typeId = com.CharunCore.server.utils.RegistryHelper.blockEntityTypeId(id);
-            pb.writeByte((byte) ((x & 15) | ((z & 15) << 4)));
+            pb.writeByte((byte) (rx | (rz << 4)));
             pb.writeShort(y);
             pb.writeVarInt(typeId);
             // tag: 去掉 id/x/y/z, 保留数据 (Items/CustomName/LootTable 等)。
@@ -63,6 +83,8 @@ public class ChunkEncoder {
 
         writeLightData(pb, chunk);
     }
+
+        private static final boolean BE_DEBUG = Boolean.parseBoolean(System.getProperty("charun.debugBe", "0"));
 
     static void writeLightData(PacketBuffer pb, Chunk chunk) {
         chunk.ensureLight();

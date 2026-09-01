@@ -25,11 +25,25 @@ public class StructureRegistry {
         public final int startHeightMin;
         public final int startHeightMax;
         public final boolean projectStartToHeightmap;
+        /** 拼图结构最大展开半径(原版 max_distance_from_center); 默认 80, 试炼密室需 116。 */
+        public final int maxDistance;
+        /** Bug15: pool_aliases(每个 start 决议一次), 试炼密室刷怪内容池等依赖。 */
+        public final java.util.List<PoolAliases.Alias> poolAliases;
 
         public ConfiguredStructure(String id, String type, String startPool, int size,
                                     String step, String biomesTag, String terrainAdaptation,
                                     String startHeightType, int startHeightMin, int startHeightMax,
-                                    boolean projectStartToHeightmap) {
+                                    boolean projectStartToHeightmap, int maxDistance) {
+            this(id, type, startPool, size, step, biomesTag, terrainAdaptation,
+                    startHeightType, startHeightMin, startHeightMax,
+                    projectStartToHeightmap, maxDistance, java.util.List.of());
+        }
+
+        public ConfiguredStructure(String id, String type, String startPool, int size,
+                                    String step, String biomesTag, String terrainAdaptation,
+                                    String startHeightType, int startHeightMin, int startHeightMax,
+                                    boolean projectStartToHeightmap, int maxDistance,
+                                    java.util.List<PoolAliases.Alias> poolAliases) {
             this.id = id;
             this.type = type;
             this.startPool = startPool;
@@ -41,6 +55,8 @@ public class StructureRegistry {
             this.startHeightMin = startHeightMin;
             this.startHeightMax = startHeightMax;
             this.projectStartToHeightmap = projectStartToHeightmap;
+            this.maxDistance = maxDistance;
+            this.poolAliases = poolAliases;
         }
 
         public boolean isJigsaw() {
@@ -122,9 +138,16 @@ public class StructureRegistry {
 
             boolean projectStartToHeightmap = json.has("project_start_to_heightmap");
 
+            // 原版 max_distance_from_center: 试炼密室=116, 其余默认 80 (village/bastion/end_city 等各有值,
+            // 但本服既有结构在 80 下已能完整展开, 故仅 trial_chambers 显式放宽到 116 以修复"规模太小"。
+            int maxDistance = json.has("max_distance_from_center")
+                ? json.get("max_distance_from_center").getAsInt() : 80;
+
             return new ConfiguredStructure(id, type, startPool, size, step, biomes,
                 terrainAdaptation, startHeightType, startHeightMin, startHeightMax,
-                projectStartToHeightmap);
+                projectStartToHeightmap, maxDistance,
+                PoolAliases.parse(json.has("pool_aliases") && json.get("pool_aliases").isJsonArray()
+                    ? json.getAsJsonArray("pool_aliases") : null));
         } catch (Exception e) {
             System.err.println("[structure2] Failed to load structure " + id + ": " + e.getMessage());
             return null;

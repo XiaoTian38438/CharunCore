@@ -34,6 +34,12 @@ public class Chunk {
     public void setBlockEntity(int rx, int y, int rz, org.cloudburstmc.nbt.NbtMap nbt) {
         long key = blockEntityKey(rx & 15, y, rz & 15);
         blockEntities.put(key, nbt);
+        com.CharunCore.server.world.WorldManager.markChunkDirty(this);
+    }
+
+    /** 区块加载(从磁盘回读 BE)用: 不标脏 —— 刚加载的区块本就与磁盘一致。 */
+    public void putBlockEntityRaw(int rx, int y, int rz, org.cloudburstmc.nbt.NbtMap nbt) {
+        blockEntities.put(blockEntityKey(rx & 15, y, rz & 15), nbt);
     }
 
     public org.cloudburstmc.nbt.NbtMap getBlockEntity(int rx, int y, int rz) {

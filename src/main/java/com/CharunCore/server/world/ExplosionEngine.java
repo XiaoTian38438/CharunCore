@@ -128,10 +128,19 @@ public final class ExplosionEngine {
             if (dist <= radius && dist > 1e-6) {
                 double factor = (1.0 - dist / radius);
                 p.damagePlayer((float) ((factor * factor * 7 + factor) * 2 * power), "explosion");
+                // Bug38 修复: 击退前检查落点是否为实心方块 —— 曾把玩家水平推进墙里,
+                // 客户端本地碰撞卡死表现为"假死: 无法移动/F5 看不见自己/可交互",
+                // 只能反复重进。目标格(脚/眼)任一为实心则大幅削减水平推力。
+                double kx = dx / dist * factor, kz = dz / dist * factor;
+                int tx = (int) Math.floor(p.x + kx * 4.0);
+                int tz = (int) Math.floor(p.z + kz * 4.0);
+                boolean wallAhead = isSolidForPush(dim, tx, (int) Math.floor(p.y), tz)
+                        || isSolidForPush(dim, tx, (int) Math.floor(p.y + 1.0), tz);
+                if (wallAhead) { kx *= 0.15; kz *= 0.15; }
                 // 击退: 限制 y 分量避免把玩家推进方块/天花板导致"假死卡住"(原版也夹紧击退)。
                 double ky = dy / dist * factor + 0.2;
                 ky = Math.min(ky, 0.4);
-                p.knockback(dx / dist * factor, dz / dist * factor, ky);
+                p.knockback(kx, kz, ky);
             }
             if (dist < 64) {
                 p.sendExplosionEffect(cx, cy, cz, power);
@@ -141,6 +150,15 @@ public final class ExplosionEngine {
 
     private static long pack(int x, int y, int z) {
         return ((long) x & 0x3FFFFFF) << 38 | ((long) y & 0xFFF) << 26 | ((long) z & 0x3FFFFFF);
+    }
+
+    private static boolean isSolidForPush(DimensionType dim, int x, int y, int z) {
+        int st = com.CharunCore.server.world.WorldManager.getBlockState(dim, x, y, z);
+        if (st == 0) return false;
+        String n = com.CharunCore.server.utils.BlockStateHelper.getName(st);
+        return n != null && !n.equals("air") && !n.equals("cave_air") && !n.equals("void_air")
+                && !n.equals("water") && !n.equals("lava")
+                && com.CharunCore.server.utils.BlockManager.hasCollision(n);
     }
 
     private static float blastResistance(String name) {

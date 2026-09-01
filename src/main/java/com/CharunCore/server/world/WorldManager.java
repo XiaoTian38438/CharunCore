@@ -321,11 +321,24 @@ public class WorldManager {
         }
 
         if (nbt.containsKey("block_entities")) {
-            for (org.cloudburstmc.nbt.NbtMap be : nbt.getList("block_entities", org.cloudburstmc.nbt.NbtType.COMPOUND)) {
+            for (org.cloudburstmc.nbt.NbtMap be : nbt.getList("block_entities", NbtType.COMPOUND)) {
                 int rx = be.getInt("x", 0) & 15;
                 int ry = be.getInt("y", 0);
                 int rz = be.getInt("z", 0) & 15;
-                chunk.setBlockEntity(rx, ry, rz, be);
+                chunk.putBlockEntityRaw(rx, ry, rz, be);
+                // Bug37 修复: 熔炉/酿造台/漏斗等带自动逻辑的容器必须在区块加载时
+                // 注册进 ContainerStore, 否则没人打开过 UI 就永远不会 tick
+                // ("物品放进去好久了才开始烧, 打开过一次就正常")。
+                String beId = be.getString("id", "");
+                if (beId.startsWith("minecraft:")) beId = beId.substring(10);
+                ContainerStore.Pos cpos = new ContainerStore.Pos(dim,
+                        (x << 4) + rx, ry, (z << 4) + rz);
+                switch (beId) {
+                    case "furnace", "blast_furnace", "smoker" -> ContainerStore.furnace(cpos, beId);
+                    case "brewing_stand" -> ContainerStore.brewing(cpos);
+                    case "hopper" -> ContainerStore.hopper(cpos);
+                    default -> { }
+                }
             }
         }
         return chunk;
@@ -385,6 +398,20 @@ public class WorldManager {
     private static final java.util.Set<Long> dirtyChunks = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final java.util.Map<DimensionType, java.util.Set<Long>> dirtyDimChunks =
         new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Bug7/9: BE 写入(告示牌文字/命令方块/容器落盘)也要标脏区块, 否则只在 30s 自动存档前
+     *  恰好被 setBlock 标脏过的区块能落盘, 纯 BE 修改重启后全部丢失。 */
+    public static void markChunkDirty(Chunk chunk) {
+        for (var dimEntry : dimChunks.entrySet()) {
+            for (var ce : dimEntry.getValue().entrySet()) {
+                if (ce.getValue() == chunk) {
+                    dirtyDimChunks.computeIfAbsent(dimEntry.getKey(),
+                        d -> java.util.concurrent.ConcurrentHashMap.newKeySet()).add(ce.getKey());
+                    return;
+                }
+            }
+        }
+    }
 
     public static void setBlock(int x, int y, int z, int stateId) {
         int chunkX = x >> 4, chunkZ = z >> 4;
@@ -668,6 +695,10 @@ public class WorldManager {
         }
         RedstoneEngine.onBlockChanged(dim, x, y, z);
         LightEngine.onBlockChanged(dim, x, y, z, oldState, stateId);
+        // Bug37: 支撑方块被移除后, 六邻居中失去支撑的非完整方块破碎为掉落物(原版 neighborChanged)。
+        if (stateId == 0) {
+            SupportEngine.checkNeighbors(dim, x, y, z);
+        }
     }
 
     public static int getBlockState(DimensionType dim, int x, int y, int z) {

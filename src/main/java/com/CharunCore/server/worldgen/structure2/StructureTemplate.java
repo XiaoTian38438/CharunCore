@@ -73,7 +73,16 @@ public class StructureTemplate {
 
     public void placeInWorld(WorldGenLevel level, int originX, int originY, int originZ,
                               Rotation rotation, Mirror mirror) {
+        placeInWorld(level, originX, originY, originZ, rotation, mirror, false);
+    }
+
+    /** skipAir=true 时不覆盖目标处空气（原版 BlockIgnoreProcessor.STRUCTURE_AND_AIR 语义）。 */
+    public void placeInWorld(WorldGenLevel level, int originX, int originY, int originZ,
+                              Rotation rotation, Mirror mirror, boolean skipAir) {
         for (StructureBlockInfo info : blocks) {
+            if (skipAir && info.blockStateId() == 0) continue;
+            String _bn = BlockStateHelper.getName(info.blockStateId());
+            if (skipAir && _bn != null && (_bn.equals("air") || _bn.endsWith(":air"))) continue;
             String blockName = BlockStateHelper.getName(info.blockStateId());
             // 【原版语义】structure_block 数据标记方块不放置, 记录到 level 延迟处理
             // (Chest→下方箱子战利品 / Sentry→潜影贝 / Elytra→鞘翅展示框, 由
@@ -87,7 +96,14 @@ public class StructureTemplate {
                 }
                 continue;
             }
-            if (blockName != null && blockName.equals("jigsaw")) continue;
+            // Bug49: jigsaw 位按原版 keepJigsaws=false 语义回填空气(曾 continue 留下地形残块,
+            // 结构门口/通道被地形堵住); structure_void 是占位方块不得放置(结构里出现"幽灵方块")。
+            if (blockName != null && blockName.equals("jigsaw")) {
+                int[] jp = transformPosition(info.x(), info.y(), info.z(), rotation, mirror);
+                level.setBlock(originX + jp[0], originY + jp[1], originZ + jp[2], 0);
+                continue;
+            }
+            if (blockName != null && blockName.equals("structure_void")) continue;
             int[] pos = transformPosition(info.x(), info.y(), info.z(), rotation, mirror);
             int worldX = originX + pos[0];
             int worldY = originY + pos[1];

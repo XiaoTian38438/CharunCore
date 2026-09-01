@@ -76,8 +76,8 @@ public final class Mapped implements DensityFunction {
         return v < 0.0 ? v * 0.25 : v;
     }
     private static double squeeze(double v) {
-        if (v == 0.0) return 0.0;
-        double abs = Math.abs(v);
-        return (abs < 1.0 ? abs * abs * (3.0 - 2.0 * abs) : 1.0) * Math.signum(v);
+        // 原版 DensityFunctions.Mapped case SQUEEZE：clamp(d,-1,1)/2 - d^3/24
+        double c = Math.clamp(v, -1.0, 1.0);
+        return c / 2.0 - c * c * c / 24.0;
     }
 }
