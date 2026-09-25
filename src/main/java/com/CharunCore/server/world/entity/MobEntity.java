@@ -292,6 +292,12 @@ public class MobEntity extends LivingEntity {
         }
 
         if ((isHostile() || (isNeutral() && angeredTimer > 0)) && nearestPlayer != null) {
+            // B2: EntityTargetEvent —— 插件可取消索敌或改写目标
+            var targetEvent = com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                    new com.CharunCore.server.plugin.event.events.EntityTargetEvent(this, nearestPlayer, nearestPlayer));
+            if (targetEvent.isCancelled()) return;
+            nearestPlayer = targetEvent.getTarget();
+            if (nearestPlayer == null) return;
             double dx = nearestPlayer.x - x;
             double dz = nearestPlayer.z - z;
             double dist = Math.sqrt(dx * dx + dz * dz);

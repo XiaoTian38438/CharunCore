@@ -340,7 +340,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return -1;
     }
 
-    /** plugin.api.ItemMeta → 内部 ItemMeta(附魔名转 id)。 */
+    /** plugin.api.ItemMeta → 内部 ItemMeta(附魔名转 id)。B1: 带扩展组件。 */
     private ItemMeta toInternalMeta(com.CharunCore.server.plugin.api.ItemMeta pm) {
         if (pm == null || pm.isEmpty()) return ItemMeta.EMPTY;
         java.util.Map<Integer, Integer> ench = new java.util.HashMap<>();
@@ -350,15 +350,23 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
         return ItemMeta.of(ench, null,
                 pm.hasDisplayName() ? pm.getDisplayName() : null,
-                pm.getDamage(), -1, -1);
+                pm.getDamage(), -1, -1,
+                pm.hasLore() ? String.join("\n", pm.getLore()) : null,
+                pm.isUnbreakable(),
+                pm.getGlintOverride() == null ? 0 : (pm.getGlintOverride() ? 1 : -1));
     }
 
-    /** 内部 ItemMeta → plugin.api.ItemMeta(附魔 id 转名)。 */
+    /** 内部 ItemMeta → plugin.api.ItemMeta(附魔 id 转名)。B1: 带扩展组件。 */
     private com.CharunCore.server.plugin.api.ItemMeta fromInternalMeta(ItemMeta m) {
         if (m == null || m.isEmpty()) return null;
         com.CharunCore.server.plugin.api.ItemMeta out = new com.CharunCore.server.plugin.api.ItemMeta();
         if (m.customName() != null && !m.customName().isEmpty()) out.setDisplayName(m.customName());
         if (m.damage() > 0) out.setDamage(m.damage());
+        if (m.lore() != null && !m.lore().isEmpty()) {
+            for (String line : m.lore().split("\n", -1)) out.addLoreLine(line);
+        }
+        out.setUnbreakable(m.unbreakable());
+        out.setGlintOverride(m.glint() == 0 ? null : m.glint() > 0);
         for (java.util.Map.Entry<Integer, Integer> e : m.enchants().entrySet()) {
             String name = com.CharunCore.server.utils.BlockManager.getEnchantName(e.getKey());
             if (name != null) out.addEnchant(name, e.getValue());
@@ -366,48 +374,15 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return out;
     }
 
-    /** 玩家背包区(槽 9-44)单槽内联写入。 */
+    /** 玩家背包区(槽 9-44)单槽内联写入。B1: playerSlotMeta 已含扩展组件, 走完整路径。 */
     private void writePlayerSlotInline(com.CharunCore.server.network.protocol.PacketBuffer pb, int ps) {
         int id = data.inventoryIds[ps];
         int count = data.inventoryCounts[ps];
         if (id <= 0 || count <= 0) {
             pb.writeVarInt(0);
-        } else if (hasExtSlotMeta(ps)) {
-            writePluginItemMeta(pb, id, count, extSlotMeta(ps));
         } else {
-            ItemMeta m = playerSlotMeta(ps);
-            if (m.isEmpty()) {
-                pb.writeSlot(id, count);
-            } else {
-                writeStackWithMeta(pb, id, count, m);
-            }
+            writeStackWithMeta(pb, id, count, playerSlotMeta(ps));
         }
-    }
-
-    /** 玩家槽位是否带扩展组件(lore/unbreakable/glint)。 */
-    private boolean hasExtSlotMeta(int ps) {
-        return data != null && ps >= 0 && ps < 46
-                && ((data.inventoryLore[ps] != null && !data.inventoryLore[ps].isEmpty())
-                    || data.inventoryUnbreakable[ps] || data.inventoryGlint[ps] != 0);
-    }
-
-    /** data 三数组 + 内部组件 → 插件 ItemMeta(发送与序列化统一入口)。 */
-    private com.CharunCore.server.plugin.api.ItemMeta extSlotMeta(int ps) {
-        com.CharunCore.server.plugin.api.ItemMeta pm = new com.CharunCore.server.plugin.api.ItemMeta();
-        if (data.inventoryCustomName[ps] != null) pm.setDisplayName(data.inventoryCustomName[ps]);
-        if (data.inventoryDamage[ps] > 0) pm.setDamage(data.inventoryDamage[ps]);
-        if (data.inventoryLore[ps] != null) {
-            for (String line : data.inventoryLore[ps].split("\n", -1)) pm.addLoreLine(line);
-        }
-        pm.setUnbreakable(data.inventoryUnbreakable[ps]);
-        pm.setGlintOverride(data.inventoryGlint[ps] == 0 ? null : data.inventoryGlint[ps] > 0);
-        if (data.inventoryEnchants[ps] != null) {
-            for (java.util.Map.Entry<Integer, Integer> e : data.inventoryEnchants[ps].entrySet()) {
-                String name = com.CharunCore.server.utils.BlockManager.getEnchantName(e.getKey());
-                if (name != null) pm.addEnchant(name, e.getValue());
-            }
-        }
-        return pm;
     }
 
     /**
@@ -592,29 +567,43 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     /** #19 光标物品盔甲纹饰(trim 组件): material/pattern 注册 id (-1=无)。 */
     private int carriedTrimMaterial = -1;
     private int carriedTrimPattern = -1;
+    /** B1: 光标扩展组件(lore/unbreakable/glint) —— 与 ItemMeta 快照同步搬运。 */
+    private String carriedLore = null;
+    private boolean carriedUnbreakable = false;
+    private int carriedGlint = 0;
 
-    /** Bug4/33: 槽位/光标/掉落物通用的物品组件快照, 随物品移动而不再依赖各处手工拷贝。 */
+    /** Bug4/33: 槽位/光标/掉落物通用的物品组件快照, 随物品移动而不再依赖各处手工拷贝。
+     *  B1: 扩展组件 lore(多行 \n 分隔)/不可破坏/发光(-1 无,0 强制关,1 强制开)随快照全链路搬运。 */
     public record ItemMeta(java.util.Map<Integer, Integer> enchants, String potion, String customName,
-                           int damage, int trimMaterial, int trimPattern) {
+                           int damage, int trimMaterial, int trimPattern,
+                           String lore, boolean unbreakable, int glint) {
         public static final ItemMeta EMPTY =
-                new ItemMeta(java.util.Map.of(), null, null, 0, -1, -1);
+                new ItemMeta(java.util.Map.of(), null, null, 0, -1, -1, null, false, 0);
         public boolean isEmpty() {
             return damage == 0 && trimMaterial < 0 && trimPattern < 0
                     && (potion == null || potion.isEmpty())
                     && (customName == null || customName.isEmpty())
+                    && (lore == null || lore.isEmpty())
+                    && !unbreakable && glint == 0
                     && (enchants == null || enchants.isEmpty());
         }
         public static ItemMeta of(java.util.Map<Integer, Integer> enchants, String potion,
                                   String customName, int damage, int trimM, int trimP) {
+            return of(enchants, potion, customName, damage, trimM, trimP, null, false, 0);
+        }
+        public static ItemMeta of(java.util.Map<Integer, Integer> enchants, String potion,
+                                  String customName, int damage, int trimM, int trimP,
+                                  String lore, boolean unbreakable, int glint) {
             ItemMeta m = new ItemMeta(enchants == null ? java.util.Map.of() : enchants,
-                    potion, customName, damage, trimM, trimP);
+                    potion, customName, damage, trimM, trimP, lore, unbreakable, glint);
             return m.isEmpty() ? EMPTY : m;
         }
     }
 
     private ItemMeta carriedSnapshot() {
         return ItemMeta.of(carriedEnchants, carriedPotionType, carriedCustomName,
-                carriedDamage, carriedTrimMaterial, carriedTrimPattern);
+                carriedDamage, carriedTrimMaterial, carriedTrimPattern,
+                carriedLore, carriedUnbreakable, carriedGlint);
     }
 
     private void loadCarriedFrom(ItemMeta m) {
@@ -625,6 +614,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         carriedDamage = m.damage();
         carriedTrimMaterial = m.trimMaterial();
         carriedTrimPattern = m.trimPattern();
+        carriedLore = m.lore();
+        carriedUnbreakable = m.unbreakable();
+        carriedGlint = m.glint();
     }
 
     private void clearCarriedMeta() {
@@ -634,6 +626,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         carriedDamage = 0;
         carriedTrimMaterial = -1;
         carriedTrimPattern = -1;
+        carriedLore = null;
+        carriedUnbreakable = false;
+        carriedGlint = 0;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -4550,19 +4545,13 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private void writePlayerSlot(PacketBuffer pb, int slot) {
-        int id = data.inventoryIds[slot], count = data.inventoryCounts[slot];
-        boolean book = "enchanted_book".equals(BlockManager.itemIdToName(id));
-        int[] pot = parsePotionEx(data.inventoryPotion[slot]);
-        pb.writeStackWithComponents(id, count, data.inventoryEnchants[slot], book, pot[0], pot[1], pot[2],
-            data.inventoryCustomName[slot], data.inventoryDamage[slot],
-            data.inventoryTrimMaterial[slot], data.inventoryTrimPattern[slot], pot[3]);
+        // B1: 统一走完整组件路径(lore/unbreakable/glint 随槽位下发)
+        writeStackWithMeta(pb, data.inventoryIds[slot], data.inventoryCounts[slot], playerSlotMeta(slot));
     }
 
     private void writeCarriedSlot(PacketBuffer pb) {
-        boolean book = "enchanted_book".equals(BlockManager.itemIdToName(carriedItemId));
-        int[] pot = parsePotionEx(carriedPotionType);
-        pb.writeStackWithComponents(carriedItemId, carriedItemCount, carriedEnchants, book, pot[0], pot[1], pot[2],
-            carriedCustomName, carriedDamage, carriedTrimMaterial, carriedTrimPattern, pot[3]);
+        // B1: 光标物品同样走完整组件路径
+        writeStackWithMeta(pb, carriedItemId, carriedItemCount, carriedSnapshot());
     }
 
     /** 带组件写出箱子/末影箱槽位 (Bug4/33: 附魔/药水/自定义名/耐久随物品同步到客户端)。 */
@@ -4572,16 +4561,92 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         writeStackWithMeta(pb, id, count, contMeta(cd.meta, s));
     }
 
-    /** Bug4/33: 按物品组件写一个完整槽位(count+id+components)。 */
+    /** Bug4/33 + B1: 按物品组件写一个完整槽位(count+id+全部组件):
+     *  damage(3)/unbreakable(4)/custom_name(6)/lore(11)/enchantments(13)/glint(21)/potion(49)/trim(54)。 */
     private void writeStackWithMeta(PacketBuffer pb, int id, int count, ItemMeta m) {
-        boolean book = "enchanted_book".equals(BlockManager.itemIdToName(id));
         ItemMeta mm = m == null ? ItemMeta.EMPTY : m;
         int[] pot = parsePotionEx(mm.potion());
-        pb.writeStackWithComponents(id, count,
-                mm.enchants().isEmpty() ? null : mm.enchants(), book,
-                pot[0], pot[1], pot[2],
-                mm.customName(), mm.damage(),
-                mm.trimMaterial(), mm.trimPattern(), pot[3]);
+        boolean book = "enchanted_book".equals(BlockManager.itemIdToName(id));
+        if (count <= 0 || id <= 0) { pb.writeVarInt(0); return; }
+        boolean hasEnch = !mm.enchants().isEmpty();
+        boolean hasPotion = pot[0] > 0 || pot[3] >= 0;
+        boolean hasName = mm.customName() != null && !mm.customName().isEmpty();
+        boolean hasLore = mm.lore() != null && !mm.lore().isEmpty();
+        boolean hasDamage = mm.damage() > 0;
+        boolean hasTrim = mm.trimMaterial() >= 0 && mm.trimPattern() >= 0;
+        boolean hasUnbreak = mm.unbreakable();
+        boolean hasGlint = mm.glint() != 0;
+        int nSet = (hasDamage ? 1 : 0) + (hasUnbreak ? 1 : 0) + (hasName ? 1 : 0) + (hasLore ? 1 : 0)
+                + (hasEnch ? 1 : 0) + (hasPotion ? 1 : 0) + (hasTrim ? 1 : 0) + (hasGlint ? 1 : 0);
+        pb.writeVarInt(count);
+        pb.writeVarInt(id);
+        pb.writeVarInt(nSet);
+        pb.writeVarInt(0); // removed count
+        if (hasDamage) {
+            pb.writeVarInt(3);
+            pb.writeVarInt(mm.damage());
+        }
+        if (hasUnbreak) {
+            pb.writeVarInt(4);
+            pb.writeAnonymousNbt(org.cloudburstmc.nbt.NbtMap.builder().build());
+        }
+        if (hasName) {
+            pb.writeVarInt(6);
+            pb.writeAnonymousNbt(org.cloudburstmc.nbt.NbtMap.builder()
+                    .putString("text", mm.customName()).build());
+        }
+        if (hasLore) {
+            java.util.List<String> lines = java.util.Arrays.asList(mm.lore().split("\n", -1));
+            pb.writeVarInt(11);
+            pb.writeVarInt(lines.size());
+            for (String line : lines) {
+                pb.writeAnonymousNbt(org.cloudburstmc.nbt.NbtMap.builder()
+                        .putString("text", line).build());
+            }
+        }
+        if (hasEnch) {
+            pb.writeVarInt(book ? 41 : 13);
+            pb.writeVarInt(mm.enchants().size());
+            for (java.util.Map.Entry<Integer, Integer> e : mm.enchants().entrySet()) {
+                pb.writeVarInt(Math.max(0, e.getKey()));
+                pb.writeVarInt(e.getValue());
+            }
+        }
+        if (hasPotion) {
+            // PotionContents: Optional<Holder<Potion>> + Optional<customColor> + List<MobEffectInstance> + Optional<customName>
+            pb.writeVarInt(49);
+            if (pot[3] >= 0) {
+                pb.writeBoolean(true);
+                pb.writeVarInt(pot[3]);
+            } else {
+                pb.writeBoolean(false);
+            }
+            pb.writeBoolean(false); // customColor absent
+            if (pot[0] > 0) {
+                // MobEffectInstance: effectId + amplifier + duration + ambient + showParticles + showIcon + hiddenEffect
+                pb.writeVarInt(1);
+                pb.writeVarInt(pot[0]);
+                pb.writeVarInt(pot[1]);
+                pb.writeVarInt(pot[2]);
+                pb.writeBoolean(false);
+                pb.writeBoolean(true);
+                pb.writeBoolean(true);
+                pb.writeBoolean(false);
+            } else {
+                pb.writeVarInt(0);
+            }
+            pb.writeBoolean(false); // customName absent
+        }
+        if (hasTrim) {
+            // minecraft:trim (id 54): holder 对 REFERENCE 写 VarInt(registryId+1)
+            pb.writeVarInt(54);
+            pb.writeVarInt(mm.trimMaterial() + 1);
+            pb.writeVarInt(mm.trimPattern() + 1);
+        }
+        if (hasGlint) {
+            pb.writeVarInt(21);
+            pb.writeBoolean(mm.glint() > 0);
+        }
     }
 
     /**
@@ -4895,12 +4960,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             } else if (windowId == 0 && slot >= 1 && slot < 46 && !empty) {
                 // Bug35: 窗口0槽0是2x2合成结果槽(非玩家背包格), 曾走 writePlayerSlot
                 // 读恒空的 data.inventoryIds[0] -> 背包合成栏永远无输出预览。
-                // 插件扩展组件(lore/unbreakable/glint)槽走完整组件路径。
-                if (hasExtSlotMeta(slot)) {
-                    writePluginItemMeta(pb, itemId, count, extSlotMeta(slot));
-                } else {
-                    writePlayerSlot(pb, slot);
-                }
+                writePlayerSlot(pb, slot);
             } else {
                 pb.writeSlot(itemId, count);
             }
@@ -5977,14 +6037,16 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     // "读源组件 → 写目标(setSlotItemFull) → 清源", 光标字段只作为中转。
 
     private static ItemMeta contMeta(ContainerStore.SlotMeta sm, int s) {
-        return ItemMeta.of(sm.slotEnchants[s], sm.slotPotion[s], sm.slotCustomName[s], sm.slotDamage[s], -1, -1);
+        return ItemMeta.of(sm.slotEnchants[s], sm.slotPotion[s], sm.slotCustomName[s], sm.slotDamage[s], -1, -1,
+                sm.slotLore[s], sm.slotUnbreakable[s], sm.slotGlint[s]);
     }
 
     private ItemMeta playerSlotMeta(int ps) {
         if (ps < 0 || ps >= 46) return ItemMeta.EMPTY;
         return ItemMeta.of(data.inventoryEnchants[ps], data.inventoryPotion[ps],
                 data.inventoryCustomName[ps], data.inventoryDamage[ps],
-                data.inventoryTrimMaterial[ps], data.inventoryTrimPattern[ps]);
+                data.inventoryTrimMaterial[ps], data.inventoryTrimPattern[ps],
+                data.inventoryLore[ps], data.inventoryUnbreakable[ps], data.inventoryGlint[ps]);
     }
 
     private void writePlayerSlotMeta(int ps, ItemMeta m) {
@@ -5997,6 +6059,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             data.inventoryDamage[ps] = 0;
             data.inventoryTrimMaterial[ps] = -1;
             data.inventoryTrimPattern[ps] = -1;
+            data.inventoryLore[ps] = null;
+            data.inventoryUnbreakable[ps] = false;
+            data.inventoryGlint[ps] = 0;
         } else {
             data.inventoryEnchants[ps] = new java.util.HashMap<>(m.enchants());
             data.inventoryPotion[ps] = m.potion();
@@ -6004,6 +6069,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             data.inventoryDamage[ps] = m.damage();
             data.inventoryTrimMaterial[ps] = m.trimMaterial();
             data.inventoryTrimPattern[ps] = m.trimPattern();
+            data.inventoryLore[ps] = m.lore();
+            data.inventoryUnbreakable[ps] = m.unbreakable();
+            data.inventoryGlint[ps] = m.glint();
         }
     }
 
@@ -6247,6 +6315,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 ? new java.util.HashMap<>() : new java.util.HashMap<>(m.enchants());
         sm.slotPotion[s] = empty ? null : m.potion();
         sm.slotCustomName[s] = empty ? null : m.customName();
+        sm.slotLore[s] = empty ? null : m.lore();
+        sm.slotUnbreakable[s] = !empty && m.unbreakable();
+        sm.slotGlint[s] = empty ? 0 : m.glint();
     }
 
     /** 写槽位并携带组件(物品移动的规范入口)。元数据经 pendingWriteMeta 在 setSlotItem
@@ -6328,7 +6399,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     pendingWriteMeta != null && !pendingWriteMeta.isEmpty() && !pendingWriteMeta.enchants().isEmpty()
                         ? pendingWriteMeta.enchants() : null,
                     pendingWriteMeta != null && !pendingWriteMeta.isEmpty() ? pendingWriteMeta.potion() : null,
-                    pendingWriteMeta != null && !pendingWriteMeta.isEmpty() ? pendingWriteMeta.customName() : null);
+                    pendingWriteMeta != null && !pendingWriteMeta.isEmpty() ? pendingWriteMeta.customName() : null,
+                    pendingWriteMeta != null ? pendingWriteMeta.lore() : null,
+                    pendingWriteMeta != null && pendingWriteMeta.unbreakable(),
+                    pendingWriteMeta != null ? pendingWriteMeta.glint() : 0);
                 cd.version++;
                 // #14: 容器内容变化 -> 邻接比较器(满度信号)重算。普通点击与 shift 均经此处写入。
                 ContainerStore.Pos notifyPos = chestDataPosForSlot(windowId, slot);
@@ -10900,6 +10974,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (power < 0.1f) return;
         if (power > 1.0f) power = 1.0f;
 
+        var shootEvent = EVENTS.fire(new com.CharunCore.server.plugin.event.events.EntityShootBowEvent(this, power));
+        if (shootEvent.isCancelled()) return;
+        power = shootEvent.getForce();
+
         double yawRad = Math.toRadians(this.yaw);
         double pitchRad = Math.toRadians(this.pitch);
         double dx = -Math.sin(yawRad) * Math.cos(pitchRad);
@@ -11331,6 +11409,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             drop.itemCustomName = meta.customName();
             drop.trimMaterial = meta.trimMaterial();
             drop.trimPattern = meta.trimPattern();
+            drop.itemLore = meta.lore();
+            drop.itemUnbreakable = meta.unbreakable();
+            drop.itemGlint = meta.glint();
         }
         EntityManager.addEntity(drop);
     }
@@ -11341,7 +11422,13 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     public int pickupItemCount(int itemId, int count, java.util.Map<Integer, Integer> enchants,
                                String potion, String customName, int damage,
                                int trimMaterial, int trimPattern) {
-        ItemMeta m = ItemMeta.of(enchants, potion, customName, damage, trimMaterial, trimPattern);
+        return pickupItemCount(itemId, count,
+                ItemMeta.of(enchants, potion, customName, damage, trimMaterial, trimPattern));
+    }
+
+    /** B1: 带 ItemMeta 组件快照的拾取入口(扩展 lore/unbreakable/glint 全保留)。 */
+    public int pickupItemCount(int itemId, int count, ItemMeta metaIn) {
+        ItemMeta m = metaIn == null ? ItemMeta.EMPTY : metaIn;
         int max = Math.max(1, getMaxStackSize(itemId));
         int picked = 0;
         if (m.isEmpty()) {

@@ -13,6 +13,10 @@ public class ItemEntity extends Entity {
     public String itemCustomName = null;
     public int trimMaterial = -1;
     public int trimPattern = -1;
+    /** B1: 掉落物扩展组件(lore 多行 \n / 不可破坏 / 发光 -1无0关1开)。 */
+    public String itemLore = null;
+    public boolean itemUnbreakable = false;
+    public int itemGlint = 0;
     public int pickupDelay = 10;
     public int age = 0;
     /** 旋转动画角度(原版: 每 tick 旋转 ~10°) */
@@ -107,9 +111,10 @@ public class ItemEntity extends Entity {
                         pickupDelay = 20;
                         return;
                     }
-                    int got = player.pickupItemCount(itemId, count,
-                            itemEnchants, itemPotion, itemCustomName, itemDamage,
-                            trimMaterial, trimPattern);
+                    NetworkHandler.ItemMeta dropMeta = NetworkHandler.ItemMeta.of(
+                            itemEnchants, itemPotion, itemCustomName, itemDamage, trimMaterial, trimPattern,
+                            itemLore, itemUnbreakable, itemGlint);
+                    int got = player.pickupItemCount(itemId, count, dropMeta);
                     if (got >= count) {
                         NetworkHandler.broadcastCollect(dim, id, player.eid, count);
                         remove();

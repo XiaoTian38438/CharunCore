@@ -74,11 +74,25 @@ public class ArrowEntity extends Entity {
 
             Object hit = findEntityHit(nx, ny, nz);
             if (hit != null) {
+                var hitEvent = com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                        new com.CharunCore.server.plugin.event.events.ProjectileHitEvent(this,
+                                (int) Math.floor(x), (int) Math.floor(y), (int) Math.floor(z)));
+                if (hitEvent.isCancelled()) {
+                    remove();
+                    return;
+                }
                 onHitEntity(hit);
                 return;
             }
 
             if (isSolidAt(nx, ny, nz)) {
+                var hitEvent = com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                        new com.CharunCore.server.plugin.event.events.ProjectileHitEvent(this,
+                                (int) Math.floor(nx), (int) Math.floor(ny), (int) Math.floor(nz)));
+                if (hitEvent.isCancelled()) {
+                    remove();
+                    return;
+                }
                 x = nx - sx * 0.3;
                 y = ny - sy * 0.3;
                 z = nz - sz * 0.3;

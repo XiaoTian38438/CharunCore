@@ -40,11 +40,17 @@ public final class PlayerDataManager {
 
     private PlayerDataManager() {}
 
-    /** 单物品解析出的组件（与设计/读取共用）。 */
+    /** 单物品解析出的组件（与设计/读取共用）。lore 多行以 \n 分隔; glint: -1 无/0 强制关/1 强制开。 */
     public record ItemComps(int damage, java.util.Map<Integer, Integer> enchants, String potion, String customName,
-                            int trimMaterial, int trimPattern) {
+                            int trimMaterial, int trimPattern,
+                            String lore, boolean unbreakable, int glint) {
         public ItemComps(int damage, java.util.Map<Integer, Integer> enchants, String potion, String customName) {
-            this(damage, enchants, potion, customName, -1, -1);
+            this(damage, enchants, potion, customName, -1, -1, null, false, 0);
+        }
+
+        public ItemComps(int damage, java.util.Map<Integer, Integer> enchants, String potion, String customName,
+                         int trimMaterial, int trimPattern) {
+            this(damage, enchants, potion, customName, trimMaterial, trimPattern, null, false, 0);
         }
     }
 
@@ -68,6 +74,15 @@ public final class PlayerDataManager {
     public static NbtMap buildItemComponents(String itemName, int damage,
             java.util.Map<Integer, Integer> enchants, String potion, String customName,
             int trimMaterial, int trimPattern) {
+        return buildItemComponents(itemName, damage, enchants, potion, customName,
+                trimMaterial, trimPattern, null, false, 0);
+    }
+
+    /** B1: 完整组件构建(含插件扩展 lore/unbreakable/glint)。 */
+    public static NbtMap buildItemComponents(String itemName, int damage,
+            java.util.Map<Integer, Integer> enchants, String potion, String customName,
+            int trimMaterial, int trimPattern,
+            String lore, boolean unbreakable, int glint) {
         NbtMapBuilder components = NbtMap.builder();
         if (damage > 0) components.putInt("minecraft:damage", damage);
         if (enchants != null && !enchants.isEmpty()) {
@@ -109,12 +124,27 @@ public final class PlayerDataManager {
         }
         if (trimMaterial >= 0 && trimPattern >= 0
                 && trimMaterial < TRIM_MATERIAL_NAMES.length
-                && trimPattern < TRIM_PATTERN_NAMES.length) {
+                && trimPattern < TRIM_MATERIAL_NAMES.length) {
             // Bug44: 原版 trim 组件 NBT = {material:"minecraft:x", pattern:"minecraft:y"}
             components.putCompound("minecraft:trim", NbtMap.builder()
                     .putString("material", "minecraft:" + TRIM_MATERIAL_NAMES[trimMaterial])
                     .putString("pattern", "minecraft:" + TRIM_PATTERN_NAMES[trimPattern])
                     .build());
+        }
+        if (lore != null && !lore.isEmpty()) {
+            // 原版 minecraft:lore 组件: List<Text> 每行一条
+            // 注: BE 存储格式为内部归一化(客户端不经此路径, 显示走 774 wire lore=11)
+            List<NbtMap> lines = new java.util.ArrayList<>();
+            for (String line : lore.split("\n", -1)) {
+                lines.add(NbtMap.builder().putString("text", line).build());
+            }
+            components.putList("minecraft:lore", NbtType.COMPOUND, lines);
+        }
+        if (unbreakable) {
+            components.putCompound("minecraft:unbreakable", NbtMap.builder().build());
+        }
+        if (glint != 0) {
+            components.putBoolean("minecraft:enchantment_glint_override", glint > 0);
         }
         return components.build();
     }
@@ -126,6 +156,9 @@ public final class PlayerDataManager {
         String potion = null;
         String customName = null;
         int trimMaterial = -1, trimPattern = -1;
+        String lore = null;
+        boolean unbreakable = false;
+        int glint = 0;
         NbtMap components = itemNbt.getCompound("components");
         if (components != null) {
             if (components.containsKey("minecraft:damage")) damage = components.getInt("minecraft:damage", 0);
@@ -176,8 +209,31 @@ public final class PlayerDataManager {
                     if (("minecraft:" + TRIM_PATTERN_NAMES[i]).equals(pt)) { trimPattern = i; break; }
                 }
             }
+            List<NbtMap> loreLines = components.getList("minecraft:lore", NbtType.COMPOUND);
+            if (loreLines != null && !loreLines.isEmpty()) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < loreLines.size(); i++) {
+                    if (i > 0) sb.append('\n');
+                    NbtMap ln = loreLines.get(i);
+                    String txt = ln != null ? ln.getString("text", "") : "";
+                    if (txt.startsWith("{")) {
+                        try {
+                            com.google.gson.JsonObject o = com.google.gson.JsonParser.parseString(txt).getAsJsonObject();
+                            if (o.has("text")) txt = o.get("text").getAsString();
+                        } catch (Exception ignored) {}
+                    }
+                    sb.append(txt);
+                }
+                lore = sb.toString();
+            }
+            unbreakable = components.containsKey("minecraft:unbreakable");
+            if (components.containsKey("minecraft:enchantment_glint_override")) {
+                Boolean g = components.getBoolean("minecraft:enchantment_glint_override", false);
+                glint = g ? 1 : -1;
+            }
         }
-        return new ItemComps(damage, enchants, potion, customName, trimMaterial, trimPattern);
+        return new ItemComps(damage, enchants, potion, customName, trimMaterial, trimPattern,
+                lore, unbreakable, glint);
     }
 
     public static void init() {
@@ -309,13 +365,24 @@ public final class PlayerDataManager {
                 d.inventoryPotion != null && slot < d.inventoryPotion.length ? d.inventoryPotion[slot] : null,
                 d.inventoryCustomName != null && slot < d.inventoryCustomName.length ? d.inventoryCustomName[slot] : null,
                 d.inventoryTrimMaterial != null && slot < d.inventoryTrimMaterial.length ? d.inventoryTrimMaterial[slot] : -1,
-                d.inventoryTrimPattern != null && slot < d.inventoryTrimPattern.length ? d.inventoryTrimPattern[slot] : -1);
+                d.inventoryTrimPattern != null && slot < d.inventoryTrimPattern.length ? d.inventoryTrimPattern[slot] : -1,
+                d.inventoryLore != null && slot < d.inventoryLore.length ? d.inventoryLore[slot] : null,
+                d.inventoryUnbreakable != null && slot < d.inventoryUnbreakable.length && d.inventoryUnbreakable[slot],
+                d.inventoryGlint != null && slot < d.inventoryGlint.length ? d.inventoryGlint[slot] : 0);
             if (!builtComponents.isEmpty()) item.putCompound("components", builtComponents);
             inventory.add(item.build());
         }
         b.putList("Inventory", NbtType.COMPOUND, inventory);
         // Bug4/33 修复: 末影箱内容随玩家数据落盘 (原硬编码空列表 -> 末影箱物品永远丢失)。
         b.putList("EnderItems", NbtType.COMPOUND, buildEnderItems(uuid));
+        // B1: 插件持久数据 (PersistentDataContainer 底存) 随 NBT 落盘。
+        if (d.pluginData != null && !d.pluginData.isEmpty()) {
+            NbtMapBuilder pd = NbtMap.builder();
+            for (java.util.Map.Entry<String, String> e : d.pluginData.entrySet()) {
+                pd.putString(e.getKey(), e.getValue());
+            }
+            b.putCompound("CharunCorePluginData", pd.build());
+        }
         b.putInt("DataVersion", DATA_VERSION);
         return b.build();
     }
@@ -336,7 +403,8 @@ public final class PlayerDataManager {
                 item.putString("id", name.startsWith("minecraft:") ? name : "minecraft:" + name);
                 item.putInt("count", cnt);
                 NbtMap comps = buildItemComponents(name, ed.meta.slotDamage[s], ed.meta.slotEnchants[s],
-                        ed.meta.slotPotion[s], ed.meta.slotCustomName[s]);
+                        ed.meta.slotPotion[s], ed.meta.slotCustomName[s], -1, -1,
+                        ed.meta.slotLore[s], ed.meta.slotUnbreakable[s], ed.meta.slotGlint[s]);
                 if (!comps.isEmpty()) item.putCompound("components", comps);
                 ender.add(item.build());
             }
@@ -375,6 +443,13 @@ public final class PlayerDataManager {
                 d.respawnDimension = nbt.getString("SpawnDimension", "minecraft:overworld");
             }
             d.spawnInitialized = true;
+            // B1: 插件持久数据还原
+            NbtMap pluginData = nbt.getCompound("CharunCorePluginData");
+            if (pluginData != null && !pluginData.isEmpty()) {
+                for (String key : pluginData.keySet()) {
+                    d.pluginData.put(key, pluginData.getString(key, ""));
+                }
+            }
 
             List<NbtMap> inventory = nbt.getList("Inventory", NbtType.COMPOUND);
             if (inventory != null) {
@@ -396,6 +471,9 @@ public final class PlayerDataManager {
                     d.inventoryCustomName[slot] = c.customName();
                     d.inventoryTrimMaterial[slot] = c.trimMaterial();
                     d.inventoryTrimPattern[slot] = c.trimPattern();
+                    d.inventoryLore[slot] = c.lore();
+                    d.inventoryUnbreakable[slot] = c.unbreakable();
+                    d.inventoryGlint[slot] = c.glint();
                 }
             }
             // Bug4/33 修复: 末影箱内容从 EnderItems 还原到内存 (原未读取 -> 末影箱永远空)。

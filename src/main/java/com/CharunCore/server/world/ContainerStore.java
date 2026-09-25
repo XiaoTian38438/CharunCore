@@ -31,10 +31,18 @@ public final class ContainerStore {
         }
         public void setChestSlot(int s, int id, int cnt, int dmg,
                 java.util.Map<Integer, Integer> ench, String pot, String name) {
+            setChestSlot(s, id, cnt, dmg, ench, pot, name, null, false, 0);
+        }
+
+        /** B1: 带扩展组件(lore/unbreakable/glint)写槽。 */
+        public void setChestSlot(int s, int id, int cnt, int dmg,
+                java.util.Map<Integer, Integer> ench, String pot, String name,
+                String lore, boolean unbreakable, int glint) {
             slots[2 * s] = id; slots[2 * s + 1] = cnt;
             meta.slotDamage[s] = dmg;
             meta.slotEnchants[s] = ench == null ? new java.util.HashMap<>() : new java.util.HashMap<>(ench);
             meta.slotPotion[s] = pot; meta.slotCustomName[s] = name;
+            meta.slotLore[s] = lore; meta.slotUnbreakable[s] = unbreakable; meta.slotGlint[s] = glint;
         }
     }
 
@@ -46,20 +54,29 @@ public final class ContainerStore {
         public final java.util.Map<Integer, Integer>[] slotEnchants;
         public final String[] slotPotion;
         public final String[] slotCustomName;
+        /** B1: 插件扩展组件 lore(多行 \n 分隔)/不可破坏/发光(-1 无,0 关,1 开)。 */
+        public final String[] slotLore;
+        public final boolean[] slotUnbreakable;
+        public final int[] slotGlint;
         public SlotMeta(int n) {
             this.n = n;
             this.slotDamage = new int[n];
             this.slotEnchants = new java.util.HashMap[n];
             this.slotPotion = new String[n];
             this.slotCustomName = new String[n];
+            this.slotLore = new String[n];
+            this.slotUnbreakable = new boolean[n];
+            this.slotGlint = new int[n];
             for (int i = 0; i < n; i++) slotEnchants[i] = new java.util.HashMap<>();
         }
         public void clear(int s) {
             slotDamage[s] = 0; slotEnchants[s].clear(); slotPotion[s] = null; slotCustomName[s] = null;
+            slotLore[s] = null; slotUnbreakable[s] = false; slotGlint[s] = 0;
         }
         public boolean has(int s) {
             return slotDamage[s] > 0 || !slotEnchants[s].isEmpty()
-                    || slotPotion[s] != null || slotCustomName[s] != null;
+                    || slotPotion[s] != null || slotCustomName[s] != null
+                    || slotLore[s] != null || slotUnbreakable[s] || slotGlint[s] != 0;
         }
     }
 
@@ -449,7 +466,8 @@ public final class ContainerStore {
                 int slot = item.containsKey("Slot") ? item.getByte("Slot", (byte) i) : i;
                 if (slot < 0 || slot >= 27) continue;
                 PlayerDataManager.ItemComps c = PlayerDataManager.parseItemComponents(item);
-                d.setChestSlot(slot, id, cnt, c.damage(), c.enchants(), c.potion(), c.customName());
+                d.setChestSlot(slot, id, cnt, c.damage(), c.enchants(), c.potion(), c.customName(),
+                        c.lore(), c.unbreakable(), c.glint());
             }
         } catch (Exception ignored) {}
     }

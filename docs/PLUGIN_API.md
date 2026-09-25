@@ -525,8 +525,9 @@ YAML 子集: 嵌套 map/列表/引号标量/注释/类型自动识别。
 ## 17. 与 Paper 的差异(现状)
 
 - 文本为 String(§ 颜色码), 无 Adventure Component。
-- ItemMeta 的 displayName/enchants/damage/lore/unbreakable/glint 均随玩家背包落盘持久;
-  注意: 经容器(箱子/熔炉等)搬运到非玩家槽位后, lore/unbreakable/glint 不随容器槽持久化(容器槽组件存储暂只含 displayName/enchants/damage/药水/纹饰)。
+- ItemMeta 全部组件(displayName/enchants/damage/lore/unbreakable/glint)全链路持久:
+  玩家背包 + 箱子/木桶/潜影盒/末影箱/熔炉/漏斗/发射器/酿造台(BE NBT components) + 光标/掉落物搬运。
+  例外: 铁砧/锻造台/切石机/砂轮/附魔台等离散槽位处理时 lore/unbreakable/glint 会丢失(仍保留附魔/改名/耐久)。
 - 自定义 Inventory 不支持强制放置光标物品的高阶操作(QUICK_CRAFT 拖拽走原生逻辑)。
 - 事件 60+ 类已全部接线(见总表); 未接线事件触发时会静默跳过。
-- PDC 值以 String 序列化, 类型为便利封装。
+- PDC 值以 String 序列化, 类型为便利封装; 随玩家 .dat 的 CharunCorePluginData 复合标签落盘。
