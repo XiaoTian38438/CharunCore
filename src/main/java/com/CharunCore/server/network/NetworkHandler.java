@@ -72,7 +72,6 @@ import com.CharunCore.server.world.entity.MobEntity;
 import com.CharunCore.server.world.entity.PotionEntity;
 import com.CharunCore.server.world.entity.TridentEntity;
 import com.CharunCore.server.worldgen.DensityRouterChunkGenerator;
-import com.CharunCore.server.worldgen.structure.StructureManager;
 import com.CharunCore.server.worldgen.structure2.BiomeTagResolver;
 import com.CharunCore.server.worldgen.structure2.LootTableLoader;
 import com.CharunCore.server.worldgen.structure2.RandomSpreadStructurePlacement;
@@ -2756,9 +2755,12 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 long seed = WorldManager.getSeed();
                 // 先走数据驱动结构集(random_spread 类，与其生成器一致)
                 int[] result = locateStructure(structureName, playerChunkX, playerChunkZ, seed);
-                // stronghold 用 concentric_rings 放置(结构集无法表示)，回退到与生成器一致的 legacy 数学
+                // stronghold 用 concentric_rings 放置(结构集无法表示)。
+                // #9: 曾回退到旧 StructureManager.findNearest 的手写环近似数学, 与生成器实际使用的
+                // ConcentricRingsStructurePlacement(ringPositions)不一致 -> 定位到从未生成的位置。
+                // 现直接读生成器同源 ringPositions 取最近环点。
                 if (result == null && (structureName.equals("stronghold") || structureName.equals("strongholds"))) {
-                    result = StructureManager.findNearest("stronghold", playerChunkX, playerChunkZ, seed);
+                    result = locateStrongholdRing(playerChunkX, playerChunkZ, seed);
                 }
                 if (result == null) {
                     sendFeedback("未找到结构: " + structureName, "red");
@@ -10961,8 +10963,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         int chunkZ = (int) Math.floor(this.z) >> 4;
         int[] found = null;
         if (this.currentDim == DimensionType.OVERWORLD) {
-            found = StructureManager.findNearest(
-                    "stronghold", chunkX, chunkZ, WorldManager.getSeed());
+            // #9: 与生成器同源的同心环定位(旧 findNearest 环近似数学与实际生成不一致)
+            found = locateStrongholdRing(chunkX, chunkZ, WorldManager.getSeed());
         }
 
         double tx, tz;
@@ -11632,6 +11634,25 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             }
         }
         return null;
+    }
+
+    /** #9: 要塞定位 —— 与生成器同源(DensityRouterChunkGenerator.isStrongholdRingChunk 使用
+     *  同一 StructureSet.get("strongholds").getRings().ringPositions(seed)), 取距玩家最近的环点。 */
+    private int[] locateStrongholdRing(int playerChunkX, int playerChunkZ, long seed) {
+        StructureSet set = StructureSet.get("strongholds");
+        if (set == null || set.getRings() == null) return null;
+        long bestDist = Long.MAX_VALUE;
+        int[] best = null;
+        for (int[] cp : set.getRings().ringPositions(seed)) {
+            long dx = (long) cp[0] - playerChunkX;
+            long dz = (long) cp[1] - playerChunkZ;
+            long dist = dx * dx + dz * dz;
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = cp;
+            }
+        }
+        return best;
     }
 
     public int[] locateStructure(String name, int playerChunkX, int playerChunkZ, long seed) {
@@ -12486,11 +12507,18 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         // 成就系统：登录后下发全量成就树与进度 (P12)
         AdvancementManager.onLogin(this);
 
-        // Keep-alive scheduler: 每秒探测, 30 秒无应答判超时断开
+        // Keep-alive scheduler: 每秒探测, 60 秒无应答判超时断开。
+        // #7: 大量区块下发时客户端网络线程被压缩/解码堵住, 应答会延迟到 30s+,
+        // 曾被误判超时踢出("生成大量区块时总是莫名断开") -> 区块队列积压期间豁免超时。
         ctx.executor().scheduleAtFixedRate(() -> {
             if (ctx.channel().isActive()) {
                 long now = System.currentTimeMillis();
-                if (now - lastKeepaliveResponse > 30000) {
+                if (now - lastKeepaliveResponse > 60000) {
+                    boolean chunkBurst = !pendingChunkSends.isEmpty();
+                    if (chunkBurst) {
+                        lastKeepaliveResponse = now - 45000; // 积压期间续期, 不累计到下次
+                        return;
+                    }
                     System.out.println("[网络] " + username + " keep-alive 超时, 断开连接");
                     ctx.close();
                     return;

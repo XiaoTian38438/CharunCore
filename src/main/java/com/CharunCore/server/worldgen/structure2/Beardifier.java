@@ -104,6 +104,10 @@ public final class Beardifier {
         minX = Math.max(minX, baseX); maxX = Math.min(maxX, baseX + 15);
         minZ = Math.max(minZ, baseZ); maxZ = Math.min(maxZ, baseZ + 15);
 
+        // Bug#2: 回填的地基要"地表化" —— 原版 Beardifier 在密度层工作, 表面规则随后
+        // 正常长草; 我们是方块后处理, 直接填 stone 会留下一圈灰色石壁截断观感。
+        // 记录回填格, 收尾时给顶面 1 层草方块、下面 2 层泥土。
+        java.util.HashSet<Long> filled = new java.util.HashSet<>();
         for (int x = minX; x <= maxX; x++) {
             for (int z = minZ; z <= maxZ; z++) {
                 for (int y = yMin; y <= yMax; y++) {
@@ -112,11 +116,39 @@ public final class Beardifier {
                         int cur = level.getBlock(x, y, z);
                         if (cur == 0) {
                             level.setBlock(x, y, z, y < 0 ? deepslate : stone);
+                            filled.add(((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFFF) << 12) | (y & 0xFFFL));
                         }
                     } else if (d < -0.08) {
                         int cur = level.getBlock(x, y, z);
                         if (cur != 0 && isCarvable(cur)) {
                             level.setBlock(x, y, z, 0);
+                        }
+                    }
+                }
+            }
+        }
+        if (!filled.isEmpty()) {
+            int grass = BlockStateHelper.getDefault("grass_block");
+            int dirt = BlockStateHelper.getDefault("dirt");
+            for (long pk : filled) {
+                int x = (int) (pk >> 38) & 0x3FFFFFF;
+                int z = (int) (pk >> 12) & 0x3FFFFFF;
+                int y = (int) pk & 0xFFF;
+                boolean aboveFilled = filled.contains((((long) (x & 0x3FFFFFF)) << 38)
+                    | (((long) (z & 0x3FFFFFF)) << 12) | ((y + 1) & 0xFFF));
+                if (aboveFilled) continue;
+                int above = level.getBlock(x, y + 1, z);
+                String an = BlockStateHelper.getName(above);
+                boolean airAbove = above == 0 || (an != null && (an.endsWith("air") || an.endsWith("leaves")
+                    || an.endsWith("log") || an.endsWith("water")));
+                if (airAbove) {
+                    level.setBlock(x, y, z, grass);
+                    // 顶面下面两层回填改泥土, 过渡自然
+                    for (int dy = 1; dy <= 2; dy++) {
+                        long belowKey = (((long) (x & 0x3FFFFFF)) << 38)
+                            | (((long) (z & 0x3FFFFFF)) << 12) | ((y - dy) & 0xFFF);
+                        if (filled.contains(belowKey)) {
+                            level.setBlock(x, y - dy, z, dirt);
                         }
                     }
                 }

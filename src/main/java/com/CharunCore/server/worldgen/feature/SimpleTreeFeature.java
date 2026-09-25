@@ -1,7 +1,7 @@
 package com.CharunCore.server.worldgen.feature;
 
-import com.CharunCore.server.world.chunk.Chunk;
 import com.CharunCore.server.utils.BlockStateHelper;
+import com.CharunCore.server.world.chunk.Chunk;
 import com.CharunCore.server.world.gen.RandomSource;
 import com.CharunCore.server.worldgen.WorldGenLevel;
 
@@ -39,6 +39,15 @@ public class SimpleTreeFeature {
         return placeTree(singleChunkLevel, x, y, z, type, random);
     }
 
+    /** 树干行进受阻判定: 树叶不阻挡(原版树干可穿过/覆盖邻近树的树叶), 实心地形才中止。
+     *  曾无条件 return false -> 密林中树干撞上邻树树冠即弃置 = 大量"断木"。 */
+    private static boolean trunkBlocked(WorldGenLevel level, int x, int y, int z) {
+        int s = level.getBlock(x, y, z);
+        if (s == 0) return false;
+        String n = BlockStateHelper.getName(s);
+        return n == null || !n.contains("leaves");
+    }
+
     public static boolean placeTree(WorldGenLevel level, int x, int y, int z, TreeType type, RandomSource random) {
         if (type == TreeType.SPRUCE) return placeSpruce(level, x, y, z, random);
         if (type == TreeType.DARK_OAK) return placeDarkOak(level, x, y, z, random);
@@ -58,7 +67,7 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (level.getBlock(x, by, z) != 0 && dy > 0) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
             level.setBlock(x, by, z, logId);
         }
 
@@ -121,28 +130,50 @@ public class SimpleTreeFeature {
     }
 
     private static boolean placeSpruce(WorldGenLevel level, int x, int y, int z, RandomSource random) {
-        int height = 6 + random.nextInt(4);
+        // 原版云杉两种形态: pine(高细塔形, 老生长针叶林/云杉林 50%) 与普通 spruce(矮胖)
+        boolean pine = random.nextInt(2) == 0;
+        int height = pine ? 8 + random.nextInt(5) : 6 + random.nextInt(4);
         if (level.getBlock(x, y, z) != 0) return false;
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (level.getBlock(x, by, z) != 0 && dy > 0) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
             level.setBlock(x, by, z, SPRUCE_LOG);
         }
 
-        int leafBase = y + height - 2;
-        for (int layer = 0; layer < 4; layer++) {
-            int ly = leafBase + layer;
-            int radius = 2 - (layer / 2);
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    if (dx == 0 && dz == 0 && layer < 3) continue;
-                    int bx = x + dx;
-                    int bz = z + dz;
-                    if (level.getBlock(bx, ly, bz) != 0) continue;
-                    int d = Math.abs(dx) + Math.abs(dz);
-                    if (d > radius) continue;
-                    level.setBlock(bx, ly, bz, SPRUCE_LEAVES);
+        if (pine) {
+            // pine: 自顶向下每 2 层一个叶环, 半径 0(尖) -> 1 -> 1 -> 2 -> 2 ...
+            int topY = y + height - 1;
+            for (int ly = topY; ly >= y + 2; ly--) {
+                int fromTop = topY - ly;
+                if (fromTop > 0 && fromTop % 2 != 0) continue; // 叶环间隔一层
+                int radius = fromTop == 0 ? 0 : Math.min(2, 1 + fromTop / 4);
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dz = -radius; dz <= radius; dz++) {
+                        int d = Math.abs(dx) + Math.abs(dz);
+                        if (d > radius) continue;
+                        int bx = x + dx;
+                        int bz = z + dz;
+                        if (level.getBlock(bx, ly, bz) != 0) continue;
+                        level.setBlock(bx, ly, bz, SPRUCE_LEAVES);
+                    }
+                }
+            }
+        } else {
+            int leafBase = y + height - 2;
+            for (int layer = 0; layer < 4; layer++) {
+                int ly = leafBase + layer;
+                int radius = 2 - (layer / 2);
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dz = -radius; dz <= radius; dz++) {
+                        if (dx == 0 && dz == 0 && layer < 3) continue;
+                        int bx = x + dx;
+                        int bz = z + dz;
+                        if (level.getBlock(bx, ly, bz) != 0) continue;
+                        int d = Math.abs(dx) + Math.abs(dz);
+                        if (d > radius) continue;
+                        level.setBlock(bx, ly, bz, SPRUCE_LEAVES);
+                    }
                 }
             }
         }
@@ -221,7 +252,7 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (level.getBlock(x, by, z) != 0 && dy > 0) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
             level.setBlock(x, by, z, JUNGLE_LOG);
         }
 
@@ -298,7 +329,7 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (level.getBlock(x, by, z) != 0 && dy > 0) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
             level.setBlock(x, by, z, ACACIA_LOG);
         }
 
@@ -331,7 +362,7 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (level.getBlock(x, by, z) != 0 && dy > 0) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
             level.setBlock(x, by, z, CHERRY_LOG);
         }
 
@@ -370,7 +401,7 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (level.getBlock(x, by, z) != 0 && dy > 0) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
             level.setBlock(x, by, z, OAK_LOG);
         }
 

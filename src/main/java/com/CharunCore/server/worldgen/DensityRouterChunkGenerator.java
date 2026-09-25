@@ -1264,8 +1264,16 @@ public final class DensityRouterChunkGenerator {
         final int MIN_TREE_DIST = 3;
         java.util.List<int[]> placed = new java.util.ArrayList<>();
         for (int attempt = 0; attempt < 64; attempt++) {
+            // 巨冠树(黑橡木/丛林: 2x2 树干 + 半径 3 树冠)需要 3 格内缩, 其余 2 格,
+            // 否则树冠被区块边界裁掉
             int lx = 2 + rng.nextInt(12);
             int lz = 2 + rng.nextInt(12);
+            int probeBiome = colBiome[lz * 16 + lx];
+            TreeType probeType = SimpleTreeFeature.biomeTreeType(probeBiome);
+            if (probeType == TreeType.DARK_OAK || probeType == TreeType.JUNGLE) {
+                lx = 3 + rng.nextInt(10);
+                lz = 3 + rng.nextInt(10);
+            }
             int colIdx = lz * 16 + lx;
             int tsy = topSolidY[colIdx];
             if (tsy < SEA_LEVEL || tsy >= MAX_Y - 12) continue;

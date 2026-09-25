@@ -1,11 +1,12 @@
 package com.CharunCore.server.world.entity;
 
+import java.util.Random;
+
 import com.CharunCore.server.Main;
 import com.CharunCore.server.network.NetworkHandler;
+import com.CharunCore.server.utils.BlockManager;
 import com.CharunCore.server.world.DimensionType;
 import com.CharunCore.server.world.ExplosionEngine;
-import com.CharunCore.server.utils.BlockManager;
-import java.util.Random;
 
 public class MobEntity extends LivingEntity {
     public final String entityName;
@@ -213,6 +214,19 @@ public class MobEntity extends LivingEntity {
     @Override
     public void tick() {
         super.tick();
+        // #4 防卡地: 脚底陷入实心方块时上浮校正(结构方块生成于脚下/区块更新后可能被埋)。
+        if (deathTime == 0 && isSolidAt(x, y + 0.1, z)) {
+            int fy = (int) Math.floor(y);
+            for (int i = 0; i < 3 && fy < 319; i++) {
+                if (!isSolidAt(x, fy + 0.1, z)) break;
+                fy++;
+            }
+            if (!isSolidAt(x, fy + 0.1, z)) {
+                y = fy + 1.001;
+                vy = 0;
+                needsTeleport = true;
+            }
+        }
         if (entityName.equals("villager")) villagerRestockIfDue();
 
         // 猪灵以物易物(barter): 非战斗状态下, 检测 4 格内金锭掉落物并拾取;
