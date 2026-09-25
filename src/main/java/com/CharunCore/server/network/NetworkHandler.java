@@ -203,7 +203,270 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private final java.util.Map<Integer, MerchantSession> openMerchants = new java.util.concurrent.ConcurrentHashMap<>();
     /** 当前玩家打开的村民交易窗口（select_trade 无 windowId 字段，靠此定位）。 */
     public int merchantWindowId = -1;
+    /** 插件自定义容器: windowId → Inventory (plugin.api)。点击/关闭/槽位读写全链路路由。 */
+    final java.util.Map<Integer, com.CharunCore.server.plugin.api.Inventory> openPluginMenus =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.Map<String, Long> digStarts = new java.util.concurrent.ConcurrentHashMap<>();
+
+    // ── 插件自定义容器 (plugin.api.Inventory) ────────────────────────────────
+
+    /** 打开插件菜单: 分配 windowId + 0x39 open_screen + 0x12 container_set_content。 */
+    public void openPluginInventory(com.CharunCore.server.plugin.api.Inventory inv) {
+        if (ctx == null || !ctx.channel().isActive()) return;
+        int windowId = nextWindowId();
+        openPluginMenus.put(windowId, inv);
+        inv.registerOpenWindow(windowId, this);
+        sendPluginMenuOpen(windowId, inv);
+        sendPluginMenuContent(windowId, inv);
+    }
+
+    private void sendPluginMenuOpen(int windowId, com.CharunCore.server.plugin.api.Inventory inv) {
+        final int size = inv.getSize();
+        String menuType = switch (size) {
+            case 9 -> "generic_9x1";
+            case 18 -> "generic_9x2";
+            case 36 -> "generic_9x4";
+            case 45 -> "generic_9x5";
+            case 54 -> "generic_9x6";
+            default -> "generic_9x3";
+        };
+        final String title = inv.getTitle();
+        sendPacket(ctx, 0x39, pb -> {
+            pb.writeVarInt(windowId);
+            pb.writeVarInt(com.CharunCore.server.utils.RegistryHelper.menuType(menuType));
+            pb.writeAnonymousNbt(org.cloudburstmc.nbt.NbtMap.builder().putString("text", title).build());
+        });
+    }
+
+    /** 重发菜单内容(0x12)。插件 setItem 后由 Inventory.refresh 调用。 */
+    public void refreshPluginMenu(com.CharunCore.server.plugin.api.Inventory inv) {
+        for (java.util.Map.Entry<Integer, com.CharunCore.server.plugin.api.Inventory> e
+                : openPluginMenus.entrySet()) {
+            if (e.getValue() == inv) {
+                sendPluginMenuContent(e.getKey(), inv);
+                return;
+            }
+        }
+    }
+
+    /** 重发菜单标题(重新 open_screen)。 */
+    public void refreshPluginWindowTitle(com.CharunCore.server.plugin.api.Inventory inv) {
+        for (java.util.Map.Entry<Integer, com.CharunCore.server.plugin.api.Inventory> e
+                : openPluginMenus.entrySet()) {
+            if (e.getValue() == inv) {
+                sendPluginMenuOpen(e.getKey(), inv);
+                return;
+            }
+        }
+    }
+
+    /** 服务端强制关闭插件菜单(0x13 close_container + 状态清理)。 */
+    public void closePluginMenu(com.CharunCore.server.plugin.api.Inventory inv) {
+        for (java.util.Map.Entry<Integer, com.CharunCore.server.plugin.api.Inventory> e
+                : openPluginMenus.entrySet()) {
+            if (e.getValue() == inv) {
+                int windowId = e.getKey();
+                openPluginMenus.remove(windowId);
+                if (ctx != null && ctx.channel().isActive()) {
+                    sendPacket(ctx, 0x13, pb -> pb.writeByte(0));
+                }
+                firePluginMenuClose(windowId, inv);
+                return;
+            }
+        }
+    }
+
+    private void firePluginMenuClose(int windowId, com.CharunCore.server.plugin.api.Inventory inv) {
+        inv.unregisterOpenWindow(windowId, this);
+        // 光标物品退回背包(关窗防丢)
+        if (carriedItemCount > 0) {
+            returnSlotToPlayer(carriedItemId, carriedItemCount, carriedSnapshot());
+            carriedItemId = 0;
+            carriedItemCount = 0;
+            sendCarriedItem();
+        }
+        inv.fireClose(this);
+    }
+
+    /** 0x12 container_set_content 全量下发插件菜单 + 玩家背包区。 */
+    private void sendPluginMenuContent(int windowId, com.CharunCore.server.plugin.api.Inventory inv) {
+        if (ctx == null || !ctx.channel().isActive()) return;
+        final int size = inv.getSize();
+        final int total = size + 36;
+        final int stateId = ++containerStateCounter;
+        sendPacket(ctx, 0x12, pb -> {
+            pb.writeVarInt(windowId);
+            pb.writeVarInt(stateId);
+            pb.writeVarInt(total);
+            for (int s = 0; s < size; s++) {
+                int id = inv.slotId(s);
+                int count = inv.slotCount(s);
+                if (id <= 0 || count <= 0) {
+                    pb.writeVarInt(0);
+                } else {
+                    writePluginItemMeta(pb, id, count, inv.slotMeta(s));
+                }
+            }
+            for (int ps = 9; ps < 45; ps++) {
+                writePlayerSlotInline(pb, ps);
+            }
+        });
+    }
+
+    private int containerStateCounter = 1;
+
+    /** 插件菜单窗口槽 → 玩家数据槽(菜单区返回 -1)。 */
+    private int pluginMenuPlayerSlot(com.CharunCore.server.plugin.api.Inventory inv, int slot) {
+        int size = inv.getSize();
+        if (slot < size) return -1;
+        int rel = slot - size;
+        return rel < 27 ? rel + 9 : rel - 27;
+    }
+
+    /** 全服广播任意 clientbound 包(插件底层通道 Packets/Entity 使用)。 */
+    public static void broadcastAll(int packetId, java.util.function.Consumer<com.CharunCore.server.network.protocol.PacketBuffer> writer) {
+        for (NetworkHandler h : players.values()) {
+            if (h.ctx == null || !h.ctx.channel().isActive()) continue;
+            h.sendPacket(h.ctx, packetId, writer);
+        }
+    }
+
+    /** 玩家背包第一个空槽(快捷栏+主背包+装备区), 无则 -1。 */
+    public int firstEmptyInventorySlot() {
+        if (data == null) return -1;
+        for (int i = 0; i < 46; i++) {
+            if (data.inventoryIds[i] <= 0 || data.inventoryCounts[i] <= 0) return i;
+        }
+        return -1;
+    }
+
+    /** plugin.api.ItemMeta → 内部 ItemMeta(附魔名转 id)。 */
+    private ItemMeta toInternalMeta(com.CharunCore.server.plugin.api.ItemMeta pm) {
+        if (pm == null || pm.isEmpty()) return ItemMeta.EMPTY;
+        java.util.Map<Integer, Integer> ench = new java.util.HashMap<>();
+        for (java.util.Map.Entry<String, Integer> e : pm.getEnchants().entrySet()) {
+            int id = com.CharunCore.server.utils.BlockManager.getEnchantId(e.getKey());
+            if (id > 0) ench.put(id, e.getValue());
+        }
+        return ItemMeta.of(ench, null,
+                pm.hasDisplayName() ? pm.getDisplayName() : null,
+                pm.getDamage(), -1, -1);
+    }
+
+    /** 内部 ItemMeta → plugin.api.ItemMeta(附魔 id 转名)。 */
+    private com.CharunCore.server.plugin.api.ItemMeta fromInternalMeta(ItemMeta m) {
+        if (m == null || m.isEmpty()) return null;
+        com.CharunCore.server.plugin.api.ItemMeta out = new com.CharunCore.server.plugin.api.ItemMeta();
+        if (m.customName() != null && !m.customName().isEmpty()) out.setDisplayName(m.customName());
+        if (m.damage() > 0) out.setDamage(m.damage());
+        for (java.util.Map.Entry<Integer, Integer> e : m.enchants().entrySet()) {
+            String name = com.CharunCore.server.utils.BlockManager.getEnchantName(e.getKey());
+            if (name != null) out.addEnchant(name, e.getValue());
+        }
+        return out;
+    }
+
+    /** 玩家背包区(槽 9-44)单槽内联写入。 */
+    private void writePlayerSlotInline(com.CharunCore.server.network.protocol.PacketBuffer pb, int ps) {
+        int id = data.inventoryIds[ps];
+        int count = data.inventoryCounts[ps];
+        if (id <= 0 || count <= 0) {
+            pb.writeVarInt(0);
+        } else if (hasExtSlotMeta(ps)) {
+            writePluginItemMeta(pb, id, count, extSlotMeta(ps));
+        } else {
+            ItemMeta m = playerSlotMeta(ps);
+            if (m.isEmpty()) {
+                pb.writeSlot(id, count);
+            } else {
+                writeStackWithMeta(pb, id, count, m);
+            }
+        }
+    }
+
+    /** 玩家槽位是否带扩展组件(lore/unbreakable/glint)。 */
+    private boolean hasExtSlotMeta(int ps) {
+        return data != null && ps >= 0 && ps < 46
+                && ((data.inventoryLore[ps] != null && !data.inventoryLore[ps].isEmpty())
+                    || data.inventoryUnbreakable[ps] || data.inventoryGlint[ps] != 0);
+    }
+
+    /** data 三数组 + 内部组件 → 插件 ItemMeta(发送与序列化统一入口)。 */
+    private com.CharunCore.server.plugin.api.ItemMeta extSlotMeta(int ps) {
+        com.CharunCore.server.plugin.api.ItemMeta pm = new com.CharunCore.server.plugin.api.ItemMeta();
+        if (data.inventoryCustomName[ps] != null) pm.setDisplayName(data.inventoryCustomName[ps]);
+        if (data.inventoryDamage[ps] > 0) pm.setDamage(data.inventoryDamage[ps]);
+        if (data.inventoryLore[ps] != null) {
+            for (String line : data.inventoryLore[ps].split("\n", -1)) pm.addLoreLine(line);
+        }
+        pm.setUnbreakable(data.inventoryUnbreakable[ps]);
+        pm.setGlintOverride(data.inventoryGlint[ps] == 0 ? null : data.inventoryGlint[ps] > 0);
+        if (data.inventoryEnchants[ps] != null) {
+            for (java.util.Map.Entry<Integer, Integer> e : data.inventoryEnchants[ps].entrySet()) {
+                String name = com.CharunCore.server.utils.BlockManager.getEnchantName(e.getKey());
+                if (name != null) pm.addEnchant(name, e.getValue());
+            }
+        }
+        return pm;
+    }
+
+    /**
+     * 插件 ItemStack 组件完整写入 (plugin.api.ItemMeta → 774 组件)。
+     * 组件表(protocol.json SlotComponentType): 3=damage 4=unbreakable 6=custom_name
+     * 11=lore 13=enchantments 21=enchantment_glint_override。
+     */
+    private void writePluginItemMeta(com.CharunCore.server.network.protocol.PacketBuffer pb,
+                                     int id, int count,
+                                     com.CharunCore.server.plugin.api.ItemMeta meta) {
+        if (count <= 0 || id <= 0) { pb.writeVarInt(0); return; }
+        boolean hasName = meta != null && meta.hasDisplayName();
+        boolean hasLore = meta != null && meta.hasLore();
+        boolean hasEnch = meta != null && meta.hasEnchants();
+        boolean hasDamage = meta != null && meta.getDamage() > 0;
+        boolean hasUnbreak = meta != null && meta.isUnbreakable();
+        boolean hasGlint = meta != null && meta.getGlintOverride() != null;
+        int nSet = (hasName ? 1 : 0) + (hasLore ? 1 : 0) + (hasEnch ? 1 : 0)
+                + (hasDamage ? 1 : 0) + (hasUnbreak ? 1 : 0) + (hasGlint ? 1 : 0);
+        pb.writeVarInt(count);
+        pb.writeVarInt(id);
+        pb.writeVarInt(nSet);
+        pb.writeVarInt(0);
+        if (hasDamage) {
+            pb.writeVarInt(3);
+            pb.writeVarInt(meta.getDamage());
+        }
+        if (hasUnbreak) {
+            pb.writeVarInt(4);
+            pb.writeAnonymousNbt(org.cloudburstmc.nbt.NbtMap.builder().build());
+        }
+        if (hasName) {
+            pb.writeVarInt(6);
+            pb.writeAnonymousNbt(org.cloudburstmc.nbt.NbtMap.builder()
+                    .putString("text", meta.getDisplayName()).build());
+        }
+        if (hasLore) {
+            java.util.List<String> lore = meta.getLore();
+            pb.writeVarInt(11);
+            pb.writeVarInt(lore.size());
+            for (String line : lore) {
+                pb.writeAnonymousNbt(org.cloudburstmc.nbt.NbtMap.builder()
+                        .putString("text", line).build());
+            }
+        }
+        if (hasEnch) {
+            pb.writeVarInt(13);
+            pb.writeVarInt(meta.getEnchants().size());
+            for (java.util.Map.Entry<String, Integer> e : meta.getEnchants().entrySet()) {
+                int enchId = com.CharunCore.server.utils.BlockManager.getEnchantId(e.getKey());
+                pb.writeVarInt(Math.max(0, enchId));
+                pb.writeVarInt(e.getValue());
+            }
+        }
+        if (hasGlint) {
+            pb.writeVarInt(21);
+            pb.writeBoolean(meta.getGlintOverride());
+        }
+    }
 
     /** 村民交易会话状态。容器槽布局：0,1=结果 2,3=输入1 4,5=输入2。 */
     private static final class MerchantSession {
@@ -255,8 +518,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private int invulnTicks = 0;
     /** 环境伤害(溺水/岩浆/火/窒息/仙人掌等)按每秒施加, 累计到 20 tick 触发一次, 原版每秒而非每 tick。 */
     private int envDamageTimer = 0;
-    /** 着火剩余刻数: >0 时持续每秒灼伤, 离开火/岩浆后仍继续(原版 fireTicks) */
-    private int fireTicks = 0;
+    /** 着火剩余刻数: >0 时持续每秒灼伤, 离开火/岩浆后仍继续(原版 fireTicks)。插件可读写。 */
+    public int fireTicks = 0;
     /** 当前生效的状态效果: key=效果名(去掉 minecraft: 前缀), value={放大器, 剩余刻数} */
     private final java.util.Map<String,int[]> activeEffects = new java.util.HashMap<>();
     private int effectTickCounter = 0;
@@ -290,6 +553,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     public double lastDeathX = 0, lastDeathY = 0, lastDeathZ = 0;
     public long lastPingTime = System.currentTimeMillis();
     public boolean allowFlight = false;
+    /** 客户端飞行状态(abilities 0x02)。插件经 Player.setFlying 控制。 */
+    public boolean flying = false;
     public float flySpeed = 0.05f;
     public float walkSpeed = 0.1f;
 
@@ -305,8 +570,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     /** Which hotbar slot is currently selected (0-8). Updated by SetCarriedItem. */
     public short heldItemSlot = 0;
 
-    /** Sneak state; used when broadcasting entity metadata to others. */
-    private boolean isSneaking = false;
+    /** Sneak state; used when broadcasting entity metadata to others. 插件可读。 */
+    public boolean isSneaking = false;
 
     /** Elytra fall-flying state; set by client start_elytra_flying action. */
     private boolean fallFlying = false;
@@ -1095,6 +1360,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         else if (id == 0x3C) { // arm_animation (serverbound)
             int hand = in.readVarInt(); // 0 = main hand, 1 = off hand
             int animId = (hand == 0) ? 0 : 3; // 0=swing main, 3=swing off
+            EVENTS.fire(new com.CharunCore.server.plugin.event.events.PlayerAnimationEvent(this));
             broadcastAnimation(this.eid, animId);
             this.isBlocking = false;
         }
@@ -1143,8 +1409,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             else if (action == 4) { EVENTS.fire(new PlayerToggleSprintEvent(this, false)); sprinting = false; }
             else if (action == 6) {                     // START_ELYTRA_FLYING
                 if (!fallFlying && hasElytraEquipped() && !onGround) {
-                    fallFlying = true;
-                    broadcastElytra();
+                    var flightEvent = EVENTS.fire(new com.CharunCore.server.plugin.event.events.PlayerToggleFlightEvent(this, true));
+                    if (!flightEvent.isCancelled()) {
+                        fallFlying = true;
+                        broadcastElytra();
+                    }
                 }
             }
         }
@@ -1337,6 +1606,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 // 曾只判 existingBlock==0 -> 点向非实心方块/空中的面也放火(隔空放 -> 立刻碎成掉落物)。
                 if (existingBlock == 0 && face >= 0 && face <= 5
                         && targetStateId != 0 && BlockStateHelper.isSolidOpaque(targetStateId)) {
+                    var igniteEvent = EVENTS.fire(new com.CharunCore.server.plugin.event.events.BlockIgniteEvent(fp[0], fp[1], fp[2]));
+                    if (igniteEvent.isCancelled()) return;
                     int fireState = com.CharunCore.server.world.FluidEngine.fireStateAt(this.currentDim, fp[0], fp[1], fp[2], 0);
                     WorldManager.setBlock(this.currentDim,fp[0], fp[1], fp[2], fireState);
                     broadcastBlockChange(this.currentDim, fp[0], fp[1], fp[2], fireState);
@@ -1352,6 +1623,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 // #45/#27 同上: 火焰弹也不能隔空放火(需紧贴被点击的实心方块面)。
                 if (existingBlock == 0 && face >= 0 && face <= 5
                         && targetStateId != 0 && BlockStateHelper.isSolidOpaque(targetStateId)) {
+                    var igniteEvent2 = EVENTS.fire(new com.CharunCore.server.plugin.event.events.BlockIgniteEvent(fp[0], fp[1], fp[2]));
+                    if (igniteEvent2.isCancelled()) return;
                     int fireState = com.CharunCore.server.world.FluidEngine.fireStateAt(this.currentDim, fp[0], fp[1], fp[2], 0);
                     WorldManager.setBlock(this.currentDim,fp[0], fp[1], fp[2], fireState);
                     broadcastBlockChange(this.currentDim, fp[0], fp[1], fp[2], fireState);
@@ -2185,6 +2458,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     }
                 }
             }
+            com.CharunCore.server.plugin.api.Inventory closedPlugin = openPluginMenus.remove(closedWindowId);
+            if (closedPlugin != null) firePluginMenuClose(closedWindowId, closedPlugin);
             ContainerStore.Pos closedChest = openChests.remove(closedWindowId);
             if (closedChest != null) {
                 ContainerStore.decrementViewers(closedChest); // P9-B2 陷阱箱查看者计数
@@ -2589,7 +2864,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void handleCommand(ChannelHandlerContext ctx,String cmd) {
         if (Server.get().getPluginManager()
-                .dispatchCommand(new PlayerSender(), cmd)) {
+                .dispatchCommand(new com.CharunCore.server.plugin.api.Player(this), cmd)) {
             return;
         }
         var cmdEvent = EVENTS.fire(new PlayerCommandPreprocessEvent(this, cmd));
@@ -3628,7 +3903,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 String[] args = new String[parts.length - 1];
                 System.arraycopy(parts, 1, args, 0, args.length);
                 for (String suggestion : pluginCommand.getExecutor()
-                        .onTabComplete(new PlayerSender(), cmd, args)) {
+                        .onTabComplete(new com.CharunCore.server.plugin.api.Player(this), cmd, args)) {
                     if (suggestion != null && suggestion.startsWith(partial)) {
                         result.add(suggestion);
                     }
@@ -3974,6 +4249,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (godMode) flags |= 0x01;
         if (allowFlight) flags |= 0x04;
         if (gameMode == 1) flags |= 0x08;
+        if (flying && allowFlight) flags |= 0x02;
         final int f = flags;
         sendPacket(ctx, 0x3e, pb -> {
             pb.writeByte((byte) f);
@@ -4574,6 +4850,17 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 itemId = data.inventoryIds[playerSlot];
                 itemCount = data.inventoryCounts[playerSlot];
             }
+        } else if (openPluginMenus.containsKey(windowId)) {
+            var pluginInv = openPluginMenus.get(windowId);
+            if (slot >= 0 && slot < pluginInv.getSize()) {
+                itemId = pluginInv.slotId(slot);
+                itemCount = pluginInv.slotCount(slot);
+            } else {
+                int playerSlot = pluginMenuPlayerSlot(pluginInv, slot);
+                if (playerSlot < 0 || playerSlot >= 46) return;
+                itemId = data.inventoryIds[playerSlot];
+                itemCount = data.inventoryCounts[playerSlot];
+            }
         } else {
             return;
         }
@@ -4584,6 +4871,19 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         // Bug4/33: 容器槽位也带组件下发(附魔/药水/改名物品在箱/炉等界面不再显示为白板)。
         // 预览槽(合成结果等)无存储组件, readSlotMeta 返回 EMPTY 走原路径。
         final boolean empty = itemId <= 0 || count <= 0;
+        var pluginInv0 = openPluginMenus.get(windowId);
+        if (pluginInv0 != null && slot >= 0 && slot < pluginInv0.getSize()) {
+            final com.CharunCore.server.plugin.api.ItemMeta pluginMeta =
+                    empty ? null : pluginInv0.slotMeta(slot);
+            final int fId = itemId, fCount = count;
+            sendPacket(ctx, 0x14, pb -> {
+                pb.writeVarInt(windowId);
+                pb.writeVarInt(0);
+                pb.writeShort(slot);
+                writePluginItemMeta(pb, fId, fCount, pluginMeta);
+            });
+            return;
+        }
         final ItemMeta m = empty ? ItemMeta.EMPTY : readSlotMeta(windowId, slot);
         final boolean hasMeta = !m.isEmpty();
         sendPacket(ctx, 0x14, pb -> {
@@ -4595,7 +4895,12 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             } else if (windowId == 0 && slot >= 1 && slot < 46 && !empty) {
                 // Bug35: 窗口0槽0是2x2合成结果槽(非玩家背包格), 曾走 writePlayerSlot
                 // 读恒空的 data.inventoryIds[0] -> 背包合成栏永远无输出预览。
-                writePlayerSlot(pb, slot);
+                // 插件扩展组件(lore/unbreakable/glint)槽走完整组件路径。
+                if (hasExtSlotMeta(slot)) {
+                    writePluginItemMeta(pb, itemId, count, extSlotMeta(slot));
+                } else {
+                    writePlayerSlot(pb, slot);
+                }
             } else {
                 pb.writeSlot(itemId, count);
             }
@@ -5056,6 +5361,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (p == null) return null;
         if (slot >= 0 && slot < 27) return ContainerStore.chest(p);
         if (isPartnerChestSlot(windowId, slot)) return ContainerStore.chest(openChestPartners.get(windowId));
+        return null;
+    }
+
+    /** 槽位所属箱子(或大箱子另一半)的坐标; 末影箱/玩家背包区返回 null。 */
+    private ContainerStore.Pos chestDataPosForSlot(int windowId, int slot) {
+        if (openEnderChests.containsKey(windowId)) return null;
+        if (slot >= 0 && slot < 27) return openChests.get(windowId);
+        if (isPartnerChestSlot(windowId, slot)) return openChestPartners.get(windowId);
         return null;
     }
 
@@ -5530,6 +5843,15 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private int[] getSlotItem(int windowId, int slot) {
+        var pluginInv = openPluginMenus.get(windowId);
+        if (pluginInv != null) {
+            if (slot >= 0 && slot < pluginInv.getSize()) {
+                return new int[]{pluginInv.slotId(slot), pluginInv.slotCount(slot)};
+            }
+            int ps = pluginMenuPlayerSlot(pluginInv, slot);
+            if (ps < 0 || ps >= 46) return new int[]{0, 0};
+            return new int[]{data.inventoryIds[ps], data.inventoryCounts[ps]};
+        }
         if (windowId == 0) {
             if (slot < 0 || slot >= 46) return new int[]{0, 0};
             return new int[]{data.inventoryIds[slot], data.inventoryCounts[slot]};
@@ -5687,6 +6009,15 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     /** 读任意窗口槽位的物品组件(无则 EMPTY)。 */
     private ItemMeta readSlotMeta(int windowId, int slot) {
+        var pluginInv = openPluginMenus.get(windowId);
+        if (pluginInv != null) {
+            if (slot >= 0 && slot < pluginInv.getSize()) {
+                com.CharunCore.server.plugin.api.ItemMeta pm = pluginInv.slotMeta(slot);
+                if (pm == null || pm.isEmpty()) return ItemMeta.EMPTY;
+                return toInternalMeta(pm);
+            }
+            return playerSlotMeta(pluginMenuPlayerSlot(pluginInv, slot));
+        }
         if (windowId == 0) return playerSlotMeta(slot);
         if (openCraftingGrids.containsKey(windowId)) {
             if (slot >= 1 && slot <= 9) {
@@ -5778,6 +6109,18 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     /** 写任意窗口槽位的物品组件; m 为 null/EMPTY 时清空。 */
     private void writeSlotMeta(int windowId, int slot, ItemMeta m) {
+        var pluginInv = openPluginMenus.get(windowId);
+        if (pluginInv != null) {
+            if (slot >= 0 && slot < pluginInv.getSize()) {
+                boolean empty = m == null || m.isEmpty();
+                pluginInv.writeSlotRaw(slot,
+                        pluginInv.slotId(slot), pluginInv.slotCount(slot),
+                        empty ? null : fromInternalMeta(m));
+            } else {
+                writePlayerSlotMeta(pluginMenuPlayerSlot(pluginInv, slot), m);
+            }
+            return;
+        }
         boolean empty = m == null || m.isEmpty();
         if (windowId == 0) { writePlayerSlotMeta(slot, m); return; }
         if (openCraftingGrids.containsKey(windowId)) {
@@ -5932,6 +6275,24 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
      *  需要保留/写入组件的场景必须走 setSlotItemFull。 */
     private void setSlotItem(int windowId, int slot, int itemId, int count) {
         boolean emptied = (itemId <= 0 || count <= 0);
+        var pluginInv = openPluginMenus.get(windowId);
+        if (pluginInv != null) {
+            if (slot >= 0 && slot < pluginInv.getSize()) {
+                boolean empty = pendingWriteMeta == null || pendingWriteMeta.isEmpty();
+                pluginInv.writeSlotRaw(slot, Math.max(itemId, 0), Math.max(count, 0),
+                        empty ? null : fromInternalMeta(pendingWriteMeta));
+                sendPluginMenuContent(windowId, pluginInv);
+            } else {
+                int ps = pluginMenuPlayerSlot(pluginInv, slot);
+                if (ps >= 0 && ps < 46) {
+                    writePlayerSlotMeta(ps, pendingWriteMeta);
+                    data.inventoryIds[ps] = itemId;
+                    data.inventoryCounts[ps] = count;
+                    sendSlotUpdateRaw(0, ps, itemId, count);
+                }
+            }
+            return;
+        }
         if (windowId == 0) {
             if (slot < 0 || slot >= 46) return;
             writePlayerSlotMeta(slot, pendingWriteMeta);
@@ -5969,6 +6330,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     pendingWriteMeta != null && !pendingWriteMeta.isEmpty() ? pendingWriteMeta.potion() : null,
                     pendingWriteMeta != null && !pendingWriteMeta.isEmpty() ? pendingWriteMeta.customName() : null);
                 cd.version++;
+                // #14: 容器内容变化 -> 邻接比较器(满度信号)重算。普通点击与 shift 均经此处写入。
+                ContainerStore.Pos notifyPos = chestDataPosForSlot(windowId, slot);
+                if (notifyPos != null) {
+                    RedstoneEngine.onBlockChanged(notifyPos.dim(), notifyPos.x(), notifyPos.y(), notifyPos.z());
+                }
             } else {
                 int ps = chestToPlayerSlot(windowId, slot);
                 if (ps < 0) return;
@@ -6174,6 +6540,25 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void handleContainerClick(int windowId, int slot, int button) {
         if (slot < 0) return;
+
+        var pluginInv0 = openPluginMenus.get(windowId);
+        if (pluginInv0 != null) {
+            com.CharunCore.server.plugin.api.InventoryClickContext pc =
+                    new com.CharunCore.server.plugin.api.InventoryClickContext(
+                            this, pluginInv0, slot, button,
+                            button == 1 ? com.CharunCore.server.plugin.api.InventoryClickContext.ClickType.PICKUP_HALF
+                                    : com.CharunCore.server.plugin.api.InventoryClickContext.ClickType.PICKUP);
+            pluginInv0.dispatchClick(pc);
+            if (pc.isCancelled()) {
+                sendPluginMenuContent(windowId, pluginInv0);
+                sendCarriedItem();
+                return;
+            }
+            if (pc.isHandled()) {
+                sendPluginMenuContent(windowId, pluginInv0);
+                return;
+            }
+        }
 
         if (openCraftingGrids.containsKey(windowId) && slot == 0) {
             handleCraftingResultClick(windowId, button);
@@ -6619,6 +7004,38 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private void handleShiftClick(int windowId, int slot) {
+        var pluginShift = openPluginMenus.get(windowId);
+        if (pluginShift != null) {
+            int size = pluginShift.getSize();
+            if (slot >= 0 && slot < size) {
+                // 菜单 → 玩家背包(入包失败部分掉落脚前, 不丢物品)
+                int itemId = pluginShift.slotId(slot);
+                int count = pluginShift.slotCount(slot);
+                if (itemId > 0 && count > 0) {
+                    com.CharunCore.server.plugin.api.ItemMeta pm = pluginShift.slotMeta(slot);
+                    returnSlotToPlayer(itemId, count, toInternalMeta(pm));
+                    pluginShift.clearSlotRaw(slot);
+                }
+            } else {
+                // 玩家背包 → 菜单第一个空位
+                int ps = pluginMenuPlayerSlot(pluginShift, slot);
+                if (ps >= 0 && ps < 46 && data.inventoryIds[ps] > 0 && data.inventoryCounts[ps] > 0) {
+                    int itemId = data.inventoryIds[ps];
+                    int count = data.inventoryCounts[ps];
+                    int target = pluginShift.firstEmpty();
+                    if (target >= 0) {
+                        ItemMeta sm = playerSlotMeta(ps);
+                        pluginShift.writeSlotRaw(target, itemId, count, fromInternalMeta(sm));
+                        data.inventoryIds[ps] = 0;
+                        data.inventoryCounts[ps] = 0;
+                        writePlayerSlotMeta(ps, null);
+                        sendSlotUpdateRaw(0, ps, 0, 0);
+                    }
+                }
+            }
+            sendPluginMenuContent(windowId, pluginShift);
+            return;
+        }
         if (openCraftingGrids.containsKey(windowId) && slot == 0) {
             craftAllFromResult(windowId);
             return;
@@ -7474,6 +7891,12 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (data.saturation > 0.0f) {
                 data.saturation = Math.max(0.0f, data.saturation - 1.0f);
             } else {
+                var foodEvent = EVENTS.fire(new com.CharunCore.server.plugin.event.events.FoodLevelChangeEvent(
+                        this, Math.max(0, data.food - 1)));
+                if (foodEvent.isCancelled()) {
+                    data.exhaustion = 0;
+                    return;
+                }
                 data.food = Math.max(0, data.food - 1);
                 sendHealthUpdate();
             }
@@ -7487,10 +7910,16 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 foodTickTimer++;
                 if (foodTickTimer >= 10) {
                     float heal = Math.min(data.saturation, 6.0f) / 6.0f;
-                    health = Math.min(20.0f, health + heal);
-                    addExhaustion(heal);
-                    foodTickTimer = 0;
-                    sendHealthUpdate();
+                    var regainEvent = EVENTS.fire(new com.CharunCore.server.plugin.event.events.EntityRegainHealthEvent(
+                            this, Math.min(20.0f - health, heal)));
+                    if (regainEvent.isCancelled()) {
+                        foodTickTimer = 0;
+                    } else {
+                        health = Math.min(20.0f, health + heal);
+                        addExhaustion(heal);
+                        foodTickTimer = 0;
+                        sendHealthUpdate();
+                    }
                 }
             } else if (data.food >= 18 && health < 20.0f) {
                 foodTickTimer++;
@@ -8444,7 +8873,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     /** 同步自身 onFire 元数据标志(索引0 bit0), 同时保留潜行(bit1)与姿态(索引6)。 */
-    private void syncOnFire() {
+    public void syncOnFire() {
         byte flags = 0;
         if (isSneaking) flags |= 0x02;
         if (fireTicks > 0) flags |= 0x01;
@@ -8641,7 +9070,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return getAttackDamage(wn);
     }
 
-    private void sendExperienceUpdate() {
+    public void sendExperienceUpdate() {
         // set_experience = 0x65 (0x66=update_health —— 曾误用 0x66 导致经验包被当血量包解码,
         // 捡经验时客户端越界断线; 0x64=entity_equipment 也不是经验包)。
         sendPacket(ctx, 0x65, pb -> {
@@ -9179,6 +9608,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }, 1, java.util.concurrent.TimeUnit.SECONDS);
         // 成就系统：进入维度事件 (P12)
         AdvancementManager.onEnterDimension(this, dimName);
+        EVENTS.fire(new com.CharunCore.server.plugin.event.events.PlayerChangedWorldEvent(this, dimName));
         this.x = targetX + 0.5;
         this.z = targetZ + 0.5;
         this.y = endPlatformY > 0
@@ -10653,7 +11083,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     /** 召雷: 向维度内玩家下发 lightning_bolt(add_entity type 77) 并对落点周围生物/玩家造成伤害与点燃。 */
-    public void strikeLightning(DimensionType dim, double x, double y, double z) {
+    public static void strikeLightning(DimensionType dim, double x, double y, double z) {
+        var lightningEvent = EVENTS.fire(new com.CharunCore.server.plugin.event.events.LightningStrikeEvent(
+                (float) x, (float) y, (float) z));
+        if (lightningEvent.isCancelled()) return;
         int lid = EntityManager.allocateId();
         for (NetworkHandler p : players.values()) {
             if (p.currentDim != dim) continue;
@@ -11547,6 +11980,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             sendFeedback("§c你无法在此休息, 附近有怪物", "white");
             return;
         }
+
+        var bedEvent = EVENTS.fire(new com.CharunCore.server.plugin.event.events.PlayerBedEnterEvent(this, x, y, z));
+        if (bedEvent.isCancelled()) return;
 
         Main.dayTime = 0;
         for (NetworkHandler p : players.values()) {
@@ -12760,6 +13196,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (slot < 0 || slot >= 46 || data.inventoryCounts[slot] <= 0) return;
         int itemId = data.inventoryIds[slot];
         String itemName = BlockManager.itemIdToName(itemId);
+        var consumeEvent = EVENTS.fire(new com.CharunCore.server.plugin.event.events.PlayerItemConsumeEvent(this, itemName));
+        if (consumeEvent.isCancelled()) return;
         sendSoundAt("minecraft:entity.player.burp", x, y, z, 0.5f, 1.0f);
         if (mode == 1) {
             String pt = data.inventoryPotion[slot];

@@ -37,3 +37,17 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+### 运行时产物/服务器数据(不入库) ###
+logs/
+picture/
+ops.json
+banned-players.json
+world/
+plugins/
+libs/
+cp_win.txt
+runcp.txt
+javac_args.txt
+tmp-truth/
+scripts/*.class

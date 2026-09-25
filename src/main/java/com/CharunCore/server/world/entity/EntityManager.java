@@ -69,6 +69,9 @@ public class EntityManager {
         if (entities.size() >= MAX_ENTITIES && !(e instanceof EnderDragonEntity)) {
             return;
         }
+        var spawnEvent = com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                new com.CharunCore.server.plugin.event.events.EntitySpawnEvent(e));
+        if (spawnEvent.isCancelled()) return;
         entities.put(e.id, e);
         if (e instanceof EnderDragonEntity) {
             for (int i = 1; i <= DRAGON_PART_COUNT; i++) partOwner.put(e.id + i, e.id);
@@ -89,6 +92,8 @@ public class EntityManager {
     public static void removeEntity(int id) {
         Entity e = entities.remove(id);
         if (e == null) return;
+        com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                new com.CharunCore.server.plugin.event.events.EntityDespawnEvent(e));
         if (e instanceof EnderDragonEntity) {
             for (int i = 1; i <= DRAGON_PART_COUNT; i++) partOwner.remove(e.id + i);
         }
@@ -208,6 +213,8 @@ public class EntityManager {
     public static void spawnItemDrop(double x, double y, double z, int itemId, int count) {
         if (itemId <= 0 || count <= 0) return;
         ItemEntity drop = new ItemEntity(allocateId(), x, y, z, itemId, count);
+        com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                new com.CharunCore.server.plugin.event.events.ItemSpawnEvent(drop));
         addEntity(drop);
     }
 

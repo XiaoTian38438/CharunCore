@@ -803,9 +803,14 @@ public class RedstoneEngine {
                 // 观察者从背面输出信号 (facing 是观察面)
                 return ("true".equals(BlockStateHelper.getProp(st, "powered"))
                         && oppositeDir(dir).equals(BlockStateHelper.getProp(st, "facing"))) ? 15 : 0;
-            case "repeater", "comparator":
+            case "repeater":
                 return ("true".equals(BlockStateHelper.getProp(st, "powered"))
                         && dir.equals(BlockStateHelper.getProp(st, "facing"))) ? 15 : 0;
+            case "comparator":
+                // #14 比较器模拟输出: 沿红石线传播 0-15 分级信号(原仅二值 15/0)。
+                if (!"true".equals(BlockStateHelper.getProp(st, "powered"))) return 0;
+                return dir.equals(BlockStateHelper.getProp(st, "facing"))
+                        ? comparatorOutputLevel(sx, sy, sz, st) : 0;
             default:
                 if (n.endsWith("_button")
                         || n.equals("pressure_plate")
@@ -1388,15 +1393,33 @@ public class RedstoneEngine {
     private static int inputLevelAt(int x, int y, int z) {
         int s = getState(x, y, z);
         if (s == 0) return 0;
-        if ("redstone_wire".equals(BlockStateHelper.getName(s))) {
+        String n = BlockStateHelper.getName(s);
+        if ("redstone_wire".equals(n)) {
             String p = BlockStateHelper.getProp(s, "power");
             return p != null ? Integer.parseInt(p) : 0;
+        }
+        // #14 比较器链: 背面是另一台比较器(其 facing 朝向本方)时读其模拟输出(深度受限防循环)。
+        if ("comparator".equals(n)) {
+            Integer depth = COMPARATOR_DEPTH.get();
+            int d = depth == null ? 0 : depth;
+            if (d >= 8) return 0;
+            COMPARATOR_DEPTH.set(d + 1);
+            try {
+                return comparatorOutputLevel(x, y, z, s);
+            } finally {
+                COMPARATOR_DEPTH.set(d);
+            }
         }
         return providesPower(s) ? 15 : 0;
     }
 
-    /** 计算比较器应输出状态; 无变化返回 -1 */
-    private static int updateComparatorState(int x, int y, int z, int state) {
+    private static final ThreadLocal<Integer> COMPARATOR_DEPTH = new ThreadLocal<>();
+
+    /**
+     * 比较器当前模拟输出强度 (0-15)。lit=false 时输出 0。
+     * 纯计算无副作用, 供 updateComparatorState 与 neighborOutputTo(线→电源读数)复用。
+     */
+    private static int comparatorOutputLevel(int x, int y, int z, int state) {
         String facing = BlockStateHelper.getProp(state, "facing");
         int[] back = facingOffset(facing);
         int[] left = facingOffset(switch (facing) {
@@ -1414,7 +1437,12 @@ public class RedstoneEngine {
                 inputLevelAt(x + left[0], y + left[1], z + left[2]),
                 inputLevelAt(x + right[0], y + right[1], z + right[2]));
         boolean subtract = "subtract".equals(BlockStateHelper.getProp(state, "mode"));
-        int out = subtract ? Math.max(0, backIn - sideMax) : (backIn >= sideMax ? backIn : 0);
+        return subtract ? Math.max(0, backIn - sideMax) : (backIn >= sideMax ? backIn : 0);
+    }
+
+    /** 计算比较器应输出状态; 无变化返回 -1 */
+    private static int updateComparatorState(int x, int y, int z, int state) {
+        int out = comparatorOutputLevel(x, y, z, state);
         boolean lit = out > 0;
         boolean curLit = "true".equals(BlockStateHelper.getProp(state, "powered"));
         if (lit == curLit) return -1;
@@ -1533,13 +1561,23 @@ public class RedstoneEngine {
         return 0;
     }
 
+    /**
+     * 原版容器满度信号: floor(Σ(count_i/maxStack_i) / slotCount * 14) + (非空 ? 1 : 0)。
+     * 按堆叠数折算而非按占用槽位 —— 单槽 32/64 的箱子读数为 8 而不是按槽位算出的 15/2。
+     */
     private static int fillSignal(int[] slots, int count) {
-        int filled = 0;
+        float fraction = 0.0f;
+        boolean nonEmpty = false;
         for (int i = 0; i < count; i++) {
-            if (slots[2 * i] > 0 && slots[2 * i + 1] > 0) filled++;
+            int id = slots[2 * i], cnt = slots[2 * i + 1];
+            if (id <= 0 || cnt <= 0) continue;
+            nonEmpty = true;
+            int maxStack = com.CharunCore.server.utils.BlockManager.getStackSize(id);
+            if (maxStack <= 0) maxStack = 64;
+            fraction += Math.min(1.0f, (float) cnt / maxStack);
         }
-        if (filled == 0) return 0;
-        return Math.max(1, Math.min(15, (int) Math.round(15.0 * filled / count)));
+        if (!nonEmpty) return 0;
+        return Math.min(15, (int) (fraction / count * 14.0f) + 1);
     }
 
     // ── 音符盒 (P8-#9) ───────────────────────────────────────────────────────

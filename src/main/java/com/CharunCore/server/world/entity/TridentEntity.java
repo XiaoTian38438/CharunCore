@@ -164,7 +164,7 @@ public class TridentEntity extends Entity {
 
         // 引雷: 雷暴中且命中生物 → 召雷
         if (channeling && Main.isThundering && livingTarget != null && thrower != null) {
-            thrower.strikeLightning(this.dim, x, y, z);
+            com.CharunCore.server.network.NetworkHandler.strikeLightning(this.dim, x, y, z);
         }
 
         if (loyalty > 0) { returning = true; returnDelay = 8; }

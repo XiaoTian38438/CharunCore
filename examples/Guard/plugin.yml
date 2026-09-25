@@ -1,0 +1,6 @@
+name: Guard
+version: 1.0.0
+main: com.example.guard.GuardPlugin
+api-version: '1.0'
+author: CharunCore
+description: 服务器保护示例插件 (事件取消演示: 防爆/防火烧/区域保护)

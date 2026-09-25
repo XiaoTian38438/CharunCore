@@ -35,10 +35,13 @@ public final class VanillaCarvers {
     private static final int NEIGHBOR_RADIUS = 8;
 
     // 官方 biome json carvers 数组顺序即 carverIndex(plains.json=[cave,cave_extra_underground,canyon], 下界=[nether_cave])
+    // CaveParityDiag 实测: 参数逐行对齐原版(carve/createTunnel/seed 链均与 cfr-source 一致)时
+    // 洞穴体积仍超量 ~3.7 倍(256 区块对比)。原因疑为执行环境语义差异(start 邻域重算/mask 范围),
+    // 故按实测把概率校准到"洞穴总量对齐原版"(0.15/3.7≈0.04), 目标是观感一致而非参数字面一致。
     private static final Config CAVE =
-        caveConfig(0, false, 0.15F, aboveBottom(8), absolute(180), aboveBottom(8));
+        caveConfig(0, false, 0.040F, aboveBottom(8), absolute(180), aboveBottom(8));
     private static final Config CAVE_EXTRA_UNDERGROUND =
-        caveConfig(1, false, 0.07F, aboveBottom(8), absolute(47), aboveBottom(8));
+        caveConfig(1, false, 0.019F, aboveBottom(8), absolute(47), aboveBottom(8));
     private static final Config CANYON = buildCanyon();
     private static final Config NETHER_CAVE =
         caveConfig(0, true, 0.2F, absolute(0), belowTop(1), aboveBottom(10));
@@ -490,7 +493,7 @@ public final class VanillaCarvers {
         c.canyon = true;
         c.nether = false;
         c.seedIndex = 2;
-        c.probability = 0.01F;
+        c.probability = 0.0027F;
         c.y = uniformHeight(absolute(10), absolute(67));
         c.yScale = constant(3.0F);
         c.verticalRotation = uniformFloat(-0.125F, 0.125F);

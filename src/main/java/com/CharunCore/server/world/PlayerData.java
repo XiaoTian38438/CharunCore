@@ -40,6 +40,12 @@ public class PlayerData {
     /** 玩家个人复活点 (床/重生锚)。y = Integer.MIN_VALUE 表示未设置, 使用世界出生点。 */
     public int respawnX = 0, respawnY = Integer.MIN_VALUE, respawnZ = 0;
     public String respawnDimension = "minecraft:overworld";
+    /** 插件持久数据 (PersistentDataContainer 底存, String→String, 随 GSON 落盘)。 */
+    public java.util.Map<String, String> pluginData = new java.util.HashMap<>();
+    /** 插件 ItemMeta 扩展组件: lore(\n 分隔) / 不可破坏 / 发光覆盖 (-1 无, 0 false, 1 true)。 */
+    public String[] inventoryLore = new String[46];
+    public boolean[] inventoryUnbreakable = new boolean[46];
+    public int[] inventoryGlint = new int[46];
 
     public PlayerData() {
         for (int i = 0; i < 46; i++) {

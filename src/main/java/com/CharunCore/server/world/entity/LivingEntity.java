@@ -31,6 +31,8 @@ public class LivingEntity extends Entity {
         if (this.health <= 0) {
             this.health = 0;
             this.deathTime = 1;
+            var deathEvt = EventManager.INSTANCE.fire(
+                    new com.CharunCore.server.plugin.event.events.EntityDeathEvent(this, 0));
             EntityManager.broadcastEntityDeath(this);
             onDeath();
         }

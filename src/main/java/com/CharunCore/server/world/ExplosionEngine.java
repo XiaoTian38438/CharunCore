@@ -20,6 +20,9 @@ public final class ExplosionEngine {
 
     public static void explode(DimensionType dim, double cx, double cy, double cz,
                                float power, boolean destroyBlocks) {
+        var explodeEvent = com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                new com.CharunCore.server.plugin.event.events.EntityExplodeEvent(cx, cy, cz, power));
+        if (explodeEvent.isCancelled()) return;
         Set<Long> destroyed = new HashSet<>();
 
         if (destroyBlocks) {

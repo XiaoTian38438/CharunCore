@@ -44,6 +44,12 @@ public class ItemEntity extends Entity {
         if (pickupDelay > 0) pickupDelay--;
 
         if (age > 6000) {
+            var despawnEvent = com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                    new com.CharunCore.server.plugin.event.events.ItemDespawnEvent(this));
+            if (despawnEvent.isCancelled()) {
+                age = 3000; // 取消消失: 重置存活计时
+                return;
+            }
             remove();
             return;
         }
@@ -95,6 +101,12 @@ public class ItemEntity extends Entity {
                 boolean overlapY = (y + 0.125) > (player.y - 0.5)
                         && (y - 0.125) < (player.y + 1.8 + 0.5);
                 if (overlapX && overlapZ && overlapY) {
+                    var pickEvent = com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                            new com.CharunCore.server.plugin.event.events.EntityPickupItemEvent(player, this));
+                    if (pickEvent.isCancelled()) {
+                        pickupDelay = 20;
+                        return;
+                    }
                     int got = player.pickupItemCount(itemId, count,
                             itemEnchants, itemPotion, itemCustomName, itemDamage,
                             trimMaterial, trimPattern);

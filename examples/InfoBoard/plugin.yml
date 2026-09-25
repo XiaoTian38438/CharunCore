@@ -1,0 +1,6 @@
+name: InfoBoard
+version: 1.0.0
+main: com.example.infoboard.InfoBoardPlugin
+api-version: '1.0'
+author: CharunCore
+description: 侧边栏信息板示例插件 (Scoreboard + ServerTick 演示)

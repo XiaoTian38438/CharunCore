@@ -1,0 +1,14 @@
+name: EssentialsGUI
+version: 1.0.0
+main: com.example.essentials.EssentialsPlugin
+api-version: '1.0'
+author: CharunCore
+description: 传送/菜单/个人数据示例插件 (Inventory+ItemMeta+PDC 演示)
+commands:
+  menu:
+    description: 打开传送菜单
+    aliases: [telemenu]
+  home:
+    description: 回到个人主页
+  sethome:
+    description: 设置个人主页

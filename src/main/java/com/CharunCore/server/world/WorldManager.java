@@ -654,6 +654,8 @@ public class WorldManager {
                     getGenerator(dim).markFeaturesDone(key);
                     // #34: 区块加载后重评估红石(灯/线/开关), 修复持久化状态与信号源不一致
                     RedstoneEngine.onChunkLoaded(dim, x, z);
+                    com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                            new com.CharunCore.server.plugin.event.events.ChunkLoadEvent(x, z, dim.key));
                     return loaded;
                 } else {
                     System.out.println("[Chunk] 磁盘区块 (" + x + "," + z + "," + dim.key + ") NBT 反序列化返回 null（版本过期或数据损坏），将重新生成 → 可能与相邻旧区块接缝不一致");

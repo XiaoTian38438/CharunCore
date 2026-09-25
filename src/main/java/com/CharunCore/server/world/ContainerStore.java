@@ -1057,6 +1057,7 @@ public final class ContainerStore {
                     h.version++;
                     h.transferCd = 8;
                     NetworkHandler.broadcastContainerUpdate(pos); // #28 实时动效
+                    notifyRedstone(pos); // #14 满度信号重算
                     return;
                 }
             }
@@ -1069,7 +1070,8 @@ public final class ContainerStore {
             h.version++;
             h.transferCd = 8;
             NetworkHandler.broadcastContainerUpdate(pos); // #28 实时动效
-            if (above.pos != null) NetworkHandler.broadcastContainerUpdate(above.pos); // 源容器同步
+            if (above.pos != null) { NetworkHandler.broadcastContainerUpdate(above.pos); notifyRedstone(above.pos); } // 源容器同步
+            notifyRedstone(pos); // #14 满度信号重算
             return;
         }
 
@@ -1084,11 +1086,17 @@ public final class ContainerStore {
                 h.version++;
                 h.transferCd = 8;
                 NetworkHandler.broadcastContainerUpdate(pos); // #28 实时动效
-                if (dst.pos != null) NetworkHandler.broadcastContainerUpdate(dst.pos); // 目标容器同步
+                if (dst.pos != null) { NetworkHandler.broadcastContainerUpdate(dst.pos); notifyRedstone(dst.pos); } // 目标容器同步
+                notifyRedstone(pos); // #14 满度信号重算
                 return;
             }
         }
         h.transferCd = 8;
+    }
+
+    /** #14: 容器内容变化后通知红石引擎重算邻接比较器的满度信号。 */
+    private static void notifyRedstone(Pos p) {
+        RedstoneEngine.onBlockChanged(p.dim(), p.x(), p.y(), p.z());
     }
 
     private static int[] facingDelta(String facing) {

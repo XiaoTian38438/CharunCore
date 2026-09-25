@@ -1,11 +1,12 @@
 package com.CharunCore.server.world;
 
-import com.CharunCore.server.world.chunk.Chunk;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+
 import com.CharunCore.server.Main;
 import com.CharunCore.server.network.NetworkHandler;
 import com.CharunCore.server.utils.BlockStateHelper;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import com.CharunCore.server.world.chunk.Chunk;
 
 public class FluidEngine {
     private static final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
@@ -260,6 +261,9 @@ public class FluidEngine {
             if (odds <= 0) continue;
             int n = (d[1] == 0) ? 300 : 250;             // 侧/上 300, 下 250 (原版)
             if (FIRE_RND.nextInt(n) < odds) {
+                var burnEvent = com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
+                        new com.CharunCore.server.plugin.event.events.BlockBurnEvent(nx, ny, nz, nb));
+                if (burnEvent.isCancelled()) continue;
                 // 5/(age+10) 概率点燃, 否则烧毁 (原版 checkBurnOut)
                 if (FIRE_RND.nextInt(age + 10) < 5) {
                     int above = WorldManager.getBlockState(dim, nx, ny + 1, nz);

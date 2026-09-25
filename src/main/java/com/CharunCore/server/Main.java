@@ -94,6 +94,7 @@ public class Main {
             worldAge += 1;
             dayTime   = (dayTime + 1) % 24000;
             tickCount++;
+            EventManager.INSTANCE.fire(new com.CharunCore.server.plugin.event.events.ServerTickEvent(tickCount, dayTime));
 
             weatherTimer--;
             if (weatherTimer <= 0) {
@@ -102,9 +103,13 @@ public class Main {
                 var weatherEvent = EventManager.INSTANCE.fire(
                         new WeatherChangeEvent(nextRaining, nextThundering));
                 if (!weatherEvent.isCancelled()) {
+                    boolean thunderChanged = isThundering != nextThundering;
                     isRaining = nextRaining;
                     isThundering = nextThundering;
                     rainTarget = nextRaining ? 1.0 : 0.0;
+                    if (thunderChanged) {
+                        EventManager.INSTANCE.fire(new com.CharunCore.server.plugin.event.events.ThunderChangeEvent(nextThundering));
+                    }
                     weatherTimer = nextRaining
                             ? 12000 + (int)(Math.random() * 12000)
                             : 12000 + (int)(Math.random() * 156000);
