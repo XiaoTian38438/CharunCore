@@ -23,16 +23,12 @@ public class MinecartEntity extends Entity {
     public double speed = 0.0;        // 当前速度（沿 dir；可负=反向）
     public int throttle = 0;          // 骑乘油门：+1 正向 / -1 反向 / 0 滑行
     public double lastInputYaw = 0.0; // 最近一次 vehicle_move 上报的玩家朝向
-    /** Bug24: 骑乘时客户端权威 —— 收到 vehicle_move 后置 true, 服务端跳过自行物理模拟。 */
-    public boolean clientDriven = false;
     public double fuel = 0.0;         // furnace_minecart 燃料剩余 tick
     public int[] invIds;              // chest/hopper 存储（暂未接 hopper 自动传输）
     public int[] invCounts;
     public boolean dead = false;
     /** Bug24: 推力冷却(刻) —— 玩家持续贴着矿车时每 5 刻才施加一次推力, 防推力与回中力逐刻对抗抖动。 */
     public int pushCooldown = 0;
-    /** Bug24: 客户端权威骑乘的宽限期(刻), 每次 vehicle_move 刷新为 10。 */
-    public int clientDrivenGrace = 0;
 
     public MinecartEntity(int id, String variant, double x, double y, double z) {
         super(id, 0, x, y, z);
@@ -97,16 +93,9 @@ public class MinecartEntity extends Entity {
             }
         }
 
-        // Bug24 二轮: 骑乘时 W/S(throttle!=0) -> 服务端主导物理(油门驱动),
-        // 无输入且客户端在流式同步 -> 采纳客户端位置(空滑不拉扯)。
-        if (clientDriven && passengerEid >= 0 && throttle == 0) {
-            if (--clientDrivenGrace > 0) {
-                updateRider();
-                return;
-            }
-        }
-        clientDriven = false; // 有油门输入/无乘客/超时 -> 服务端物理
-
+        // Bug24 三轮: 矿车改为纯服务端权威(1.21.2+ NewMinecartBehavior 语义),
+        // 删除 clientDriven 混合双权威 —— 曾骑乘时在"客户端位置流"与"服务端格子物理"
+        // 之间反复切换, 两套物理互搏导致坐车抖动/开不动/推车没反应。
         int rx = (int) Math.floor(x), rz = (int) Math.floor(z), ry = (int) Math.floor(y);
         int state = WorldManager.getBlockState(dim, rx, ry, rz);
         String rname = BlockStateHelper.getName(state);
@@ -300,6 +289,7 @@ public class MinecartEntity extends Entity {
     private void applyPushFromCollisions(int[][] ports) {
         for (Entity e : EntityManager.getEntities().values()) {
             if (e == this || e.dim != dim || e instanceof MinecartEntity) continue;
+            if (e instanceof ItemEntity) continue; // 原版: 掉落物不推矿车(矿车反而推掉落物)
             tryPushOnRail(e.x, e.y, e.z, e.width, e.height, ports, Double.NaN);
         }
         for (NetworkHandler p : NetworkHandler.players.values()) {
@@ -342,6 +332,7 @@ public class MinecartEntity extends Entity {
     private void applyPushOffRail() {
         for (Entity e : EntityManager.getEntities().values()) {
             if (e == this || e.dim != dim || e instanceof MinecartEntity) continue;
+            if (e instanceof ItemEntity) continue;
             tryPushOffRail(e.x, e.y, e.z, e.width, e.height);
         }
         for (NetworkHandler p : NetworkHandler.players.values()) {

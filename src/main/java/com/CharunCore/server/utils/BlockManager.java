@@ -321,6 +321,32 @@ public class BlockManager {
         return (h * 1.5f) / bestToolSpeed();
     }
 
+    /** 工具速度 (原版 Tier 速度)。 */
+    public static float toolSpeed(int heldItemId) {
+        String name = itemIdToName(heldItemId);
+        if (name == null) return 1.0f;
+        if (name.startsWith("netherite_")) return 9.0f;
+        if (name.startsWith("diamond_")) return 8.0f;
+        if (name.startsWith("iron_")) return 6.0f;
+        if (name.startsWith("stone_")) return 4.0f;
+        if (name.startsWith("wooden_") || name.startsWith("golden_")) return 2.0f;
+        return 1.0f;
+    }
+
+    /**
+     * 手持指定物品挖穿该方块的估算秒数 (原版公式: 对工具 hardness*1.5/speed, 不对工具 hardness*5/hand)。
+     * 用于生存挖掘裂纹阶段同步 —— 曾用 best-case 导致观战者裂纹中途消失。
+     */
+    public static float getBreakSeconds(String blockName, int heldItemId) {
+        float h = getBlockHardness(blockName);
+        if (h <= 0.0f) return 0.0f;
+        String tool = getToolType(heldItemId);
+        if (tool.equals(getRequiredTool(blockName))) {
+            return (h * 1.5f) / toolSpeed(heldItemId);
+        }
+        return h * 5.0f;
+    }
+
     /** 判断手持物品是否为某种工具 (pickaxe/axe/shovel), 用于"对工具"判定。 */
     public static String getToolType(int heldItemId) {
         String name = itemIdToName(heldItemId);

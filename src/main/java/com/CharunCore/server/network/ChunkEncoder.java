@@ -86,22 +86,45 @@ public class ChunkEncoder {
 
         private static final boolean BE_DEBUG = Boolean.parseBoolean(System.getProperty("charun.debugBe", "0"));
 
+    private static final byte[] SKY_FULL_SECTION = new byte[2048];
+    static {
+        java.util.Arrays.fill(SKY_FULL_SECTION, (byte) 0xFF);
+    }
+
     static void writeLightData(PacketBuffer pb, Chunk chunk) {
         chunk.ensureLight();
         byte[][] sky = chunk.skyLightSections();
         byte[][] block = chunk.blockLightSections();
         int sections = chunk.getSectionCount();
+        // 原版语义 (ClientboundLightUpdatePacketData): 掩码位 b 对应
+        // light section = minLightSection + b，其中 minLightSection = minSectionY - 1。
+        // 即 bit0 = 世界底下方 padding section, bit1..N = 数据 section, bit N+1 = 世界顶上方 padding。
+        // Bug40: 曾把数据 section 锚在 bit0 -> 客户端把所有光照整体下移 16 格渲染,
+        // 火把/萤石/岩浆光斑全部落在地下, 表现为"所有光源只亮一格"。
+        int lightSections = sections + 2;
 
         long skyMask = 0, blockMask = 0, emptySky = 0, emptyBlock = 0;
-        java.util.List<byte[]> skyArrays = new java.util.ArrayList<>(sections);
-        java.util.List<byte[]> blockArrays = new java.util.ArrayList<>(sections);
-        for (int i = 0; i < sections; i++) {
+        java.util.List<byte[]> skyArrays = new java.util.ArrayList<>(lightSections);
+        java.util.List<byte[]> blockArrays = new java.util.ArrayList<>(lightSections);
+        for (int b = 0; b < lightSections; b++) {
+            if (b == 0) {
+                emptySky |= 1L;
+                emptyBlock |= 1L;
+                continue;
+            }
+            if (b > sections) {
+                skyMask |= 1L << b;
+                skyArrays.add(SKY_FULL_SECTION);
+                emptyBlock |= 1L << b;
+                continue;
+            }
+            int i = b - 1;
             byte[] s = sky[i];
-            if (s != null && isNonZero(s)) { skyMask |= 1L << i; skyArrays.add(s); }
-            else emptySky |= 1L << i;
-            byte[] b = block[i];
-            if (b != null && isNonZero(b)) { blockMask |= 1L << i; blockArrays.add(b); }
-            else emptyBlock |= 1L << i;
+            if (s != null && isNonZero(s)) { skyMask |= 1L << b; skyArrays.add(s); }
+            else emptySky |= 1L << b;
+            byte[] bl = block[i];
+            if (bl != null && isNonZero(bl)) { blockMask |= 1L << b; blockArrays.add(bl); }
+            else emptyBlock |= 1L << b;
         }
 
         pb.writeBitSet(bitSetToLongs(skyMask));

@@ -506,7 +506,7 @@ public class ConsoleCommandHandler {
                             return;
                         }
                         WorldManager.setBlock(dim, bx, by, bz, blockId);
-                        NetworkHandler.broadcastBlockChange(bx, by, bz, blockId);
+                        NetworkHandler.broadcastBlockChange(dim, bx, by, bz, blockId);
                         out("已设置方块 " + blockToken + " 在 " + bx + " " + by + " " + bz + " (" + dim + ", " + mode + ")");
                     } catch (NumberFormatException e) { err("无效坐标"); }
                 }
@@ -551,7 +551,7 @@ public class ConsoleCommandHandler {
                                     if (mode.equals("keep") && cur != 0) continue;
                                     if (filterName != null && cur != filterId) continue;
                                     WorldManager.setBlock(dim, bx, by, bz, blockId);
-                                    NetworkHandler.broadcastBlockChange(bx, by, bz, blockId);
+                                    NetworkHandler.broadcastBlockChange(dim, bx, by, bz, blockId);
                                     count++;
                                 }
                         out("已填充 " + count + " 个方块 (" + dim + ", " + mode + (filterName != null ? " filter=" + filterName : "") + ")");
@@ -580,7 +580,7 @@ public class ConsoleCommandHandler {
                                 for (int bz = minZ; bz <= maxZ; bz++) {
                                     int state = WorldManager.getBlockState(dim, bx, by, bz);
                                     WorldManager.setBlock(dim, bx + offX, by + offY, bz + offZ, state);
-                                    NetworkHandler.broadcastBlockChange(bx + offX, by + offY, bz + offZ, state);
+                                    NetworkHandler.broadcastBlockChange(dim, bx + offX, by + offY, bz + offZ, state);
                                 }
                         out("已克隆区域 (" + dim + ")");
                     } catch (NumberFormatException e) { err("无效坐标"); }

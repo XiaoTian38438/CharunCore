@@ -229,9 +229,10 @@ public final class LightEngine {
         if (cur > newEm) {
             removal.push(pack(x, y, z, cur));
             setLight(dim, x, y, z, 0, false, null);
+            cur = 0;
         }
         if (newEm > 0) {
-            setLight(dim, x, y, z, Math.max(cur, newEm), false, null);
+            setLight(dim, x, y, z, newEm, false, null);
             add.push(pack(x, y, z, 0));
         }
         if (newOp < oldOp) {

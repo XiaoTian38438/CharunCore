@@ -81,7 +81,7 @@ public final class ExplosionEngine {
                     continue;
                 }
                 WorldManager.setBlock(dim, bx, by, bz, 0);
-                NetworkHandler.broadcastBlockChange(bx, by, bz, 0);
+                NetworkHandler.broadcastBlockChange(dim, bx, by, bz, 0);
                 if (RNG.nextFloat() < 1.0f / Math.max(1.0f, power)) {
                     String dropName = explosionDrop(name);
                     if (dropName != null) {

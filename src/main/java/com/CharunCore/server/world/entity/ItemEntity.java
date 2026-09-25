@@ -55,8 +55,10 @@ public class ItemEntity extends Entity {
         if (isInFluid("water")) {
             // Bug18 二轮: 三段式浮力 —— 近水面(浸没 0.3~0.75)强阻尼静浮(速度收敛到 0,
             // 静止时 syncTracking 不再发包 -> 消除"近玩家抖动/远离后正常"的分叉);
-            // 深层上浮、露出过多回落。水平方向随水流推力走(Entity.tick 无水流推力,
-            // 由 FluidEngine 的 scheduleChunkFluids 侧驱动)。
+            // 深层上浮、露出过多回落。
+            // Bug18 四轮: 补上原版水流推力(FlowingFluid.getFlow 近似) —— 服务端从未推动
+            // 水中物品, 客户端本地顺水漂走后被 60 tick 重锚定拉回 = "来回抽搐"。
+            applyWaterFlowPush();
             double waterTop = Math.floor(y) + 1.0;
             double depth = Math.max(0.0, Math.min(1.0, waterTop - y));
             if (depth > 0.75) vy = Math.min(vy + 0.05, 0.08);
@@ -86,18 +88,21 @@ public class ItemEntity extends Entity {
             // Bug47: pickupItemCount 先并入背包已有堆再放空槽; 背包满则部分拾取后留余量。
             for (NetworkHandler player : NetworkHandler.players.values()) {
                 if (player.isDead || player.currentDim != this.dim) continue; // P4-7: 跨维度误拾取过滤
-                double dx = player.x - x;
-                double dy = player.y - y;
-                double dz = player.z - z;
-                double distSq = dx * dx + dy * dy + dz * dz;
-                // Bug18: 原版拾取近似 —— 玩家 AABB 外扩 1 格内可拾取(曾 1.5 过于磁吸)
-                if (distSq < 1.1 * 1.1) {
+                // Bug18: 原版语义 —— 物品 AABB 外扩 (1, 0.5, 1) 与玩家 AABB 相交即可拾取
+                double ix = Math.abs(player.x - x), iz = Math.abs(player.z - z);
+                boolean overlapX = ix < 1.0 + 0.3 + 0.125;
+                boolean overlapZ = iz < 1.0 + 0.3 + 0.125;
+                boolean overlapY = (y + 0.125) > (player.y - 0.5)
+                        && (y - 0.125) < (player.y + 1.8 + 0.5);
+                if (overlapX && overlapZ && overlapY) {
                     int got = player.pickupItemCount(itemId, count,
                             itemEnchants, itemPotion, itemCustomName, itemDamage,
                             trimMaterial, trimPattern);
                     if (got >= count) {
+                        NetworkHandler.broadcastCollect(dim, id, player.eid, count);
                         remove();
                     } else if (got > 0) {
+                        NetworkHandler.broadcastCollect(dim, id, player.eid, got);
                         count -= got;
                         pickupDelay = 10;
                     } else {
@@ -127,5 +132,46 @@ public class ItemEntity extends Entity {
                 break;
             }
         }
+    }
+
+    /** 原版 FlowingFluid.getFlow 近似: 朝更低水位(或溢流边缘)方向推物品, 阻尼后稳态漂速 ~0.05 格/tick。 */
+    private void applyWaterFlowPush() {
+        int bx = (int) Math.floor(x), by = (int) Math.floor(y), bz = (int) Math.floor(z);
+        int own = fluidLevelAt(bx, by, bz);
+        if (own < 0 || own == 8) return; // 不在水里(算错)或下落水柱(竖直方向交给浮力)
+        double fx = 0, fz = 0;
+        boolean any = false;
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int[] d : dirs) {
+            int nl = fluidLevelAt(bx + d[0], by, bz + d[1]);
+            double w = 0;
+            if (nl < 0) {
+                // 非水邻居: 空气且其下方也是空气 -> 水会溢流过去, 视作更低
+                int nb = com.CharunCore.server.world.WorldManager.getBlockState(dim, bx + d[0], by, bz + d[1]);
+                int below = com.CharunCore.server.world.WorldManager.getBlockState(dim, bx + d[0], by - 1, bz + d[1]);
+                String nbName = com.CharunCore.server.utils.BlockStateHelper.getName(nb);
+                String belowName = com.CharunCore.server.utils.BlockStateHelper.getName(below);
+                boolean airLike = nb == 0 || "air".equals(nbName) || "cave_air".equals(nbName);
+                boolean belowAirLike = below == 0 || "air".equals(belowName) || "cave_air".equals(belowName);
+                if (airLike && belowAirLike) w = 1.0;
+            } else if (nl > own) {
+                w = Math.min(3.0, nl - own);
+            }
+            if (w > 0) { fx += d[0] * w; fz += d[1] * w; any = true; }
+        }
+        if (any) {
+            double len = Math.hypot(fx, fz);
+            vx += fx / len * 0.008;
+            vz += fz / len * 0.008;
+        }
+    }
+
+    /** 水位: 0=水源,1-7=流动,8=下落; 非水返回 -1。 */
+    private int fluidLevelAt(int x, int y, int z) {
+        int st = com.CharunCore.server.world.WorldManager.getBlockState(dim, x, y, z);
+        String n = com.CharunCore.server.utils.BlockStateHelper.getName(st);
+        if (!"water".equals(n)) return -1;
+        String p = com.CharunCore.server.utils.BlockStateHelper.getProp(st, "level");
+        return p == null ? 0 : Integer.parseInt(p);
     }
 }

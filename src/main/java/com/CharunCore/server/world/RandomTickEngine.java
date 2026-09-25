@@ -136,7 +136,7 @@ public final class RandomTickEngine {
 
     private static void setBlockAndBroadcast(DimensionType dim, int x, int y, int z, int state) {
         WorldManager.setBlock(dim, x, y, z, state);
-        NetworkHandler.broadcastBlockChange(x, y, z, state);
+        NetworkHandler.broadcastBlockChange(dim, x, y, z, state);
     }
 
     private static void growAge(DimensionType dim, int x, int y, int z, int state, int newAge) {

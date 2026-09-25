@@ -32,7 +32,7 @@ public class WorldManager {
     private static DensityRouterChunkGenerator overworldGenerator;
     private static DensityRouterChunkGenerator netherGenerator;
     private static DensityRouterChunkGenerator endGenerator;
-    private static final ScheduledExecutorService ioExecutor = Executors.newScheduledThreadPool(2);
+    private static volatile ScheduledExecutorService ioExecutor = Executors.newScheduledThreadPool(2);
     private static final java.util.concurrent.ConcurrentMap<Long, java.util.concurrent.locks.ReentrantLock> chunkLocks =
         new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -44,7 +44,27 @@ public class WorldManager {
         }, "WorldManager-ShutdownHook"));
     }
 
-    public static ScheduledExecutorService getIoExecutor() { return ioExecutor; }
+    /** 获取区块 IO 线程池。自愈: 若池已被关闭(JVM 退出钩子/异常路径误关), 重建新池,
+     *  避免 /tp 后所有区块任务被拒绝 -> "只加载脚下区块且透明"的僵尸状态。 */
+    public static ScheduledExecutorService getIoExecutor() {
+        ScheduledExecutorService e = ioExecutor;
+        if (e.isShutdown()) {
+            synchronized (WorldManager.class) {
+                e = ioExecutor;
+                if (e.isShutdown()) {
+                    ioExecutor = e = Executors.newScheduledThreadPool(2);
+                    System.err.println("[WorldManager] ioExecutor 已被关闭, 已重建新池恢复区块加载/保存");
+                }
+            }
+        }
+        return e;
+    }
+
+    /** ioExecutor 积压任务数(背压用): 超过阈值时 pumpChunkSends 应暂停提交, 防止
+     *  远距离 /tp 后提交速度(120/s)远超远处区块生成速度(~10/s)导致数千任务积压。 */
+    public static int ioBacklog() {
+        return ((java.util.concurrent.ThreadPoolExecutor) ioExecutor).getQueue().size();
+    }
 
     public static long getSeed() { return WORLD_SEED; }
 
@@ -325,6 +345,27 @@ public class WorldManager {
                 int rx = be.getInt("x", 0) & 15;
                 int ry = be.getInt("y", 0);
                 int rz = be.getInt("z", 0) & 15;
+                // Bug7: 加载期补全告示牌双面文本 —— 旧存档/旧版本创建的 BE 可能只有单侧
+                // (编辑期补面只覆盖"当次编辑"的牌), 重进后另一面无 front_text/back_text
+                // -> 客户端只渲染最后编辑的一面的文字。
+                String beIdN = be.getString("id", "");
+                if (beIdN.startsWith("minecraft:")) beIdN = beIdN.substring(10);
+                if (beIdN.endsWith("_sign") || beIdN.endsWith("_wall_sign")
+                        || beIdN.endsWith("_hanging_sign") || beIdN.endsWith("_wall_hanging_sign")
+                        || beIdN.equals("sign") || beIdN.equals("hanging_sign")) {
+                    org.cloudburstmc.nbt.NbtMapBuilder sb = org.cloudburstmc.nbt.NbtMap.builder();
+                    for (String k : be.keySet()) sb.put(k, be.get(k));
+                    for (String side : new String[]{"front_text", "back_text"}) {
+                        if (sb.containsKey(side)) continue;
+                        sb.put(side, org.cloudburstmc.nbt.NbtMap.builder()
+                            .putList("messages", org.cloudburstmc.nbt.NbtType.STRING,
+                                java.util.List.of("", "", "", ""))
+                            .putString("color", "black")
+                            .putBoolean("has_glowing_text", false)
+                            .build());
+                    }
+                    be = sb.build();
+                }
                 chunk.putBlockEntityRaw(rx, ry, rz, be);
                 // Bug37 修复: 熔炉/酿造台/漏斗等带自动逻辑的容器必须在区块加载时
                 // 注册进 ContainerStore, 否则没人打开过 UI 就永远不会 tick
@@ -337,6 +378,7 @@ public class WorldManager {
                     case "furnace", "blast_furnace", "smoker" -> ContainerStore.furnace(cpos, beId);
                     case "brewing_stand" -> ContainerStore.brewing(cpos);
                     case "hopper" -> ContainerStore.hopper(cpos);
+                    case "beacon" -> NetworkHandler.registerBeaconFromBE(cpos, be); // Bug11: 重启后信标失效
                     default -> { }
                 }
             }
@@ -606,6 +648,10 @@ public class WorldManager {
                     loaded.dim = dim;
                     store.put(key, loaded);
                     SpawnerSystem.registerChunk(dim, loaded, x, z);
+                    // Bug57: 磁盘区块的 feature 已随落盘持久化, 标记完成 —— 否则
+                    // getChunk 快速路径会重跑 generate() 重放 feature
+                    // (末地水晶一柱双颗/树与花重复)。
+                    getGenerator(dim).markFeaturesDone(key);
                     // #34: 区块加载后重评估红石(灯/线/开关), 修复持久化状态与信号源不一致
                     RedstoneEngine.onChunkLoaded(dim, x, z);
                     return loaded;

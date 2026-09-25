@@ -218,9 +218,11 @@ public class RegistryHelper {
             int rz = (int)((beKey >> 4) & 15);
             int ry = (int)((beKey >> 16) & 0xFFFF) - 64;
             NbtMapBuilder beb = NbtMap.builder();
-            beb.putInt("x", rx);
+            // 原版 anvil block_entities 的 x/y/z 是世界绝对坐标(曾写区块相对坐标 -> 非原版格式,
+            // 第三方工具/其他实现读档会把 BE 定位到错误位置)。
+            beb.putInt("x", chunk.getX() * 16 + rx);
             beb.putInt("y", ry);
-            beb.putInt("z", rz);
+            beb.putInt("z", chunk.getZ() * 16 + rz);
             org.cloudburstmc.nbt.NbtMap src = e.getValue();
             for (String bk : src.keySet()) {
                 if (bk.equals("x") || bk.equals("y") || bk.equals("z")) continue;

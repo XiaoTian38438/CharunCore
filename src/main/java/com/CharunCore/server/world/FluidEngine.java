@@ -208,7 +208,7 @@ public class FluidEngine {
             }
             if (exposed && FIRE_RND.nextFloat() < 0.2f + age * 0.03f) {
                 WorldManager.setBlock(dim, x, y, z, 0);
-                NetworkHandler.broadcastBlockChange(x, y, z, 0);
+                NetworkHandler.broadcastBlockChange(dim, x, y, z, 0);
                 return;
             }
         }
@@ -227,13 +227,13 @@ public class FluidEngine {
                 boolean belowSturdy = BlockStateHelper.isSolidOpaque(below);
                 if (!belowSturdy || age > 3) {
                     WorldManager.setBlock(dim, x, y, z, 0);
-                    NetworkHandler.broadcastBlockChange(x, y, z, 0);
+                    NetworkHandler.broadcastBlockChange(dim, x, y, z, 0);
                     return;
                 }
             } else if (age == 15 && FIRE_RND.nextInt(4) == 0 && !isFlammable(belowName)) {
                 // age 满 15 且下方不可燃 → 概率熄灭 (原版)
                 WorldManager.setBlock(dim, x, y, z, 0);
-                NetworkHandler.broadcastBlockChange(x, y, z, 0);
+                NetworkHandler.broadcastBlockChange(dim, x, y, z, 0);
                 return;
             }
         }
@@ -267,12 +267,12 @@ public class FluidEngine {
                         int fs = fireStateAt(dim, nx, ny + 1, nz,
                                 Math.min(15, age + FIRE_RND.nextInt(5) / 4));
                         WorldManager.setBlock(dim, nx, ny + 1, nz, fs);
-                        NetworkHandler.broadcastBlockChange(nx, ny + 1, nz, fs);
+                        NetworkHandler.broadcastBlockChange(dim, nx, ny + 1, nz, fs);
                         scheduleFireTick(dim, nx, ny + 1, nz, fs);
                     }
                 } else {
                     WorldManager.setBlock(dim, nx, ny, nz, 0);
-                    NetworkHandler.broadcastBlockChange(nx, ny, nz, 0);
+                    NetworkHandler.broadcastBlockChange(dim, nx, ny, nz, 0);
                     neighborChanged(dim, nx, ny, nz);     // 烧毁后让相邻流体重算
                 }
             }
@@ -296,7 +296,7 @@ public class FluidEngine {
                         int fs = fireStateAt(dim, cx, cy, cz,
                                 Math.min(15, age + FIRE_RND.nextInt(5) / 4));
                         WorldManager.setBlock(dim, cx, cy, cz, fs);
-                        NetworkHandler.broadcastBlockChange(cx, cy, cz, fs);
+                        NetworkHandler.broadcastBlockChange(dim, cx, cy, cz, fs);
                         scheduleFireTick(dim, cx, cy, cz, fs);
                     }
                 }
@@ -435,7 +435,7 @@ public class FluidEngine {
         if (lvl > 0) {
             if (!hasFluidFeed(dim, x, y, z, name, lvl)) {
                 WorldManager.setBlock(dim, x, y, z, 0);
-                NetworkHandler.broadcastBlockChange(x, y, z, 0);
+                NetworkHandler.broadcastBlockChange(dim, x, y, z, 0);
                 neighborChanged(dim, x, y, z); // 让更外层流动水继续被重算/干涸
                 return;
             }
@@ -454,7 +454,7 @@ public class FluidEngine {
                         boolean lavaSource = "0".equals(BlockStateHelper.getProp(nbState, "level"));
                         int result = BlockStateHelper.getDefault(lavaSource ? "obsidian" : "cobblestone");
                         WorldManager.setBlock(dim, nb[0], nb[1], nb[2], result);
-                        NetworkHandler.broadcastBlockChange(nb[0], nb[1], nb[2], result);
+                        NetworkHandler.broadcastBlockChange(dim, nb[0], nb[1], nb[2], result);
                         break;
                     }
                 }
@@ -466,7 +466,7 @@ public class FluidEngine {
                         boolean lavaSource = "0".equals(BlockStateHelper.getProp(currentState, "level"));
                         int result = BlockStateHelper.getDefault(lavaSource ? "obsidian" : "cobblestone");
                         WorldManager.setBlock(dim, x, y, z, result);
-                        NetworkHandler.broadcastBlockChange(x, y, z, result);
+                        NetworkHandler.broadcastBlockChange(dim, x, y, z, result);
                         return;
                     }
                 }
@@ -496,7 +496,7 @@ public class FluidEngine {
                 if (sourceCount >= 2) {
                     int srcState = BlockStateHelper.withProp(currentState, "level", "0");
                     WorldManager.setBlock(dim, x, y, z, srcState);
-                    NetworkHandler.broadcastBlockChange(x, y, z, srcState);
+                    NetworkHandler.broadcastBlockChange(dim, x, y, z, srcState);
                     scheduleFluidTick(dim, x, y, z, srcState, flowDelay);
                     return;
                 }
@@ -515,7 +515,7 @@ public class FluidEngine {
                 int downState = BlockStateHelper.withProp(currentState, "level", "8");
                 if (below != downState) {
                     WorldManager.setBlock(dim, x, y - 1, z, downState);
-                    NetworkHandler.broadcastBlockChange(x, y - 1, z, downState);
+                    NetworkHandler.broadcastBlockChange(dim, x, y - 1, z, downState);
                 }
                 scheduleFluidTick(dim, x, y - 1, z, downState, flowDelay);
                 flowedDown = true;
@@ -538,7 +538,7 @@ public class FluidEngine {
                     // #44: 目标已是该状态则跳过(防振荡期同格反复 set+广播 -> 单块包洪泛)
                     if (WorldManager.getBlockState(dim, nb[0], nb[1], nb[2]) != spreadState) {
                         WorldManager.setBlock(dim, nb[0], nb[1], nb[2], spreadState);
-                        NetworkHandler.broadcastBlockChange(nb[0], nb[1], nb[2], spreadState);
+                        NetworkHandler.broadcastBlockChange(dim, nb[0], nb[1], nb[2], spreadState);
                     }
                     scheduleFluidTick(dim, nb[0], nb[1], nb[2], spreadState, flowDelay);
                 }
@@ -557,7 +557,7 @@ public class FluidEngine {
             int cur = WorldManager.getBlockState(dim, nb[0], nb[1], nb[2]);
             if (canDisplace(cur)) {
                 WorldManager.setBlock(dim, nb[0], nb[1], nb[2], level1);
-                NetworkHandler.broadcastBlockChange(nb[0], nb[1], nb[2], level1);
+                NetworkHandler.broadcastBlockChange(dim, nb[0], nb[1], nb[2], level1);
                 scheduleFluidTick(dim, nb[0], nb[1], nb[2], level1);
             }
         }

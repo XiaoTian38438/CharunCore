@@ -265,7 +265,13 @@ public class Main {
                 while (RUNNING && (line = br.readLine()) != null) {
                     String trimmed = line.trim();
                     if (trimmed.isEmpty()) continue;
-                    ConsoleCommandHandler.execute(trimmed);
+                    try {
+                        ConsoleCommandHandler.execute(trimmed);
+                    } catch (Throwable err) {
+                        // 控制台指令异常不得杀死读取线程(曾 /tp 触发生成异常 -> 控制台线程死亡)
+                        System.err.println("[控制台] 指令执行异常: " + err);
+                        err.printStackTrace();
+                    }
                 }
             } catch (java.io.IOException e) {
                 System.out.println("[控制台] 输入读取结束: " + e.getMessage());

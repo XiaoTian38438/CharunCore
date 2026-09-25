@@ -1,40 +1,90 @@
 package com.CharunCore.server.network;
 
-import com.CharunCore.server.Main;
-import com.CharunCore.server.ServerConfig;
-import com.CharunCore.server.advancement.AdvancementManager;
-import com.CharunCore.server.command.BanList;
-import com.CharunCore.server.command.Permissions;
-import com.CharunCore.server.command.TpaSystem;
-import com.CharunCore.server.plugin.Server;
-import com.CharunCore.server.plugin.command.CommandSender;
-import com.CharunCore.server.plugin.event.EventManager;
-import com.CharunCore.server.plugin.event.events.*;
-import com.CharunCore.server.utils.BlockManager;
-import com.CharunCore.server.utils.BlockStateHelper;
-import com.CharunCore.server.world.*;
-import com.CharunCore.server.world.entity.*;
-import com.CharunCore.server.worldgen.DensityRouterChunkGenerator;
-import com.CharunCore.server.worldgen.structure.StructureManager;
-import com.CharunCore.server.worldgen.structure2.*;
-import com.CharunCore.server.network.protocol.PacketBuffer;
-import com.CharunCore.server.utils.RegistryHelper;
-import com.CharunCore.server.world.PlayerData;
-import com.CharunCore.server.command.EntitySelector;
-import com.CharunCore.server.command.OpList;
-import com.CharunCore.server.world.chunk.Chunk;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.SimpleChannelInboundHandler;
-
-import java.io.*;
+import java.io.File;
 import java.nio.file.Files;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.CharunCore.server.Main;
+import com.CharunCore.server.ServerConfig;
+import com.CharunCore.server.advancement.AdvancementManager;
+import com.CharunCore.server.command.BanList;
+import com.CharunCore.server.command.EntitySelector;
+import com.CharunCore.server.command.OpList;
+import com.CharunCore.server.command.Permissions;
+import com.CharunCore.server.command.TpaSystem;
+import com.CharunCore.server.network.protocol.PacketBuffer;
+import com.CharunCore.server.plugin.Server;
+import com.CharunCore.server.plugin.command.CommandSender;
+import com.CharunCore.server.plugin.event.EventManager;
+import com.CharunCore.server.plugin.event.events.BlockBreakEvent;
+import com.CharunCore.server.plugin.event.events.BlockPlaceEvent;
+import com.CharunCore.server.plugin.event.events.EntityDamageByEntityEvent;
+import com.CharunCore.server.plugin.event.events.InventoryClickEvent;
+import com.CharunCore.server.plugin.event.events.InventoryCloseEvent;
+import com.CharunCore.server.plugin.event.events.PlayerChatEvent;
+import com.CharunCore.server.plugin.event.events.PlayerCommandPreprocessEvent;
+import com.CharunCore.server.plugin.event.events.PlayerDeathEvent;
+import com.CharunCore.server.plugin.event.events.PlayerDropItemEvent;
+import com.CharunCore.server.plugin.event.events.PlayerExpChangeEvent;
+import com.CharunCore.server.plugin.event.events.PlayerGameModeChangeEvent;
+import com.CharunCore.server.plugin.event.events.PlayerInteractEvent;
+import com.CharunCore.server.plugin.event.events.PlayerItemHeldEvent;
+import com.CharunCore.server.plugin.event.events.PlayerJoinEvent;
+import com.CharunCore.server.plugin.event.events.PlayerMoveEvent;
+import com.CharunCore.server.plugin.event.events.PlayerQuitEvent;
+import com.CharunCore.server.plugin.event.events.PlayerRespawnEvent;
+import com.CharunCore.server.plugin.event.events.PlayerTeleportEvent;
+import com.CharunCore.server.plugin.event.events.PlayerToggleSneakEvent;
+import com.CharunCore.server.plugin.event.events.PlayerToggleSprintEvent;
+import com.CharunCore.server.plugin.event.events.ServerListPingEvent;
+import com.CharunCore.server.utils.BlockManager;
+import com.CharunCore.server.utils.BlockStateHelper;
+import com.CharunCore.server.utils.RegistryHelper;
+import com.CharunCore.server.world.ContainerStore;
+import com.CharunCore.server.world.CraftingSystem;
+import com.CharunCore.server.world.DimensionType;
+import com.CharunCore.server.world.EnchantSystem;
+import com.CharunCore.server.world.ExplosionEngine;
+import com.CharunCore.server.world.FluidEngine;
+import com.CharunCore.server.world.PlayerData;
+import com.CharunCore.server.world.PlayerDataManager;
+import com.CharunCore.server.world.RecipeRegistry;
+import com.CharunCore.server.world.RedstoneEngine;
+import com.CharunCore.server.world.SmeltingSystem;
+import com.CharunCore.server.world.StatisticsManager;
+import com.CharunCore.server.world.WorldManager;
+import com.CharunCore.server.world.chunk.Chunk;
+import com.CharunCore.server.world.entity.ArrowEntity;
+import com.CharunCore.server.world.entity.EndCrystalEntity;
+import com.CharunCore.server.world.entity.EndDragonFight;
+import com.CharunCore.server.world.entity.EnderDragonEntity;
+import com.CharunCore.server.world.entity.EnderPearlEntity;
+import com.CharunCore.server.world.entity.Entity;
+import com.CharunCore.server.world.entity.EntityManager;
+import com.CharunCore.server.world.entity.EyeOfEnderEntity;
+import com.CharunCore.server.world.entity.FishingBobberEntity;
+import com.CharunCore.server.world.entity.ItemEntity;
+import com.CharunCore.server.world.entity.LivingEntity;
+import com.CharunCore.server.world.entity.MinecartEntity;
+import com.CharunCore.server.world.entity.MobEntity;
+import com.CharunCore.server.world.entity.PotionEntity;
+import com.CharunCore.server.world.entity.TridentEntity;
+import com.CharunCore.server.worldgen.DensityRouterChunkGenerator;
+import com.CharunCore.server.worldgen.structure.StructureManager;
+import com.CharunCore.server.worldgen.structure2.BiomeTagResolver;
+import com.CharunCore.server.worldgen.structure2.LootTableLoader;
+import com.CharunCore.server.worldgen.structure2.RandomSpreadStructurePlacement;
+import com.CharunCore.server.worldgen.structure2.StructureRegistry;
+import com.CharunCore.server.worldgen.structure2.StructureSelectionEntry;
+import com.CharunCore.server.worldgen.structure2.StructureSet;
 import com.google.gson.Gson;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.SimpleChannelInboundHandler;
 
 public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
@@ -82,6 +132,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     // 客户端点击配方书时回传该 id（place_recipe），服务端据此反查并填充网格。
     private static final java.util.List<RecipeRegistry.Recipe> RECIPE_BOOK_ENTRIES = new java.util.ArrayList<>();
     private static final java.util.Map<Integer, RecipeRegistry.Recipe> RECIPE_BOOK_BY_ID = new java.util.HashMap<>();
+    /** 配方书展示去重: 每个产物物品只保留一个展示条目(recipes.json 的同产物变体配方
+     *  —— 如 12 种木板合成木棍 —— 原版配方书里只显示一个木棍条目, 曾全部作为独立
+     *  displayId 推送 -> 配方书里"木棍×12"式重复)。BOOK_DISPLAY_TO_RECIPE.get(d) = RECIPE_BOOK_ENTRIES 索引。 */
+    private static final java.util.List<Integer> BOOK_DISPLAY_TO_RECIPE = new java.util.ArrayList<>();
+    private static final java.util.Set<Integer> BOOK_REPRESENTATIVE_INDICES = java.util.concurrent.ConcurrentHashMap.newKeySet();
     static {
         // 惰性触发 RecipeRegistry.loadAll() (避免类加载顺序: BlockManager 必须先加载)
         try {
@@ -90,12 +145,19 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             System.err.println("[配方书] RecipeRegistry 加载失败: " + t);
         }
         int id = 0;
+        java.util.Set<String> seenResults = new java.util.HashSet<>();
         for (RecipeRegistry.Recipe r : RecipeRegistry.all()) {
             RECIPE_BOOK_ENTRIES.add(r);
-            RECIPE_BOOK_BY_ID.put(id, r);
+            String rn = r.resultItemId > 0 ? BlockManager.itemIdToName(r.resultItemId) : null;
+            if (rn != null && seenResults.add(rn)) {
+                BOOK_DISPLAY_TO_RECIPE.add(id);
+                BOOK_REPRESENTATIVE_INDICES.add(id);
+                RECIPE_BOOK_BY_ID.put(BOOK_DISPLAY_TO_RECIPE.size() - 1, r);
+            }
             id++;
         }
-        System.out.println("[配方书] 已索引 " + id + " 个合成配方用于 recipe_book_add");
+        System.out.println("[配方书] 已索引 " + id + " 个合成配方, 去重后 "
+            + BOOK_DISPLAY_TO_RECIPE.size() + " 个配方书展示条目");
     }
 
     /** BUG2: 每个玩家已解锁的配方(配方书 displayId 集合)。拿到对应物品才解锁, 模拟原版。 */
@@ -117,6 +179,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return openCraftingCounts.computeIfAbsent(windowId, k -> new int[9]);
     }
     private final java.util.Map<Integer, ContainerStore.Pos> openChests = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Bug51: 大箱子窗口 → 另一半箱子位置(存在 = 该窗口是 generic_9x6 双箱界面)。 */
+    private final java.util.Map<Integer, ContainerStore.Pos> openChestPartners = new java.util.concurrent.ConcurrentHashMap<>();
     /** 共享容器观察者: Pos → 正在查看该容器的玩家集(用于多人同箱实时同步)。 */
     private static final java.util.Map<ContainerStore.Pos, java.util.Set<NetworkHandler>> chestObservers = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.Map<Integer, ContainerStore.Pos> openHoppers = new java.util.concurrent.ConcurrentHashMap<>();
@@ -656,7 +720,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         if (acv > 0) {
                             int ns = BlockStateHelper.withProp(as, "charges", String.valueOf(acv - 1));
                             WorldManager.setBlock(respawnDim, data.respawnX, data.respawnY, data.respawnZ, ns);
-                            broadcastBlockChange(data.respawnX, data.respawnY, data.respawnZ, ns);
+                            broadcastBlockChange(respawnDim, data.respawnX, data.respawnY, data.respawnZ, ns);
                         }
                         if (acv - 1 <= 0) data.respawnY = Integer.MIN_VALUE;
                     }
@@ -678,8 +742,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     pb.writeByte((byte) 0x00);       // dataKept = 0 (死亡重生不保留属性/元数据)
                 });
 
-                // 2. 满血复活 (update_health = 0x67, 曾误用 0x66=set_experience -> 客户端断开)
-                sendPacket(ctx, 0x67, pb -> {
+                // 2. 满血复活 (update_health/set_health = 0x66; 0x67=set_held_slot —— 曾误用 0x67)
+                sendPacket(ctx, 0x66, pb -> {
                     pb.writeFloat(20.0f); pb.writeVarInt(20); pb.writeFloat(5.0f);
                 });
 
@@ -823,32 +887,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             float vyaw = in.getBuffer().readFloat();
             float vpitch = in.getBuffer().readFloat();
             if (this.riddenEntity instanceof MinecartEntity cart) {
-                // Bug24 修复: 原版骑乘载具是客户端权威 —— 客户端模拟矿车物理并经
-                // vehicle_move 上报真实位置, 服务端只需采纳并跟随。
-                // 曾服务端自行模拟 + 丢弃上报坐标 -> 服务端/客户端互相拉扯,
-                // 表现为"按移动键开不动 + 沿轨高频小幅抖动"。
-                double ddx = vcx - cart.x, ddy = vcy - cart.y, ddz = vcz - cart.z;
-                double distSq = ddx * ddx + ddy * ddy + ddz * ddz;
-                // Bug34: 拒绝非有限/瞬移坐标, 防 NaN 进入矿车与骑乘者服务端状态
-                // Bug24 二轮: 有油门输入时服务端主导, 忽略客户端位置流(防两套物理对撞)
-                if (cart.throttle != 0) return;
-                if (distSq < 64.0 && Double.isFinite(vcx) && Double.isFinite(vcy) && Double.isFinite(vcz)
+                // Bug24 三轮: 1.21.2+ 矿车为 NewMinecartBehavior = 服务端权威, 客户端矿车
+                // 位置/插值完全由专用 move_minecart(0x35) 驱动, 不消费 vehicle_move 上报位置。
+                // 曾做"客户端权威" -> 服务端格子物理与客户端物理互相拉扯(坐车抖动/开不动/
+                // 推车没反应)。此处只采纳朝向作为转向输入(玩家按 W 时朝最近的轨口开),
+                // 坐标一律忽略, 位置由服务端 MinecartEntity.tick 每刻 0x35 广播。
+                if (Double.isFinite(vcx) && Double.isFinite(vcy) && Double.isFinite(vcz)
                         && Float.isFinite(vyaw) && Float.isFinite(vpitch)) {
-                    cart.x = vcx; cart.y = vcy; cart.z = vcz;
-                    cart.yaw = vyaw; cart.pitch = vpitch;
-                    cart.clientDriven = true;
-                    cart.clientDrivenGrace = 10;
-                    double hDist = Math.hypot(ddx, ddz);
-                    if (hDist > 0.01) {
-                        int ndx = Math.abs(ddx) >= Math.abs(ddz) ? (ddx > 0 ? 1 : -1) : 0;
-                        int ndz = ndx == 0 ? (ddz > 0 ? 1 : -1) : 0;
-                        if (ndx != 0 || ndz != 0) { cart.dirX = ndx; cart.dirZ = ndz; }
-                        cart.speed = Math.min(0.6, hDist);
-                    } else {
-                        cart.speed = 0.0;
-                    }
-                    // 同步骑乘者坐标(服务端视角)
-                    this.x = vcx; this.y = vcy + 0.7; this.z = vcz;
+                    cart.lastInputYaw = vyaw;
                 }
             }
         }
@@ -1149,14 +1195,16 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     float reqSec = BlockManager.getBreakSecondsBestCase(bName);
                     if (reqSec > 0.0f) {
                         String dkey = pos[0] + "," + pos[1] + "," + pos[2];
-                        Long start = digStarts.remove(dkey);
-                        if (start == null) {
-                            return; // 无开始记录且非瞬破方块 → 拒绝
-                        }
-                        long elapsed = System.currentTimeMillis() - start;
-                        if (elapsed < (long) (reqSec * 1000.0f * 0.5f)) {
-                            return; // 挖掘过快 → 判定作弊, 不破坏
-                        }
+                    Long start = digStarts.remove(dkey);
+                    if (start == null) {
+                        clearDigProgress(); // Bug59: 被拒也要清其他玩家看到的裂纹
+                        return; // 无开始记录且非瞬破方块 → 拒绝
+                    }
+                    long elapsed = System.currentTimeMillis() - start;
+                    if (elapsed < (long) (reqSec * 1000.0f * 0.5f)) {
+                        clearDigProgress(); // Bug59: 被拒也要清其他玩家看到的裂纹
+                        return; // 挖掘过快 → 判定作弊, 不破坏
+                    }
                     }
                 }
                 breakBlockAt(pos[0], pos[1], pos[2]);
@@ -1175,11 +1223,13 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     breakBlockAt(pos[0], pos[1], pos[2]);
                 } else {
                     digStarts.put(pos[0] + "," + pos[1] + "," + pos[2], System.currentTimeMillis());
-                    broadcastBlockBreakProgress(this.eid, pos[0], pos[1], pos[2], 0);
+                    broadcastBlockBreakProgress(this.currentDim, this.eid, pos[0], pos[1], pos[2], 0);
                     // Bug59: 记录进行中的生存挖掘, tickSurvival 按 elapsed/总时长 广播裂纹阶段
                     digProgressX = pos[0]; digProgressY = pos[1]; digProgressZ = pos[2];
                     digProgressStart = System.currentTimeMillis();
-                    digProgressDurMs = Math.max(50.0f, reqSec0 * 1000.0f);
+                    // Bug59: 用真实工具耗时而非 best-case, 否则裂纹阶段对不上、中途消失
+                    digProgressDurMs = Math.max(50.0f,
+                        BlockManager.getBreakSeconds(bName0, data.inventoryIds[36 + heldItemSlot]) * 1000.0f);
                     digProgressStage = 0;
                 }
             }
@@ -1290,7 +1340,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         && targetStateId != 0 && BlockStateHelper.isSolidOpaque(targetStateId)) {
                     int fireState = com.CharunCore.server.world.FluidEngine.fireStateAt(this.currentDim, fp[0], fp[1], fp[2], 0);
                     WorldManager.setBlock(this.currentDim,fp[0], fp[1], fp[2], fireState);
-                    broadcastBlockChange(fp[0], fp[1], fp[2], fireState);
+                    broadcastBlockChange(this.currentDim, fp[0], fp[1], fp[2], fireState);
                     FluidEngine.scheduleFireTick(this.currentDim, fp[0], fp[1], fp[2], fireState);
                 }
                 return;
@@ -1305,7 +1355,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         && targetStateId != 0 && BlockStateHelper.isSolidOpaque(targetStateId)) {
                     int fireState = com.CharunCore.server.world.FluidEngine.fireStateAt(this.currentDim, fp[0], fp[1], fp[2], 0);
                     WorldManager.setBlock(this.currentDim,fp[0], fp[1], fp[2], fireState);
-                    broadcastBlockChange(fp[0], fp[1], fp[2], fireState);
+                    broadcastBlockChange(this.currentDim, fp[0], fp[1], fp[2], fireState);
                     FluidEngine.scheduleFireTick(this.currentDim, fp[0], fp[1], fp[2], fireState);
                     if (gameMode == 0) {
                         int slot = 36 + heldItemSlot;
@@ -1327,7 +1377,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     if (!"true".equals(hasEye)) {
                         int newState = BlockStateHelper.withProp(targetStateId, "eye", "true");
                         WorldManager.setBlock(this.currentDim,pos[0], pos[1], pos[2], newState);
-                        broadcastBlockChange(pos[0], pos[1], pos[2], newState);
+                        broadcastBlockChange(this.currentDim, pos[0], pos[1], pos[2], newState);
                         tryActivateEndPortal(pos[0], pos[1], pos[2]);
                         // 原版: 放入末影之眼消耗物品(生存模式)
                         if (gameMode == 0) {
@@ -1349,7 +1399,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 int[] fp = faceOffset(pos, face);
                 int waterState = BlockStateHelper.getDefault("water");
                 WorldManager.setBlock(this.currentDim,fp[0], fp[1], fp[2], waterState);
-                broadcastBlockChange(fp[0], fp[1], fp[2], waterState);
+                broadcastBlockChange(this.currentDim, fp[0], fp[1], fp[2], waterState);
                 FluidEngine.scheduleFluidTick(fp[0], fp[1], fp[2], waterState);
                 // 玩家倒水: 显式向 4 方向扩散成 level=1 流动水 (自然水体不排洪,
                 // 若只放 1 格水源会因 processFluid 不蔓延而"水不流动")。
@@ -1371,7 +1421,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 if ("water".equals(clickedName)
                         && "0".equals(BlockStateHelper.getProp(targetStateId, "level"))) {
                     WorldManager.setBlock(this.currentDim,pos[0], pos[1], pos[2], 0);
-                    broadcastBlockChange(pos[0], pos[1], pos[2], 0);
+                    broadcastBlockChange(this.currentDim, pos[0], pos[1], pos[2], 0);
                     int wbId = BlockManager.getItemIdByName("water_bucket");
                     if (gameMode == 0) {
                         int slotW = 36 + heldItemSlot;
@@ -1385,7 +1435,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 if ("lava".equals(clickedName)
                         && "0".equals(BlockStateHelper.getProp(targetStateId, "level"))) {
                     WorldManager.setBlock(this.currentDim,pos[0], pos[1], pos[2], 0);
-                    broadcastBlockChange(pos[0], pos[1], pos[2], 0);
+                    broadcastBlockChange(this.currentDim, pos[0], pos[1], pos[2], 0);
                     int lbId = BlockManager.getItemIdByName("lava_bucket");
                     if (gameMode == 0) {
                         int slotL = 36 + heldItemSlot;
@@ -1403,7 +1453,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 int[] fp = faceOffset(pos, face);
                 int lavaState = BlockStateHelper.getDefault("lava");
                 WorldManager.setBlock(this.currentDim,fp[0], fp[1], fp[2], lavaState);
-                broadcastBlockChange(fp[0], fp[1], fp[2], lavaState);
+                broadcastBlockChange(this.currentDim, fp[0], fp[1], fp[2], lavaState);
                 FluidEngine.scheduleFluidTick(fp[0], fp[1], fp[2], lavaState);
                 int bucketIdL = BlockManager.getItemIdByName("bucket");
                 if (gameMode == 0) {
@@ -1572,7 +1622,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (targetName != null && targetName.equals("dragon_egg")) {
                 int eggX = pos[0], eggY = pos[1], eggZ = pos[2];
                 WorldManager.setBlock(this.currentDim, eggX, eggY, eggZ, 0);
-                broadcastBlockChange(eggX, eggY, eggZ, 0);
+                broadcastBlockChange(this.currentDim, eggX, eggY, eggZ, 0);
                 // 瞬移到附近随机位置 (5 格内, 需要 2 格空间)
                 java.util.Random rng = new java.util.Random();
                 int eggState = BlockStateHelper.getDefault("dragon_egg");
@@ -1595,14 +1645,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     String an = BlockStateHelper.getName(at);
                     if (at == 0 || "air".equals(an) || "cave_air".equals(an)) {
                         WorldManager.setBlock(this.currentDim, nx, ny, nz, eggState);
-                        broadcastBlockChange(nx, ny, nz, eggState);
+                        broadcastBlockChange(this.currentDim, nx, ny, nz, eggState);
                         placed = true;
                     }
                 }
                 if (!placed) {
                     // 回退: 原位放回
                     WorldManager.setBlock(this.currentDim, eggX, eggY, eggZ, eggState);
-                    broadcastBlockChange(eggX, eggY, eggZ, eggState);
+                    broadcastBlockChange(this.currentDim, eggX, eggY, eggZ, eggState);
                 }
                 return;
             }
@@ -1731,15 +1781,16 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             // C7: 放置校验 — 目标格必须是空气/液体/可替换, 且不能落在玩家身体内
             if (!canPlaceInto(WorldManager.getBlockState(this.currentDim, pp[0], pp[1], pp[2]))) {
                 // Bug54: 拒绝时回发当前真实方块, 消除客户端预测的幽灵方块
-                broadcastBlockChange(pp[0], pp[1], pp[2],
+                broadcastBlockChange(this.currentDim, pp[0], pp[1], pp[2],
                     WorldManager.getBlockState(this.currentDim, pp[0], pp[1], pp[2]));
                 return;
             }
             // Bug47 修复: 只有"有碰撞箱"的方块才禁止放在脚下(原版行为);
             // 火把/红石粉/花等无碰撞方块原版本就可以放在玩家所站格子。
+            // Bug54: 碰撞检测从"仅自己"扩展到所有实体(其他玩家/生物), 与原版一致。
             boolean collides = BlockManager.hasCollision(blockName);
-            if (collides && intersectsPlayer(pp[0], pp[1], pp[2])) {
-                broadcastBlockChange(pp[0], pp[1], pp[2],
+            if (collides && intersectsAnyEntity(pp[0], pp[1], pp[2])) {
+                broadcastBlockChange(this.currentDim, pp[0], pp[1], pp[2],
                     WorldManager.getBlockState(this.currentDim, pp[0], pp[1], pp[2]));
                 return;
             }
@@ -1765,7 +1816,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             // ── 门（双高）────────────────────────────────
             if (blockName.endsWith("_door")) {
                 if (!canPlaceInto(WorldManager.getBlockState(this.currentDim, pp[0], pp[1] + 1, pp[2]))
-                        || intersectsPlayer(pp[0], pp[1] + 1, pp[2])) return;
+                        || intersectsAnyEntity(pp[0], pp[1] + 1, pp[2])) return;
                 placeDoor(pp[0], pp[1], pp[2], blockName, facing);
                 if (gameMode == 0) {
                     int slot = 36 + heldItemSlot;
@@ -1784,7 +1835,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (placeEvent.isCancelled()) return;
 
             WorldManager.setBlock(this.currentDim,pp[0], pp[1], pp[2], placeStateId);
-            broadcastBlockChange(pp[0], pp[1], pp[2], placeStateId);
+            broadcastBlockChange(this.currentDim, pp[0], pp[1], pp[2], placeStateId);
             RedstoneEngine.onBlockChanged(this.currentDim, pp[0], pp[1], pp[2]);
             // 放置带方块实体的方块时创建初始 BE NBT(告示牌/刷怪笼/信标等), 否则重启/重载后数据丢失。
             createInitialBlockEntity(pp[0], pp[1], pp[2], blockName);
@@ -1799,7 +1850,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             // 必须重读实际状态再广播。原用放置前的 placeStateId 广播 -> 客户端显示未连接/未激活的旧状态,
             // 直到重进游戏才正确(用户报"新放红石粉不连线/红石灯不亮, 重进就好"的根因)。
             int actualState = WorldManager.getBlockState(this.currentDim, pp[0], pp[1], pp[2]);
-            broadcastBlockChange(pp[0], pp[1], pp[2], actualState);
+            broadcastBlockChange(this.currentDim, pp[0], pp[1], pp[2], actualState);
 
             if (gameMode == 0) {
                 int slot = 36 + heldItemSlot;
@@ -2143,6 +2194,15 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 sendChestBlockEvent(closedChest, false);
                 java.util.Set<NetworkHandler> obs = chestObservers.get(closedChest);
                 if (obs != null) { obs.remove(this); if (obs.isEmpty()) chestObservers.remove(closedChest); }
+            }
+            // Bug51: 大箱子另一半同步关闭
+            ContainerStore.Pos closedPartner = openChestPartners.remove(closedWindowId);
+            if (closedPartner != null) {
+                ContainerStore.decrementViewers(closedPartner);
+                persistChest(closedPartner);
+                sendChestBlockEvent(closedPartner, false);
+                java.util.Set<NetworkHandler> pobs = chestObservers.get(closedPartner);
+                if (pobs != null) { pobs.remove(this); if (pobs.isEmpty()) chestObservers.remove(closedPartner); }
             }
             openEnderChests.remove(closedWindowId);
             openFurnaces.remove(closedWindowId);
@@ -3019,7 +3079,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         if (old != 0) spawnBlockDrop(bx, by, bz, old);
                     }
                     WorldManager.setBlock(this.currentDim,bx, by, bz, blockId);
-                    broadcastBlockChange(bx, by, bz, blockId);
+                    broadcastBlockChange(this.currentDim, bx, by, bz, blockId);
                     sendFeedback("已设置方块 " + blockName + " 在 " + bx + " " + by + " " + bz, "gray");
                 } catch (NumberFormatException e) { sendFeedback("无效坐标", "red"); }
             }
@@ -3047,7 +3107,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                             for (int bz = minZ; bz <= maxZ; bz++) {
                                 if (filterId != null && WorldManager.getBlockState(this.currentDim,bx, by, bz) != filterId) continue;
                                 WorldManager.setBlock(this.currentDim,bx, by, bz, blockId);
-                                broadcastBlockChange(bx, by, bz, blockId);
+                                broadcastBlockChange(this.currentDim, bx, by, bz, blockId);
                                 count++;
                             }
                         }
@@ -3073,7 +3133,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                                 int state = WorldManager.getBlockState(this.currentDim,bx, by, bz);
                                 int nx = bx + offX, ny = by + offY, nz = bz + offZ;
                                 WorldManager.setBlock(this.currentDim,nx, ny, nz, state);
-                                broadcastBlockChange(nx, ny, nz, state);
+                                broadcastBlockChange(this.currentDim, nx, ny, nz, state);
                             }
                         }
                     }
@@ -4463,15 +4523,18 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 itemCount = data.inventoryCounts[playerSlot];
             }
         } else if (openChests.containsKey(windowId) || openEnderChests.containsKey(windowId)) {
-            int[] chestContents = getChestContents(windowId);
-            if (slot >= 0 && slot < 27) {
-                itemId = chestContents[slot * 2];
-                itemCount = chestContents[slot * 2 + 1];
-                // 共享箱子槽位(0-26)实时同步给其他观察者
-                ContainerStore.Pos cpos = openChests.get(windowId);
-                if (cpos != null) broadcastChestSlot(cpos, slot, itemId, itemCount);
+            // Bug51: 双箱窗口按 0-26 本箱 / 27-53 邻箱路由
+            ContainerStore.ChestData cdata = chestDataForSlot(windowId, slot);
+            if (cdata != null) {
+                int ls = isPartnerChestSlot(windowId, slot) ? slot - 27 : slot;
+                itemId = cdata.slots[ls * 2];
+                itemCount = cdata.slots[ls * 2 + 1];
+                // 共享箱子槽位实时同步给其他观察者
+                ContainerStore.Pos cpos = isPartnerChestSlot(windowId, slot)
+                    ? openChestPartners.get(windowId) : openChests.get(windowId);
+                if (cpos != null) broadcastChestSlot(cpos, ls, itemId, itemCount);
             } else {
-                int playerSlot = chestToPlayerSlot(slot);
+                int playerSlot = chestToPlayerSlot(windowId, slot);
                 if (playerSlot < 0 || playerSlot >= 46) return;
                 itemId = data.inventoryIds[playerSlot];
                 itemCount = data.inventoryCounts[playerSlot];
@@ -4640,9 +4703,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private void sendRecipeBook(ChannelHandlerContext ctx) {
-        // 0x48 recipe_book_add — 统计总条目数(工作台 + 熔炉 + 高炉 + 烟熏炉 + 切石机)
-        // Bug5 修复: 先过滤掉物品表里不存在的条目再计数, 否则声明的 total 与实际写入条数不符,
-        // 客户端按 total 读取 -> 解析错位/失败。
+        // 0x48 recipe_book_add — 登录时只重置配方书并推送站台配方(熔炉/高炉/烟熏炉/切石机);
+        // 合成配方由 checkRecipeUnlocks 渐进解锁(replace=false 增量) —— 曾在登录全量推送全部
+        // 合成配方 + 渐进解锁同 id 重发, 双轨状态导致条目重复/错乱。
+        // displayId 分配: 0..C-1 = 去重后的合成配方(C = BOOK_DISPLAY_TO_RECIPE.size()),
+        // C.. = 站台配方, 与 checkRecipeUnlocks 的增量 id 永不冲突。
         var smeltAll = com.CharunCore.server.world.SmeltingSystem.allSmeltingEntries().stream()
                 .filter(se -> BlockManager.getItemIdByName(se.input) > 0 && BlockManager.getItemIdByName(se.result) > 0).toList();
         var blastAll = com.CharunCore.server.world.SmeltingSystem.allBlastingEntries().stream()
@@ -4651,52 +4716,15 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 .filter(se -> BlockManager.getItemIdByName(se.input) > 0 && BlockManager.getItemIdByName(se.result) > 0).toList();
         var stonecutterEntries = com.CharunCore.server.world.menu.MenuUtil.stonecutterEntries().stream()
                 .filter(se -> BlockManager.getItemIdByName(se.input) > 0 && BlockManager.getItemIdByName(se.result) > 0).toList();
-        int total = RECIPE_BOOK_ENTRIES.size() + smeltAll.size() + blastAll.size() + smokeAll.size() + stonecutterEntries.size();
+        int craftDisplayCount = BOOK_DISPLAY_TO_RECIPE.size();
+        // total 只算本包实际写入的站台条目! 合成配方不在登录包写(由 checkRecipeUnlocks 增量发),
+        // craftDisplayCount 仅用于给站台条目的 displayId 让出 0..C-1 的 id 空间。
+        // 曾把 craftDisplayCount 误算进 total -> 声明了数百个从未写入的幽灵条目,
+        // 客户端读完站台条目后越界 -> "Failed to decode recipe_book_add" 断线。
+        int total = smeltAll.size() + blastAll.size() + smokeAll.size() + stonecutterEntries.size();
         sendPacket(ctx, 0x48, pb -> {
             pb.writeVarInt(total);
-            int idx = RECIPE_BOOK_ENTRIES.size();
-            for (int i = 0; i < RECIPE_BOOK_ENTRIES.size(); i++) {
-                RecipeRegistry.Recipe r = RECIPE_BOOK_ENTRIES.get(i);
-                // RecipeDisplayEntry: id(RecipeDisplayId), display(RecipeDispatch), group, category, craftingRequirements, flags
-                pb.writeVarInt(i); // RecipeDisplayId (varint index)
-
-                if (r.shapeless) {
-                    // type 0 = crafting_shapeless: ingredients(list), result, craftingStation (无 width/height)
-                    pb.writeVarInt(0); // ShapelessCraftingRecipeDisplay
-                    int ingCount = 0;
-                    for (int g = 0; g < 9; g++) if (r.grid[g] != 0) ingCount++;
-                    pb.writeVarInt(ingCount);
-                    for (int g = 0; g < 9; g++)
-                        if (r.grid[g] != 0) writeIngredientSlotDisplay(pb, r.grid[g]);
-                } else {
-                    // type 1 = crafting_shaped: width, height, ingredients(w*h), result, craftingStation
-                    pb.writeVarInt(1); // ShapedCraftingRecipeDisplay
-                    int minR = 3, maxR = -1, minC = 3, maxC = -1;
-                    for (int rr = 0; rr < 3; rr++) for (int cc = 0; cc < 3; cc++) {
-                        if (r.grid[rr * 3 + cc] != 0) {
-                            minR = Math.min(minR, rr); maxR = Math.max(maxR, rr);
-                            minC = Math.min(minC, cc); maxC = Math.max(maxC, cc);
-                        }
-                    }
-                    if (maxR < 0) {
-                        pb.writeVarInt(1); pb.writeVarInt(1);
-                        pb.writeVarInt(1); writeIngredientSlotDisplay(pb, null);
-                    } else {
-                        int w = maxC - minC + 1, h = maxR - minR + 1;
-                        pb.writeVarInt(w); pb.writeVarInt(h);
-                        pb.writeVarInt(w * h);
-                        for (int rr = minR; rr <= maxR; rr++)
-                            for (int cc = minC; cc <= maxC; cc++)
-                                writeIngredientSlotDisplay(pb, r.grid[rr * 3 + cc]);
-                    }
-                }
-                writeResultSlotDisplay(pb, r.resultItemId, r.resultCount);
-                writeResultSlotDisplay(pb, "crafting_table", 1); // craftingStation
-                pb.writeVarInt(0);  // group (optvarint: 0 = 缺省/null)
-                pb.writeVarInt(r.category); // category (0=建筑 1=红石 2=装备 3=杂项)
-                pb.writeBoolean(false); // craftingRequirements (optional list, 缺省)
-                pb.writeByte(0);     // Entry flags (notification|highlight) = 0
-            }
+            int idx = craftDisplayCount;
 
             // #8/#13 熔炉/高炉/烟熏炉/切石机左侧配方。
             // 原版 FurnaceRecipeDisplay: ingredient + fuel(any_fuel) + result + craftingStation + duration + experience。
@@ -4897,9 +4925,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (n != null) have.add(n);
         }
         java.util.List<Integer> newly = new java.util.ArrayList<>();
-        for (int i = 0; i < RECIPE_BOOK_ENTRIES.size(); i++) {
-            if (unlockedRecipes.contains(i)) continue;
-            RecipeRegistry.Recipe r = RECIPE_BOOK_ENTRIES.get(i);
+        for (int d = 0; d < BOOK_DISPLAY_TO_RECIPE.size(); d++) {
+            if (unlockedRecipes.contains(d)) continue;
+            RecipeRegistry.Recipe r = RECIPE_BOOK_ENTRIES.get(BOOK_DISPLAY_TO_RECIPE.get(d));
             boolean ok = false;
             // 产物或任一原料出现在背包即解锁
             String resultName = BlockManager.itemIdToName(r.resultItemId);
@@ -4911,16 +4939,16 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     if (rep != null && have.contains(rep)) { ok = true; break; }
                 }
             }
-            if (ok) { unlockedRecipes.add(i); newly.add(i); }
+            if (ok) { unlockedRecipes.add(d); newly.add(d); }
         }
         if (newly.isEmpty()) return;
         // 增量推送(只发新解锁的, replace=false 以免覆盖已解锁列表)
         final java.util.List<Integer> toSend = newly;
         sendPacket(ctx, 0x48, pb -> {
             pb.writeVarInt(toSend.size());
-            for (int i : toSend) {
-                RecipeRegistry.Recipe r = RECIPE_BOOK_ENTRIES.get(i);
-                pb.writeVarInt(i); // displayId
+            for (int d : toSend) {
+                RecipeRegistry.Recipe r = RECIPE_BOOK_ENTRIES.get(BOOK_DISPLAY_TO_RECIPE.get(d));
+                pb.writeVarInt(d); // displayId (与登录站台配方的 id 空间不冲突)
                 if (r.shapeless) {
                     pb.writeVarInt(0); // shapeless
                     int ingCount = 0;
@@ -4951,7 +4979,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 }
                 writeResultSlotDisplay(pb, r.resultItemId, r.resultCount);
                 writeResultSlotDisplay(pb, "crafting_table", 1);
-                pb.writeVarInt(-1);
+                // group = ByteBufCodecs.OPTIONAL_VAR_INT(移位式: 0=无分组, present=值+1)。
+                // 曾写 varint(-1) -> 客户端解出 OptionalInt.of(-2) -> 所有解锁配方共享同一分组,
+                // 全部折叠进一个格子轮换显示。
+                pb.writeVarInt(0);
                 pb.writeVarInt(r.category);
                 pb.writeBoolean(false);
                 pb.writeByte(0);
@@ -5009,7 +5040,28 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return -1;
     }
 
-    private int chestToPlayerSlot(int containerSlot) {
+    /** Bug51: 该窗口 slot 是否属于大箱子另一半(27..53)。 */
+    private boolean isPartnerChestSlot(int windowId, int slot) {
+        return openChestPartners.containsKey(windowId) && slot >= 27 && slot < 54;
+    }
+
+    /** Bug51: 取窗口 slot 对应的箱子存储(双箱按 0-26 本箱 / 27-53 邻箱路由)。null = 非箱子槽。 */
+    private ContainerStore.ChestData chestDataForSlot(int windowId, int slot) {
+        if (openEnderChests.containsKey(windowId)) {
+            return (slot >= 0 && slot < 27) ? ContainerStore.enderChest(openEnderChests.get(windowId)) : null;
+        }
+        ContainerStore.Pos p = openChests.get(windowId);
+        if (p == null) return null;
+        if (slot >= 0 && slot < 27) return ContainerStore.chest(p);
+        if (isPartnerChestSlot(windowId, slot)) return ContainerStore.chest(openChestPartners.get(windowId));
+        return null;
+    }
+
+    private int chestToPlayerSlot(int windowId, int containerSlot) {
+        if (openChestPartners.containsKey(windowId)) {
+            if (containerSlot >= 54 && containerSlot <= 89) return containerSlot - 45;
+            return -1;
+        }
         if (containerSlot >= 27 && containerSlot <= 62) return containerSlot - 18;
         return -1;
     }
@@ -5494,11 +5546,13 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             }
             return new int[]{0, 0};
         } else if (openChests.containsKey(windowId) || openEnderChests.containsKey(windowId)) {
-            int[] contents = getChestContents(windowId);
-            if (slot >= 0 && slot < 27) {
-                return new int[]{contents[slot * 2], contents[slot * 2 + 1]};
+            // Bug51: 双箱窗口按 0-26 本箱 / 27-53 邻箱路由
+            ContainerStore.ChestData cdata = chestDataForSlot(windowId, slot);
+            if (cdata != null) {
+                int ls = isPartnerChestSlot(windowId, slot) ? slot - 27 : slot;
+                return new int[]{cdata.slots[ls * 2], cdata.slots[ls * 2 + 1]};
             } else {
-                int ps = chestToPlayerSlot(slot);
+                int ps = chestToPlayerSlot(windowId, slot);
                 if (ps < 0) return new int[]{0, 0};
                 return new int[]{data.inventoryIds[ps], data.inventoryCounts[ps]};
             }
@@ -5641,14 +5695,17 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             return playerSlotMeta(craftingToPlayerSlot(slot));
         }
         if (openChests.containsKey(windowId)) {
-            ContainerStore.ChestData cd = ContainerStore.chest(openChests.get(windowId));
-            if (slot >= 0 && slot < 27) return contMeta(cd.meta, slot);
-            return playerSlotMeta(chestToPlayerSlot(slot));
+            ContainerStore.ChestData cd = chestDataForSlot(windowId, slot);
+            if (cd != null) {
+                int ls = isPartnerChestSlot(windowId, slot) ? slot - 27 : slot;
+                return contMeta(cd.meta, ls);
+            }
+            return playerSlotMeta(chestToPlayerSlot(windowId, slot));
         }
         if (openEnderChests.containsKey(windowId)) {
             ContainerStore.ChestData cd = ContainerStore.enderChest(this.uuid);
             if (slot >= 0 && slot < 27) return contMeta(cd.meta, slot);
-            return playerSlotMeta(chestToPlayerSlot(slot));
+            return playerSlotMeta(chestToPlayerSlot(windowId, slot));
         }
         if (openFurnaces.containsKey(windowId)) {
             ContainerStore.FurnaceData fd = getFurnaceData(windowId);
@@ -5730,15 +5787,17 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             writePlayerSlotMeta(craftingToPlayerSlot(slot), m);
             return;
         }
-        if ((openChests.containsKey(windowId) || openEnderChests.containsKey(windowId)) && slot >= 0 && slot < 27) {
-            boolean isEnder = openEnderChests.containsKey(windowId);
-            ContainerStore.ChestData cd = isEnder ? ContainerStore.enderChest(this.uuid) : ContainerStore.chest(openChests.get(windowId));
-            cd.meta.slotDamage[slot] = empty ? 0 : m.damage();
-            cd.meta.slotEnchants[slot] = (empty || m.enchants().isEmpty())
-                    ? new java.util.HashMap<>() : new java.util.HashMap<>(m.enchants());
-            cd.meta.slotPotion[slot] = empty ? null : m.potion();
-            cd.meta.slotCustomName[slot] = empty ? null : m.customName();
-            return;
+        if (openChests.containsKey(windowId) || openEnderChests.containsKey(windowId)) {
+            ContainerStore.ChestData cd = chestDataForSlot(windowId, slot);
+            if (cd != null) {
+                int ls = isPartnerChestSlot(windowId, slot) ? slot - 27 : slot;
+                cd.meta.slotDamage[ls] = empty ? 0 : m.damage();
+                cd.meta.slotEnchants[ls] = (empty || m.enchants().isEmpty())
+                        ? new java.util.HashMap<>() : new java.util.HashMap<>(m.enchants());
+                cd.meta.slotPotion[ls] = empty ? null : m.potion();
+                cd.meta.slotCustomName[ls] = empty ? null : m.customName();
+                return;
+            }
         }
         if (openFurnaces.containsKey(windowId)) {
             ContainerStore.FurnaceData fd = getFurnaceData(windowId);
@@ -5897,21 +5956,19 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             return;
         }
         if (openChests.containsKey(windowId) || openEnderChests.containsKey(windowId)) {
-            boolean isEnder = openEnderChests.containsKey(windowId);
-            ContainerStore.ChestData cd = isEnder ? ContainerStore.enderChest(this.uuid) : ContainerStore.chest(openChests.get(windowId));
-            if (slot >= 0 && slot < 27) {
-                // Bug53: 曾一律 setChestSlot(...,0,null,null,null) 把刚放入物品的
-                // 附魔/药水/改名/耐久元数据清空 -> 箱子里的 NBT 物品重进/落盘即变白板。
-                ItemMeta pm = pendingWriteMeta;
-                boolean hasMeta = pm != null && !pm.isEmpty();
-                cd.setChestSlot(slot, Math.max(itemId, 0), Math.max(count, 0),
-                    hasMeta ? pm.damage() : 0,
-                    (hasMeta && !pm.enchants().isEmpty()) ? pm.enchants() : null,
-                    (hasMeta) ? pm.potion() : null,
-                    (hasMeta) ? pm.customName() : null);
+            // Bug51: 双箱窗口按 0-26 本箱 / 27-53 邻箱路由
+            ContainerStore.ChestData cd = chestDataForSlot(windowId, slot);
+            if (cd != null) {
+                int ls = isPartnerChestSlot(windowId, slot) ? slot - 27 : slot;
+                cd.setChestSlot(ls, Math.max(itemId, 0), Math.max(count, 0),
+                    pendingWriteMeta != null && !pendingWriteMeta.isEmpty() ? pendingWriteMeta.damage() : 0,
+                    pendingWriteMeta != null && !pendingWriteMeta.isEmpty() && !pendingWriteMeta.enchants().isEmpty()
+                        ? pendingWriteMeta.enchants() : null,
+                    pendingWriteMeta != null && !pendingWriteMeta.isEmpty() ? pendingWriteMeta.potion() : null,
+                    pendingWriteMeta != null && !pendingWriteMeta.isEmpty() ? pendingWriteMeta.customName() : null);
                 cd.version++;
             } else {
-                int ps = chestToPlayerSlot(slot);
+                int ps = chestToPlayerSlot(windowId, slot);
                 if (ps < 0) return;
                 writePlayerSlotMeta(ps, pendingWriteMeta);
                 data.inventoryIds[ps] = itemId;
@@ -7393,9 +7450,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     public void knockback(double kx, double kz, double ky) {
-        // entity_velocity = 0x64 (曾误用 0x63=attach_entity -> 客户端解析错乱)。
+        // entity_velocity/set_entity_motion = 0x63 (服务端 jar GameProtocols 注册序确认;
+        // 0x64=entity_equipment —— 曾误用 0x64 导致击退速度被客户端当装备数据静默吞掉)。
         // velocity 必须用 lpVec3 编码, 不能用 3×Short(旧格式), 否则客户端 lpVec3 解码器越界崩溃。
-        sendPacket(ctx, 0x64, pb -> {
+        sendPacket(ctx, 0x63, pb -> {
             pb.writeVarInt(this.eid);
             pb.writeLpVec3(kx, ky, kz);
         });
@@ -7747,7 +7805,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 newState = BlockStateHelper.withProp(newState, "conditional", condWant);
             }
             WorldManager.setBlock(this.currentDim, pos[0], pos[1], pos[2], newState);
-            broadcastBlockChange(pos[0], pos[1], pos[2], newState);
+            broadcastBlockChange(this.currentDim, pos[0], pos[1], pos[2], newState);
             RedstoneEngine.onBlockChanged(this.currentDim, pos[0], pos[1], pos[2]);
         }
         // 写回 BE 持久化
@@ -7887,6 +7945,16 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private int[] getMerchantContents(int windowId) {
         MerchantSession s = openMerchants.get(windowId);
         return s == null ? new int[6] : s.slots;
+    }
+
+    /** Bug11: 区块加载时从 BE 注册信标 —— beaconEffectTick 遍历 ContainerStore 的信标表,
+     *  曾只在打开 UI 时注册 -> 重启后信标静默失效("效果不能保存")。 */
+    public static void registerBeaconFromBE(ContainerStore.Pos pos, org.cloudburstmc.nbt.NbtMap be) {
+        ContainerStore.BeaconData bd = ContainerStore.beacon(pos);
+        if (be.containsKey("Primary")) bd.primary = be.getInt("Primary", -1);
+        if (be.containsKey("Secondary")) bd.secondary = be.getInt("Secondary", -1);
+        if (be.containsKey("Levels")) bd.levels = be.getInt("Levels", 0);
+        bd.version++;
     }
 
     // ── 附魔台书架计数 ──────────────────────────────────────────────────────
@@ -8362,10 +8430,11 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     public void sendHealthUpdate() {
-        // Bug: 曾用 0x66(set_experience) 发血量/饱食度 -> 客户端按经验格式解析多 3 字节直接断开
-        // (disconnect-*.txt: "set_experience was larger than I expected, found 3 bytes extra")。
-        // 正确包号: update_health = 0x67。
-        sendPacket(ctx, 0x67, pb -> {
+        // update_health/set_health = 0x66 (服务端 jar GameProtocols 注册序确认)。
+        // 0x63=set_entity_motion / 0x64=set_equipment / 0x65=set_experience / 0x66=set_health /
+        // 0x67=set_held_slot / 0x69=set_passengers —— 本区域曾连环错位(8-30 与 9-24 的
+        // "set_experience 3 bytes extra" 断线即装备包误放 0x65 所致), 已全部按注册序校准。
+        sendPacket(ctx, 0x66, pb -> {
             pb.writeFloat(health);
             pb.writeVarInt(data.food);
             pb.writeFloat(data.saturation);
@@ -8379,7 +8448,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (fireTicks > 0) flags |= 0x01;
         byte pose = (byte)(isSneaking ? 5 : 0); // 5=crouching, 0=standing
         final byte fFlags = flags, fPose = pose;
-        this.sendPacket(this.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+        this.sendPacket(this.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
             pb.writeVarInt(this.eid);
             pb.writeByte(0); pb.writeVarInt(0); pb.writeByte(fFlags);
             pb.writeByte(6); pb.writeVarInt(20); pb.writeVarInt(fPose);
@@ -8387,7 +8456,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         });
         for (NetworkHandler h : players.values()) {
             if (h == this || h.ctx == null) continue;
-            h.sendPacket(h.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            h.sendPacket(h.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(this.eid);
                 pb.writeByte(0); pb.writeVarInt(0); pb.writeByte(fFlags);
                 pb.writeByte(6); pb.writeVarInt(20); pb.writeVarInt(fPose);
@@ -8571,9 +8640,9 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private void sendExperienceUpdate() {
-        // Bug34 相关: 0x65 是 entity_equipment(给实体穿装备), 经验包是 0x66!
-        // 曾把经验更新发成 0x65 -> 客户端给自己的 LocalPlayer 应用乱码装备数据。
-        sendPacket(ctx, 0x66, pb -> {
+        // set_experience = 0x65 (0x66=update_health —— 曾误用 0x66 导致经验包被当血量包解码,
+        // 捡经验时客户端越界断线; 0x64=entity_equipment 也不是经验包)。
+        sendPacket(ctx, 0x65, pb -> {
             pb.writeFloat(data.xpProgress);
             pb.writeVarInt(data.xpLevel);
             pb.writeVarInt(data.xpTotal);
@@ -9079,6 +9148,23 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             pb.writeInt(eid);
             pb.writeByte((byte) (24 + dimOpLevel));
         });
+        // Bug1 强化: 与重生路径保持一致 —— abilities / player_info_update(ADD|GAMEMODE|LISTED) /
+        // game_state(3) / declare_commands 都要重发。1.21.5+ 客户端权限集由命令树派生,
+        // LocalPlayer.gamemode 由 player_info/game_state 刷新; 只发 entity_event 不够。
+        sendAbilitiesUpdate();
+        final int dimGm = this.gameMode;
+        for (NetworkHandler h : players.values()) {
+            if (h.ctx == null || !h.ctx.channel().isActive()) continue;
+            h.sendPacket(h.ctx, 0x44, pb -> {
+                pb.writeByte(0x01 | 0x04 | 0x08);
+                pb.writeVarInt(1); pb.writeUUID(this.uuid); pb.writeString(this.username);
+                writeProfileProperties(pb, this.profileProperties);
+                pb.writeVarInt(dimGm);
+                pb.writeBoolean(true);
+            });
+        }
+        sendPacket(ctx, 0x26, pb -> { pb.writeByte(3); pb.writeFloat(dimGm); });
+        sendCommandsPacket(ctx);
         final ChannelHandlerContext dimCtx = ctx;
         ctx.executor().schedule(() -> {
             if (dimCtx.channel().isActive() && !isDead && this.currentDim == targetDim) {
@@ -9286,7 +9372,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     WorldManager.setBlock(dim, bx + ox, by + oy, bz + 1, 0);
                 }
                 WorldManager.setBlock(dim, bx + ox, by + oy, bz, state);
-                broadcastBlockChange(bx + ox, by + oy, bz, state);
+                broadcastBlockChange(dim, bx + ox, by + oy, bz, state);
             }
         }
     }
@@ -9352,7 +9438,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private void broadcastMetadata() {
         for (NetworkHandler h : players.values()) {
             if (h == this || h.ctx == null) continue;
-            h.sendPacket(h.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            h.sendPacket(h.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(this.eid);
 
                 // Index 0: Entity Flags (type 0 = byte)
@@ -9431,8 +9517,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
      *   Index 0 (Entity Flags, type=byte): bit 0x02 = sneaking
      *   Index 6 (Pose, type=VarInt): 0=STANDING, 5=CROUCHING
      *
-     * Set Entity Data clientbound ID: 0x57 in 1.21.11 — ❓VERIFY via logs.
-     * Pose type VarInt ID: 20 in 1.21.x (may be 21 in 1.21.4+ — ❓verify).
+     * Set Entity Data clientbound ID: 0x61 (0x62=attach_entity/set_entity_link, 曾误用导致断线)。
+     * Pose type VarInt ID: 20 (1.21.11 序列化器注册序: BYTE=0..BOOLEAN=8..POSE=20, 服务端 jar 反汇编确认)。
      */
     private void setSneaking(boolean sneak) {
         this.isSneaking = sneak;
@@ -9441,7 +9527,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         for (NetworkHandler other : players.values()) {
             if (other == this || other.ctx == null) continue;
-            other.sendPacket(other.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)  // ❓ verify 0x57
+            other.sendPacket(other.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)  // ❓ verify 0x57
                 pb.writeVarInt(this.eid);
 
                 // Entry 1: flags byte (index 0, type 0 = byte)
@@ -9477,7 +9563,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         int pose = isSneaking ? 5 : 0;
         for (NetworkHandler other : players.values()) {
             if (other == this || other.ctx == null) continue;
-            other.sendPacket(other.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            other.sendPacket(other.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(this.eid);
                 pb.writeByte(0);      // metadata index 0
                 pb.writeVarInt(0);    // type = byte
@@ -9559,6 +9645,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void pumpChunkSends() {
         if (pendingChunkSends.isEmpty() || ctx == null || !ctx.channel().isActive()) return;
+        // Bug: 远距离 /tp 后提交速度(6/tick=120/s)远超远处区块生成速度(~10/s),
+        // ioExecutor 积压曾达 5197 任务 -> 世界长时间空转。积压超阈值时暂停提交,
+        // 让已入队区块先消化(区块按距离排序入队, 近处先出)。
+        if (WorldManager.ioBacklog() > 64) return;
         int budget = CHUNK_SEND_BUDGET;
         long[] entry;
         while (budget-- > 0 && (entry = pendingChunkSends.poll()) != null) {
@@ -9719,6 +9809,20 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
     }
 
+    /** Bug18: 拾取动画包 collect(0x7A, 1.21.2+ 线序: collectedId + collectorId + count)。
+     *  掉落物被拾取时物品飞向玩家的客户端动画 —— 此前缺失, 拾取只有音效没有动画。 */
+    public static void broadcastCollect(DimensionType dim, int collectedEid, int collectorEid, int count) {
+        for (NetworkHandler player : players.values()) {
+            if (player.ctx == null || !player.ctx.channel().isActive()) continue;
+            if (player.currentDim != dim) continue;
+            player.sendPacket(player.ctx, 0x7A, pb -> {
+                pb.writeVarInt(collectedEid);
+                pb.writeVarInt(collectorEid);
+                pb.writeVarInt(Math.max(1, count));
+            });
+        }
+    }
+
     /** 维度感知停止声音 (0x75 stop_sound): 发给同维度 128 格内玩家 (Bug22 唱片机停播)。 */
     public static void broadcastStopSound(DimensionType dim, double x, double y, double z,
                                           String soundName) {
@@ -9755,9 +9859,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
      *
      * TODO: Re-implement using the correct 1.21.11 particle packet once identified.
      */
-    public static void broadcastBlockBreakParticles(int x, int y, int z, int blockStateId) {
+    public static void broadcastBlockBreakParticles(DimensionType dim, int x, int y, int z, int blockStateId) {
         for (NetworkHandler player : players.values()) {
             if (player.ctx == null || !player.ctx.channel().isActive()) continue;
+            if (player.currentDim != dim) continue; // Bug56: 跨维度粒子泄漏
             int dx = (int) player.x - x;
             int dz = (int) player.z - z;
             if (dx * dx + dz * dz > 16384) continue;
@@ -9770,9 +9875,10 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
     }
 
-    public static void broadcastBlockBreakProgress(int breakerId, int x, int y, int z, int stage) {
+    public static void broadcastBlockBreakProgress(DimensionType dim, int breakerId, int x, int y, int z, int stage) {
         for (NetworkHandler player : players.values()) {
             if (player.ctx == null || !player.ctx.channel().isActive()) continue;
+            if (player.currentDim != dim) continue; // Bug56/59: 裂纹按维度过滤
             int dx = (int) player.x - x;
             int dz = (int) player.z - z;
             if (dx * dx + dz * dz > 16384) continue;
@@ -9855,7 +9961,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (target.isSneaking || target.fireTicks > 0) {
             byte tf = (byte) ((target.isSneaking ? 0x02 : 0) | (target.fireTicks > 0 ? 0x01 : 0));
             byte tp = (byte)(target.isSneaking ? 5 : 0);
-            this.sendPacket(this.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            this.sendPacket(this.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(target.eid);
                 pb.writeByte(0); pb.writeVarInt(0); pb.writeByte(tf);
                 pb.writeByte(6); pb.writeVarInt(20); pb.writeVarInt(tp);
@@ -9906,7 +10012,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         // 至少主手要发（空也发，让别人看到拿东西）
         int[] eqSlots = {mhSlot, 45, 8, 7, 6, 5};
-        receiver.sendPacket(receiver.ctx, 0x65, pb -> {
+        receiver.sendPacket(receiver.ctx, 0x64, pb -> { // entity_equipment=0x64 (0x65=set_experience, 曾误用 0x65 -> 骷髅持弓/盔甲广播被当经验包解码, 报 "3 bytes extra" 断线)
             pb.writeVarInt(source.eid);
             for (int i = 0; i < 6; i++) {
                 boolean last = (i == 5);
@@ -10237,7 +10343,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     int pz = fireZ + w * stepZ;
                     int portalState = BlockStateHelper.withProp(portal, "axis", axis == 0 ? "x" : "z");
                     WorldManager.setBlock(this.currentDim,px, fireY + h, pz, portalState);
-                    broadcastBlockChange(px, fireY + h, pz, portalState);
+                    broadcastBlockChange(this.currentDim, px, fireY + h, pz, portalState);
                 }
             }
             return true;
@@ -10330,7 +10436,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         final byte flags = (byte) (using ? 0x01 : 0x00);
         for (NetworkHandler p : players.values()) {
             if (p.ctx == null || p.currentDim != this.currentDim) continue;
-            p.sendPacket(p.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            p.sendPacket(p.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(this.eid);
                 pb.writeByte(8);      // index 8 = living entity flags
                 pb.writeVarInt(0);    // type: byte
@@ -10709,7 +10815,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
         dropContainerContents(x, y, z);
         WorldManager.setBlock(this.currentDim, x, y, z, 0);
-        broadcastBlockChange(x, y, z, 0);
+        broadcastBlockChange(this.currentDim, x, y, z, 0); // Bug56: 曾固定发主世界 -> 下界/末地挖不掉
         // Bug51: 破坏大箱子的一半后, 邻箱 type 回退 single
         if ("chest".equals(preName) || "trapped_chest".equals(preName)) {
             updateChestType(x + 1, y, z);
@@ -10721,7 +10827,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         AdvancementManager.onBlockBreak(this, preName);
         StatisticsManager.add(this, "mined", preName, 1);
         if (oldState != 0) {
-            broadcastBlockBreakParticles(x, y, z, oldState);
+            broadcastBlockBreakParticles(this.currentDim, x, y, z, oldState);
             if (gameMode == 0) {
                 addExhaustion(0.005f);
                 String blockName = BlockStateHelper.getName(oldState);
@@ -10916,7 +11022,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             for (int dx = -1; dx <= 1; dx++) {
                 for (int dz = -1; dz <= 1; dz++) {
                     WorldManager.setBlock(this.currentDim,bestCx + dx, y, bestCz + dz, portalId);
-                    broadcastBlockChange(bestCx + dx, y, bestCz + dz, portalId);
+                    broadcastBlockChange(this.currentDim, bestCx + dx, y, bestCz + dz, portalId);
                 }
             }
         }
@@ -11378,8 +11484,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         WorldManager.setBlock(this.currentDim,fx, fy, fz, footState);
         WorldManager.setBlock(this.currentDim,hx, fy, hz, headState);
-        broadcastBlockChange(fx, fy, fz, footState);
-        broadcastBlockChange(hx, fy, hz, headState);
+        broadcastBlockChange(this.currentDim, fx, fy, fz, footState);
+        broadcastBlockChange(this.currentDim, hx, fy, hz, headState);
     }
 
     // ── 门放置（下半 + 上半）────────────────────────────
@@ -11396,8 +11502,8 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         WorldManager.setBlock(this.currentDim,x, y,   z, lowerState);
         WorldManager.setBlock(this.currentDim,x, y+1, z, upperState);
-        broadcastBlockChange(x, y,   z, lowerState);
-        broadcastBlockChange(x, y+1, z, upperState);
+        broadcastBlockChange(this.currentDim, x, y,   z, lowerState);
+        broadcastBlockChange(this.currentDim, x, y+1, z, upperState);
     }
 
     // ── 问题 5：方块交互处理 ────────────────────────────
@@ -11408,7 +11514,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private void handleBedUse(int x, int y, int z) {
         if (currentDim != DimensionType.OVERWORLD) {
             WorldManager.setBlock(currentDim, x, y, z, 0);
-            broadcastBlockChange(x, y, z, 0);
+            broadcastBlockChange(currentDim, x, y, z, 0);
             ExplosionEngine.explode(
                     currentDim, x + 0.5, y + 0.5, z + 0.5, 5.0f, true);
             return;
@@ -11460,7 +11566,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (this.currentDim != DimensionType.THE_NETHER) {
             // 在主世界/末地使用重生锚会爆炸(原版行为)
             WorldManager.setBlock(this.currentDim, x, y, z, 0);
-            broadcastBlockChange(x, y, z, 0);
+            broadcastBlockChange(this.currentDim, x, y, z, 0);
             ExplosionEngine.explode(
                     this.currentDim, x + 0.5, y + 0.5, z + 0.5, 5.0f, true);
             return;
@@ -11472,7 +11578,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (c < 4) {
                 int ns = BlockStateHelper.withProp(stateId, "charges", String.valueOf(c + 1));
                 WorldManager.setBlock(this.currentDim, x, y, z, ns);
-                broadcastBlockChange(x, y, z, ns);
+                broadcastBlockChange(this.currentDim, x, y, z, ns);
                 if (gameMode == 0) {
                     data.inventoryCounts[36 + heldItemSlot]--;
                     if (data.inventoryCounts[36 + heldItemSlot] <= 0) {
@@ -11619,26 +11725,26 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             int otherState = WorldManager.getBlockState(this.currentDim,x, otherY, z);
             int otherNew   = BlockStateHelper.toggleBool(otherState, "open");
             WorldManager.setBlock(this.currentDim,x, otherY, z, otherNew);
-            broadcastBlockChange(x, otherY, z, otherNew);
+            broadcastBlockChange(this.currentDim, x, otherY, z, otherNew);
 
         } else if (name.equals("lever")) {
             newState = BlockStateHelper.toggleBool(stateId, "powered");
             // 拉杆触发红石更新
             WorldManager.setBlock(this.currentDim,x, y, z, newState);
-            broadcastBlockChange(x, y, z, newState);
+            broadcastBlockChange(this.currentDim, x, y, z, newState);
             RedstoneEngine.onBlockChanged(this.currentDim, x, y, z);
             return;
 
         } else if (name.endsWith("_button")) {
             newState = BlockStateHelper.withProp(stateId, "powered", "true");
             WorldManager.setBlock(this.currentDim,x, y, z, newState);
-            broadcastBlockChange(x, y, z, newState);
+            broadcastBlockChange(this.currentDim, x, y, z, newState);
             RedstoneEngine.onBlockChanged(this.currentDim, x, y, z);
             // 2秒后复位
             final int bx = x, by = y, bz = z, offState = BlockStateHelper.withProp(stateId, "powered", "false");
             ctx.executor().schedule(() -> {
                 WorldManager.setBlock(this.currentDim,bx, by, bz, offState);
-                broadcastBlockChange(bx, by, bz, offState);
+                broadcastBlockChange(this.currentDim, bx, by, bz, offState);
                 RedstoneEngine.onBlockChanged(this.currentDim, bx, by, bz);
             }, 2, java.util.concurrent.TimeUnit.SECONDS);
             return;
@@ -11652,7 +11758,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             newState = BlockStateHelper.withProp(stateId, "mode",
                 "compare".equals(cur) ? "subtract" : "compare");
             WorldManager.setBlock(this.currentDim,x, y, z, newState);
-            broadcastBlockChange(x, y, z, newState);
+            broadcastBlockChange(this.currentDim, x, y, z, newState);
             RedstoneEngine.onBlockChanged(this.currentDim, x, y, z);
             return;
 
@@ -11663,7 +11769,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             note = (note + 1) % 25;
             newState = BlockStateHelper.withProp(stateId, "note", String.valueOf(note));
             WorldManager.setBlock(this.currentDim, x, y, z, newState);
-            broadcastBlockChange(x, y, z, newState);
+            broadcastBlockChange(this.currentDim, x, y, z, newState);
             RedstoneEngine.playNoteManual(this.currentDim, x, y, z, newState);
             return;
 
@@ -11675,7 +11781,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             d = (d >= 4) ? 1 : d + 1;
             newState = BlockStateHelper.withProp(stateId, "delay", String.valueOf(d));
             WorldManager.setBlock(this.currentDim, x, y, z, newState);
-            broadcastBlockChange(x, y, z, newState);
+            broadcastBlockChange(this.currentDim, x, y, z, newState);
             return;
 
         } else if (name.equals("daylight_detector")) {
@@ -11683,7 +11789,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             boolean inv = "true".equals(BlockStateHelper.getProp(stateId, "inverted"));
             newState = BlockStateHelper.withProp(stateId, "inverted", inv ? "false" : "true");
             WorldManager.setBlock(this.currentDim, x, y, z, newState);
-            broadcastBlockChange(x, y, z, newState);
+            broadcastBlockChange(this.currentDim, x, y, z, newState);
             RedstoneEngine.onBlockChanged(this.currentDim, x, y, z);
             return;
 
@@ -11697,7 +11803,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     int nl = level + 1;
                     newState = BlockStateHelper.withProp(stateId, "level", String.valueOf(nl));
                     WorldManager.setBlock(this.currentDim,x, y, z, newState);
-                    broadcastBlockChange(x, y, z, newState);
+                    broadcastBlockChange(this.currentDim, x, y, z, newState);
                     if (nl == 8) {
                         spawnDrop(x, y + 1, z,
                             BlockManager.getItemIdByName("bone_meal"), 1);
@@ -11713,7 +11819,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 int ws = BlockStateHelper.withProp(
                     BlockStateHelper.getDefault("water_cauldron"), "level", "3");
                 WorldManager.setBlock(this.currentDim,x, y, z, ws);
-                broadcastBlockChange(x, y, z, ws);
+                broadcastBlockChange(this.currentDim, x, y, z, ws);
                 if (gameMode == 0) replaceHeldWith(heldItemId,
                     BlockManager.getItemIdByName("bucket"));
                 else giveItem(BlockManager.getItemIdByName("bucket"), 1);
@@ -11722,7 +11828,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if ("lava_bucket".equals(heldName)) {
                 int ls = BlockStateHelper.getDefault("lava_cauldron");
                 WorldManager.setBlock(this.currentDim,x, y, z, ls);
-                broadcastBlockChange(x, y, z, ls);
+                broadcastBlockChange(this.currentDim, x, y, z, ls);
                 if (gameMode == 0) replaceHeldWith(heldItemId,
                     BlockManager.getItemIdByName("bucket"));
                 else giveItem(BlockManager.getItemIdByName("bucket"), 1);
@@ -11737,7 +11843,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                             BlockStateHelper.getDefault("water_cauldron"),
                             "level", String.valueOf(lvl - 1));
                     WorldManager.setBlock(this.currentDim,x, y, z, ns);
-                    broadcastBlockChange(x, y, z, ns);
+                    broadcastBlockChange(this.currentDim, x, y, z, ns);
                     if (gameMode == 0) replaceHeldWith(heldItemId,
                             BlockManager.getItemIdByName("water_bottle"));
                     else giveItem(BlockManager.getItemIdByName("water_bottle"), 1);
@@ -11748,7 +11854,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 if ("3".equals(BlockStateHelper.getProp(stateId, "level"))) {
                     int ns = BlockStateHelper.getDefault("cauldron");
                     WorldManager.setBlock(this.currentDim,x, y, z, ns);
-                    broadcastBlockChange(x, y, z, ns);
+                    broadcastBlockChange(this.currentDim, x, y, z, ns);
                     if (gameMode == 0) replaceHeldWith(heldItemId,
                         BlockManager.getItemIdByName("water_bucket"));
                     else giveItem(BlockManager.getItemIdByName("water_bucket"), 1);
@@ -11833,17 +11939,40 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 slotIds[i] = chestData.slots[i * 2];
                 slotCounts[i] = chestData.slots[i * 2 + 1];
             }
+            // Bug51: 大箱子 —— 相邻同类箱作为另一半, 打开 generic_9x6 (0-26 本箱 / 27-53 邻箱)
+            ContainerStore.Pos partnerPos = null;
+            if (!isEnder) {
+                partnerPos = ContainerStore.findChestPartner(chestPos);
+            }
+            ContainerStore.ChestData partnerData = partnerPos != null ? ContainerStore.chest(partnerPos) : null;
+            final int[] pSlotIds = new int[27];
+            final int[] pSlotCounts = new int[27];
+            if (partnerData != null) {
+                for (int i = 0; i < 27; i++) {
+                    pSlotIds[i] = partnerData.slots[i * 2];
+                    pSlotCounts[i] = partnerData.slots[i * 2 + 1];
+                }
+            }
             if (isEnder) openEnderChests.put(windowId, this.uuid);
             else {
                 openChests.put(windowId, chestPos);
+                if (partnerPos != null) openChestPartners.put(windowId, partnerPos);
                 chestObservers.computeIfAbsent(chestPos, k -> java.util.concurrent.ConcurrentHashMap.newKeySet()).add(this);
                 ContainerStore.incrementViewers(chestPos); // P9-B2 陷阱箱查看者计数
                 persistChest(chestPos); // 打开即持久化(奖励箱生成后立即落盘, 防未关闭即卸载丢物品 P9-B7)
                 // 打开箱盖动画: block_event action=1 param=1 (open=true)
                 sendChestBlockEvent(chestPos, true);
+                // Bug51: 大箱子另一半同样计数/开盖动画
+                if (partnerPos != null) {
+                    chestObservers.computeIfAbsent(partnerPos, k -> java.util.concurrent.ConcurrentHashMap.newKeySet()).add(this);
+                    ContainerStore.incrementViewers(partnerPos);
+                    sendChestBlockEvent(partnerPos, true);
+                }
             }
             final int[] fSlotIds = slotIds;
             final int[] fSlotCounts = slotCounts;
+            final boolean doubleChest = partnerData != null;
+            final int stateCount = doubleChest ? 90 : 63;
             org.cloudburstmc.nbt.NbtMap title = org.cloudburstmc.nbt.NbtMap.builder()
                     .putString("text", name.endsWith("_shulker_box") ? "Shulker Box"
                         : name.equals("barrel") ? "Barrel"
@@ -11851,20 +11980,31 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     .build();
             sendPacket(ctx, 0x39, pb -> {
                 pb.writeVarInt(windowId);
-                pb.writeVarInt(RegistryHelper.menuType("generic_9x3"));
+                pb.writeVarInt(RegistryHelper.menuType(doubleChest ? "generic_9x6" : "generic_9x3"));
                 pb.writeAnonymousNbt(title);
             });
             // 单箱窗口共 63 格: 0-26 箱子 / 27-53 主背包 / 54-62 快捷栏
+            // Bug51: 大箱子窗口共 90 格: 0-26 本箱 / 27-53 邻箱 / 54-80 主背包 / 81-89 快捷栏
             sendPacket(ctx, 0x12, pb -> {
                 pb.writeVarInt(windowId);
                 pb.writeVarInt(0);
-                pb.writeVarInt(63);
+                pb.writeVarInt(stateCount);
                 for (int i = 0; i < 27; i++) {
                     writeChestSlot(pb, chestData, i);
                 }
-                for (int s = 27; s <= 62; s++) {
-                    int ps = s - 18;
-                    writePlayerSlot(pb, ps);
+                if (doubleChest) {
+                    for (int i = 0; i < 27; i++) {
+                        writeChestSlot(pb, partnerData, i);
+                    }
+                    for (int s = 54; s <= 89; s++) {
+                        int ps = s - 45;
+                        writePlayerSlot(pb, ps);
+                    }
+                } else {
+                    for (int s = 27; s <= 62; s++) {
+                        int ps = s - 18;
+                        writePlayerSlot(pb, ps);
+                    }
                 }
                 writeCarriedSlot(pb);
             });
@@ -12160,7 +12300,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     if (BlockStateHelper.getProp(jState, "has_record") != null) {
                         int ns = BlockStateHelper.withProp(jState, "has_record", "true");
                         WorldManager.setBlock(this.currentDim, x, y, z, ns);
-                        broadcastBlockChange(x, y, z, ns);
+                        broadcastBlockChange(this.currentDim, x, y, z, ns);
                     }
                     // 广播音效: 唱片对应 sound event(1.21 唱片机曲目 sound_event = music_disc.<歌曲>,
                     // 如 music_disc_13 -> music_disc.13; 曾用 item.music_disc_13.play -> 客户端不播放)。
@@ -12198,7 +12338,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         if (BlockStateHelper.getProp(jState2, "has_record") != null) {
                             int ns2 = BlockStateHelper.withProp(jState2, "has_record", "false");
                             WorldManager.setBlock(this.currentDim, x, y, z, ns2);
-                            broadcastBlockChange(x, y, z, ns2);
+                            broadcastBlockChange(this.currentDim, x, y, z, ns2);
                         }
                         // Bug22 修复: 取出唱片时停掉正在播放的曲目 (原只复位 has_record 不发送 stop_sound
                         // -> 客户端唱片机循环音效持续播放不停止)。
@@ -12214,7 +12354,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
 
         WorldManager.setBlock(this.currentDim,x, y, z, newState);
-        broadcastBlockChange(x, y, z, newState);
+        broadcastBlockChange(this.currentDim, x, y, z, newState);
     }
 
     // =========================================================================
@@ -12562,14 +12702,14 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (!myType.equals(curType)) {
             int ns = BlockStateHelper.withProp(st, "type", myType);
             WorldManager.setBlock(this.currentDim, x, y, z, ns);
-            broadcastBlockChange(x, y, z, ns);
+            broadcastBlockChange(this.currentDim, x, y, z, ns);
         }
         if (otherPos != null) {
             int os = WorldManager.getBlockState(this.currentDim, otherPos[0], otherPos[1], otherPos[2]);
             if (!otherType.equals(BlockStateHelper.getProp(os, "type"))) {
                 int ns = BlockStateHelper.withProp(os, "type", otherType);
                 WorldManager.setBlock(this.currentDim, otherPos[0], otherPos[1], otherPos[2], ns);
-                broadcastBlockChange(otherPos[0], otherPos[1], otherPos[2], ns);
+                broadcastBlockChange(this.currentDim, otherPos[0], otherPos[1], otherPos[2], ns);
             }
         }
     }
@@ -12719,6 +12859,30 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return (bx + 1 > pminX && bx < pmaxX)
             && (bz + 1 > pminZ && bz < pmaxZ)
             && (by + 1 > pminY && by < pmaxY);
+    }
+
+    /** Bug54: 目标格是否与同维度任意实体碰撞箱相交(原版 isUnobstructed 语义, 包含放置者自己:
+     *  原版不能把有碰撞的方块放进自己的碰撞箱)。物品/经验球/箭等不阻挡放置。 */
+    private boolean intersectsAnyEntity(int bx, int by, int bz) {
+        double minX = bx, maxX = bx + 1, minY = by, maxY = by + 1, minZ = bz, maxZ = bz + 1;
+        for (NetworkHandler p : players.values()) {
+            if (p == null || p.ctx == null || !p.ctx.channel().isActive()) continue;
+            if (p.currentDim != this.currentDim) continue;
+            if (p.x + 0.3 > minX && p.x - 0.3 < maxX
+                    && p.z + 0.3 > minZ && p.z - 0.3 < maxZ
+                    && p.y + 1.8 > minY && p.y < maxY) return true;
+        }
+        for (com.CharunCore.server.world.entity.Entity e : com.CharunCore.server.world.entity.EntityManager.getEntities().values()) {
+            if (e == null || e.dim != this.currentDim) continue;
+            if (e instanceof com.CharunCore.server.world.entity.ItemEntity) continue;
+            if (e instanceof com.CharunCore.server.world.entity.ArrowEntity) continue;
+            if (e instanceof com.CharunCore.server.world.entity.ExperienceOrbEntity) continue;
+            double half = e.width / 2.0;
+            if (e.x + half > minX && e.x - half < maxX
+                    && e.z + half > minZ && e.z - half < maxZ
+                    && e.y + e.height > minY && e.y < maxY) return true;
+        }
+        return false;
     }
 
     /** 该非完整方块是否需要实心支撑才能放置(原版 canSurvive)。统一走 SupportEngine。 */

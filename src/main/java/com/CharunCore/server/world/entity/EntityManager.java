@@ -1,21 +1,26 @@
 package com.CharunCore.server.world.entity;
 
+import java.io.FileReader;
+import java.nio.file.Paths;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
 import com.CharunCore.server.Main;
+import com.CharunCore.server.network.NetworkHandler;
+import com.CharunCore.server.utils.BlockStateHelper;
+import com.CharunCore.server.world.DimensionType;
 import com.CharunCore.server.world.ExplosionEngine;
+import com.CharunCore.server.world.WorldManager;
 import com.CharunCore.server.world.light.LightEngine;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.CharunCore.server.network.NetworkHandler;
-import com.CharunCore.server.utils.BlockStateHelper;
-import com.CharunCore.server.world.DimensionType;
-import com.CharunCore.server.world.WorldManager;
-
-import java.io.FileReader;
-import java.nio.file.Paths;
-import java.util.*;
-import java.util.concurrent.*;
 
 public class EntityManager {
     private static final Map<Integer, Entity> entities = new ConcurrentHashMap<>();
@@ -130,7 +135,7 @@ public class EntityManager {
             if (handler.ctx == null || handler.currentDim != mob.dim) continue;
             Set<Integer> seen = trackingFor.get(handler);
             if (seen == null || !seen.contains(mob.id)) continue;
-            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            handler.sendPacket(handler.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(mob.id);
                 pb.writeByte(17);
                 pb.writeVarInt(8);
@@ -213,7 +218,7 @@ public class EntityManager {
             Set<Integer> seen = trackingFor.get(handler);
             if (seen == null || !seen.contains(e.id)) continue;
             if (e instanceof ItemFrameEntity frame) {
-                handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+                handler.sendPacket(handler.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                     pb.writeVarInt(e.id);
                     pb.writeByte(8);
                     pb.writeVarInt(7);
@@ -221,7 +226,7 @@ public class EntityManager {
                     pb.writeByte(0xFF);
                 });
             } else if (e instanceof MobEntity mob) {
-                handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+                handler.sendPacket(handler.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                     pb.writeVarInt(e.id);
                     pb.writeByte(9);
                     pb.writeVarInt(3);
@@ -622,7 +627,15 @@ public class EntityManager {
                 || (e.prevX == 0.0 && e.prevY == 0.0 && e.prevZ == 0.0);
             // Bug18: 每 60 tick 对所有实体错峰重锚定一次(原版 ClientboundTeleportEntity 同步周期)。
             // 曾只发相对增量 -> 客户端本地模拟与服务端积分发散, 水中掉落物"看得见捡不到"。
-            if (com.CharunCore.server.Main.worldAge % 60 == e.id % 60) tp = true;
+            // Bug18 三轮: 掉落物客户端本地模拟流体(顺水漂), 服务端每 60 tick 无条件传送会
+            // 把已漂走的物品猛拉回服务端位置(注入服务端残余速度) -> "水中掉落物来回抽搐"。
+            // 改为: 掉落物仅当本 tick 位移/漂移较大(>1 格)时才重锚定, 小漂移交给客户端模拟。
+            if (com.CharunCore.server.Main.worldAge % 60 == e.id % 60) {
+                if (!(e instanceof ItemEntity)
+                        || Math.abs(e.dxMove) + Math.abs(e.dyMove) + Math.abs(e.dzMove) > 1.0) {
+                    tp = true;
+                }
+            }
             e.needsTeleport = tp;
             e.needHeadRot = (e.yaw != e.prevYaw);
         }
@@ -675,6 +688,21 @@ public class EntityManager {
         // 完全静止且朝向无变化且已同步过 -> 不发任何包(进一步减负)。
         if (!e.needsTeleport && !e.needHeadRot && e.yaw == e.prevYaw && e.pitch == e.prevPitch
                 && e.dxMove == 0.0 && e.dyMove == 0.0 && e.dzMove == 0.0 && e.syncedOnce) {
+            return;
+        }
+        // Bug24: 矿车走 1.21.2+ 专用 move_minecart(0x35) —— 客户端 NewMinecartBehavior
+        // 只按 MinecartStep 列表插值, 对通用增量包(0x33/0x34)不插值, 仅靠每 60 tick 的
+        // 0x23 瞬移一次 => "推了没反应/一顿一顿"。每 tick 发 1 个 step(位置+速度+朝向)。
+        if (e instanceof MinecartEntity) {
+            handler.sendPacket(handler.ctx, 0x35, pb -> {
+                pb.writeVarInt(e.id);
+                pb.writeVarInt(1);
+                pb.writeDouble(e.x); pb.writeDouble(e.y); pb.writeDouble(e.z);
+                pb.writeDouble(e.dxMove); pb.writeDouble(e.dyMove); pb.writeDouble(e.dzMove);
+                pb.writeFloat(e.yaw); pb.writeFloat(0.0f);
+                pb.writeFloat(1.0f);
+            });
+            e.syncedOnce = true;
             return;
         }
         if (e.needsTeleport) {
@@ -737,7 +765,7 @@ public class EntityManager {
 
         if (e instanceof ItemFrameEntity frame) {
             // 元数据: Item (index 8, Slot)
-            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            handler.sendPacket(handler.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(e.id);
                 pb.writeByte(8);
                 pb.writeVarInt(7);
@@ -745,7 +773,7 @@ public class EntityManager {
                 pb.writeByte(0xFF);
             });
         } else if (e instanceof ItemEntity item) {
-            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            handler.sendPacket(handler.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(e.id);
                 pb.writeByte(8);
                 pb.writeVarInt(7);
@@ -754,7 +782,7 @@ public class EntityManager {
             });
         } else if ("tnt".equals(e.typeName)) {
             // 引爆 TNT: FUSE 元数据(index 8, INT), 客户端据此渲染闪烁与缩放
-            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            handler.sendPacket(handler.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(e.id);
                 pb.writeByte(8);
                 pb.writeVarInt(1);
@@ -762,7 +790,7 @@ public class EntityManager {
                 pb.writeByte(0xFF);
             });
         } else if (e instanceof MobEntity mob) {
-            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            handler.sendPacket(handler.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(e.id);
                 // Entry 1: flags (index 0, byte) — 含 ON_FIRE 位(0x01), 使燃烧中的生物一出生就显示火焰
                 pb.writeByte(0);
@@ -778,8 +806,10 @@ public class EntityManager {
         }
     }
 
-    /** Bug55: skeleton-family spawn with weapon (entity_equipment 0x65, topBitSetTerminatedArray).
+    /** Bug55: skeleton-family spawn with weapon (entity_equipment 0x64, topBitSetTerminatedArray).
      *  Never sent equipment -> skeletons rendered empty-handed ("melee like zombies"). */
+    private static boolean EQUIP_WARNED = false;
+
     private static void sendMobEquipment(NetworkHandler handler, MobEntity mob, int entityId) {
         int itemId;
         switch (mob.entityName) {
@@ -787,9 +817,16 @@ public class EntityManager {
             case "wither_skeleton" -> itemId = com.CharunCore.server.utils.BlockManager.getItemIdByName("stone_sword");
             default -> { return; }
         }
-        if (itemId <= 0) return;
+        if (itemId <= 0) {
+            // 曾静默 return 导致骷髅空手; 打印一次便于定位物品表映射问题
+            if (!EQUIP_WARNED) {
+                EQUIP_WARNED = true;
+                System.err.println("[实体] " + mob.entityName + " 的武器物品 ID 无效(" + itemId + "), 装备包未发送");
+            }
+            return;
+        }
         final int fid = itemId;
-        handler.sendPacket(handler.ctx, 0x65, pb -> {
+        handler.sendPacket(handler.ctx, 0x64, pb -> { // entity_equipment=0x64 (0x65=set_experience, 曾误用 0x65 -> 骷髅持弓广播被当经验包解码断线)
             pb.writeVarInt(entityId);
             // topBitSetTerminatedArray: high bit of slot byte = more entries follow
             pb.getBuffer().writeByte(0x80); // slot 0 = main hand, more follow
@@ -806,7 +843,7 @@ public class EntityManager {
             if (handler.ctx == null || handler.currentDim != e.dim) continue;
             Set<Integer> seen = trackingFor.get(handler);
             if (seen == null || !seen.contains(e.id)) continue;
-            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            handler.sendPacket(handler.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(e.id);
                 pb.writeByte(0);    // metadata index 0
                 pb.writeVarInt(0);  // type = byte
@@ -900,7 +937,7 @@ public class EntityManager {
                 }
             });
             if (e instanceof MobEntity mob) {
-                handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+                handler.sendPacket(handler.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                     pb.writeVarInt(e.id);
                     pb.writeByte(9);
                     pb.writeVarInt(3);
@@ -922,7 +959,7 @@ public class EntityManager {
             if (handler.ctx == null || handler.currentDim != e.dim) continue;
             Set<Integer> seen = trackingFor.get(handler);
             if (seen == null || !seen.contains(e.id)) continue;
-            handler.sendPacket(handler.ctx, 0x62, pb -> { // entity_metadata (曾误用 0x61=scoreboard_display_objective)
+            handler.sendPacket(handler.ctx, 0x61, pb -> { // entity_metadata/set_entity_data=0x61 (0x62=attach_entity/set_entity_link 栓绳包,固定 8 字节 2×i32; 曾误用 0x62 -> eid 大于 127 时载荷超出 8 字节, 客户端报 "N bytes extra" 断线)
                 pb.writeVarInt(e.id);
                 pb.writeByte(16);
                 pb.writeVarInt(1);

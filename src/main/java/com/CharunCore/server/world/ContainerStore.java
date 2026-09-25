@@ -402,21 +402,31 @@ public final class ContainerStore {
     public static ChestData chest(Pos p) {
         ChestData d = CHESTS.get(p);
         if (d != null) return d;
-        // P9-B3 (best-effort): 检测水平相邻同类箱，合并共享同一 ChestData（合并读取）
-        Pos partner = findChestPartner(p);
-        if (partner != null) {
-            ChestData pd = CHESTS.get(partner);
-            if (pd != null) {
-                CHESTS.put(p, pd);
-                return pd;
-            }
-        }
+        // Bug51: 移除"相邻箱共享同一 27 格 ChestData"的旧近似 —— 两口相邻箱子会互相
+        // 覆盖内容(物品复制/丢失)。原版语义: 每箱独立 27 格存储, 大箱子由 UI 层
+        // 打开 generic_9x6 把两箱各 27 格拼成 54 格。
         ChestData created = CHESTS.computeIfAbsent(p, k -> new ChestData());
         if (!created.loaded) {
             loadChestFromBE(p, created);
             created.loaded = true;
         }
         return created;
+    }
+
+    /** Bug51: 检测水平相邻同类箱(大箱子另一半)。返回 null = 无相邻同类箱。 */
+    public static Pos findChestPartner(Pos p) {
+        int st = WorldManager.getBlockState(p.dim(), p.x(), p.y(), p.z());
+        String n = BlockStateHelper.getName(st);
+        if (n == null) return null;
+        if (!("chest".equals(n) || "trapped_chest".equals(n))) return null;
+        int[][] dirs = {{0,0,-1},{0,0,1},{1,0,0},{-1,0,0}};
+        for (int[] d : dirs) {
+            Pos np = new Pos(p.dim(), p.x() + d[0], p.y() + d[1], p.z() + d[2]);
+            int ns = WorldManager.getBlockState(np.dim(), np.x(), np.y(), np.z());
+            String nn = BlockStateHelper.getName(ns);
+            if (n.equals(nn) && ("chest".equals(nn) || "trapped_chest".equals(nn))) return np;
+        }
+        return null;
     }
 
     /** 箱子/木桶/潜影盒: 从区块 BE 的 Items 载入 (id,count) + 组件(附魔/药水/自定义名/耐久)。 */
@@ -442,21 +452,6 @@ public final class ContainerStore {
                 d.setChestSlot(slot, id, cnt, c.damage(), c.enchants(), c.potion(), c.customName());
             }
         } catch (Exception ignored) {}
-    }
-
-    private static Pos findChestPartner(Pos p) {
-        int st = WorldManager.getBlockState(p.dim(), p.x(), p.y(), p.z());
-        String n = BlockStateHelper.getName(st);
-        if (n == null) return null;
-        if (!("chest".equals(n) || "trapped_chest".equals(n))) return null;
-        int[][] dirs = {{0,0,-1},{0,0,1},{1,0,0},{-1,0,0}};
-        for (int[] d : dirs) {
-            Pos np = new Pos(p.dim(), p.x() + d[0], p.y() + d[1], p.z() + d[2]);
-            int ns = WorldManager.getBlockState(np.dim(), np.x(), np.y(), np.z());
-            String nn = BlockStateHelper.getName(ns);
-            if (n.equals(nn) && ("chest".equals(nn) || "trapped_chest".equals(nn))) return np;
-        }
-        return null;
     }
 
     // ── P9-B2: 陷阱箱查看者计数 → 红石信号 (clamp(viewers,0,15)) ─────────────
@@ -1202,7 +1197,7 @@ public final class ContainerStore {
             int newState = BlockStateHelper.withProp(state, "lit", want);
             if (newState == state) return;
             WorldManager.setBlock(pos.dim(), pos.x(), pos.y(), pos.z(), newState);
-            NetworkHandler.broadcastBlockChange(pos.x(), pos.y(), pos.z(), newState);
+            NetworkHandler.broadcastBlockChange(pos.dim(), pos.x(), pos.y(), pos.z(), newState);
         } catch (Exception ignored) {
         }
     }

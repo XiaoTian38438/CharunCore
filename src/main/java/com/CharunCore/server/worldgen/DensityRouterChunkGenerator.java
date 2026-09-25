@@ -231,6 +231,12 @@ public final class DensityRouterChunkGenerator {
         return featuresDone.contains(key);
     }
 
+    /** 磁盘加载的区块视为已完成 feature 放置 —— 否则缓存淘汰后重跑 generate() 会
+     *  重放 feature(末地水晶一柱双颗/树重复等, Bug57)。 */
+    public void markFeaturesDone(long key) {
+        featuresDone.add(key);
+    }
+
     /** 当区块从 WorldManager 卸载时，同步清理生成器内部的缓存数据，防止内存泄漏。 */
     public void purgeChunkCache(java.util.Collection<Long> keys) {
         for (Long key : keys) {
@@ -306,6 +312,9 @@ public final class DensityRouterChunkGenerator {
                     registerStructuresForChunk(nc, nwx, nwz, computeTopSolidY(nc));
                 }
             }
+            // Bug43: 纯种子 start(下界要塞)远窗口提前注册 —— 要塞分件延伸 ~10 区块,
+            // 3x3 预注册覆盖不到, 先于锚点区块生成的区块永久缺失分件(烈焰人刷怪笼房间)。
+            registerFarSeedStarts(chunkX, chunkZ);
 
             if (dimensionType == DimensionType.OVERWORLD) {
                 FeatureDecoration.carveOverworld(level, chunkX, chunkZ, seedLo);
@@ -364,8 +373,11 @@ public final class DensityRouterChunkGenerator {
         java.util.List<com.CharunCore.server.worldgen.structure2.Beardifier.Rigid> rigids = new java.util.ArrayList<>();
         java.util.List<com.CharunCore.server.worldgen.structure2.Beardifier.Junction> junctions = new java.util.ArrayList<>();
         int cMinX = chunkX << 4, cMinZ = chunkZ << 4;
-        for (int wdx = -1; wdx <= 1; wdx++) {
-            for (int wdz = -1; wdz <= 1; wdz++) {
+        // Bug52 二轮: start 查询窗口 ±1 → ±8。村庄 piece 包围盒横跨 ~7 区块,
+        // 锚点在 3x3 之外的 piece 完全不吃 Beardifier(实测"重测还是悬空"的根因之一)。
+        // start 表全局缓存, 查询是纯 Map 读, 扩窗代价可忽略。
+        for (int wdx = -8; wdx <= 8; wdx++) {
+            for (int wdz = -8; wdz <= 8; wdz++) {
                 for (var start : mgr.getStartsForChunk(dimensionType, chunkX + wdx, chunkZ + wdz)) {
                     if (!(start instanceof com.CharunCore.server.worldgen.structure2.StructureStart ss)
                             || !ss.isValid()) continue;
@@ -685,6 +697,9 @@ public final class DensityRouterChunkGenerator {
             : (dimensionType == DimensionType.THE_END)
             ? NoiseSettings.END : NoiseSettings.OVERWORLD;
         Chunk chunk = new Chunk(chunkX, chunkZ, MIN_Y, dimensionType.height >> 4);
+        // Bug57/58: 生成期必须立刻设置维度 —— 曾等 generate() 返回后才由 WorldManager 赋值,
+        // 生成期创建的末地水晶等实体 dim 全为默认 OVERWORLD -> 水晶刷进主世界。
+        chunk.dim = dimensionType;
         int cellCountXZ = 16 / settings.getCellWidth();
         int cellWidth = settings.getCellWidth();
         int cellHeight = settings.getCellHeight();
@@ -1061,6 +1076,60 @@ public final class DensityRouterChunkGenerator {
             mgr.addStart(dimensionType, chunkX, chunkZ,
                 new StructureStart(
                     chosen.structureId(), chunkX, chunkZ, pieces));
+        }
+    }
+
+    /** Bug43: 纯种子 start(下界要塞)远窗口提前注册。
+     *  要塞 start 只依赖种子/网格/权重, 不依赖锚点区块地形(无需 medianSurface/biome 查询 ——
+     *  要塞 biome 标签覆盖全部下界群系), 因此可在任意区块生成期确定性重算并提前注册。
+     *  与 registerStructuresForChunk 的选择流程逐行同序(随机数消费一致), 两者对同一锚点
+     *  必然产出相同 start, addStart 按 (id,chunkX,chunkZ) 去重幂等。 */
+    private void registerFarSeedStarts(int chunkX, int chunkZ) {
+        if (dimensionType != DimensionType.THE_NETHER) return;
+        StructureManager2 mgr = StructureManager2.getInstance();
+        if (cachedStructureSets == null) cachedStructureSets = StructureSet.loadAll();
+        final int window = 12; // 要塞分件最大延伸(区块)
+        for (int dx = -window; dx <= window; dx++) {
+            for (int dz = -window; dz <= window; dz++) {
+                int ax = chunkX + dx, az = chunkZ + dz;
+                for (StructureSet set : cachedStructureSets.values()) {
+                    if (set == null || set.getPlacementLike() == null) continue;
+                    if (set.getRings() != null) continue;
+                    if (!set.getPlacementLike().isStructureChunk(seedLo, ax, az)) continue;
+                    boolean hasFortress = false;
+                    for (StructureSelectionEntry e : set.getStructures()) {
+                        if ("fortress".equals(e.structureId())) { hasFortress = true; break; }
+                    }
+                    if (!hasFortress) continue;
+                    // 与 registerStructuresForChunk 相同的随机流: picker -> 权重选择 -> nextLong
+                    RandomSource picker = StructurePlacementMath.withLargeFeatureSeed(seedLo, ax, az);
+                    int totalWeight = 0;
+                    for (StructureSelectionEntry e : set.getStructures()) {
+                        StructureRegistry.ConfiguredStructure cs = StructureRegistry.get(e.structureId());
+                        if (cs == null) continue;
+                        if (!isStructureAllowed(cs.id)) continue;
+                        totalWeight += e.weight();
+                    }
+                    if (totalWeight <= 0) continue;
+                    int roll = picker.nextInt(totalWeight);
+                    int acc = 0;
+                    StructureSelectionEntry chosen = null;
+                    for (StructureSelectionEntry e : set.getStructures()) {
+                        StructureRegistry.ConfiguredStructure cs = StructureRegistry.get(e.structureId());
+                        if (cs == null) continue;
+                        if (!isStructureAllowed(cs.id)) continue;
+                        acc += e.weight();
+                        if (roll < acc) { chosen = e; break; }
+                    }
+                    if (chosen == null || !"fortress".equals(chosen.structureId())) continue;
+                    long sSeed = picker.nextLong();
+                    int centerX = (ax << 4) + 8;
+                    int centerZ = (az << 4) + 8;
+                    mgr.addStart(dimensionType, ax, az,
+                        ProceduralStructureStart.fortress(sSeed, centerX - 8, centerZ - 8,
+                            "fortress", ax, az));
+                }
+            }
         }
     }
 
