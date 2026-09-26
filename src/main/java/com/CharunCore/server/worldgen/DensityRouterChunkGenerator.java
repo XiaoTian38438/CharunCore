@@ -3,34 +3,52 @@ package com.CharunCore.server.worldgen;
 import java.util.Arrays;
 import java.util.Set;
 
-import com.CharunCore.server.world.DimensionType;
-import com.CharunCore.server.world.gen.LegacyRandomSource;
-import com.CharunCore.server.worldgen.biome.BiomeManager;
-import com.CharunCore.server.worldgen.feature.*;
-import com.CharunCore.server.worldgen.structure.StructureManager;
-import com.CharunCore.server.worldgen.structure2.*;
 import com.CharunCore.server.utils.BlockStateHelper;
+import com.CharunCore.server.world.DimensionType;
 import com.CharunCore.server.world.chunk.Chunk;
+import com.CharunCore.server.world.gen.LegacyRandomSource;
+import com.CharunCore.server.world.gen.NoiseParameters;
+import com.CharunCore.server.world.gen.NormalNoise;
 import com.CharunCore.server.world.gen.RandomSource;
 import com.CharunCore.server.world.gen.WorldgenRandom;
 import com.CharunCore.server.world.gen.XoroshiroRandomSource;
+import com.CharunCore.server.worldgen.biome.BiomeManager;
+import com.CharunCore.server.worldgen.biome.Climate;
+import com.CharunCore.server.worldgen.biome.MultiNoiseBiomeSource;
+import com.CharunCore.server.worldgen.biome.NetherBiomeSource;
 import com.CharunCore.server.worldgen.density.DensityFunction;
 import com.CharunCore.server.worldgen.density.DensityFunction.NoiseHolder;
 import com.CharunCore.server.worldgen.density.NoiseRouter;
 import com.CharunCore.server.worldgen.density.NoiseRouterData;
+import com.CharunCore.server.worldgen.feature.AmethystGeodeGenerator;
+import com.CharunCore.server.worldgen.feature.AquaticGenerator;
+import com.CharunCore.server.worldgen.feature.BiomeDecorator;
+import com.CharunCore.server.worldgen.feature.ChorusTreeFeature;
+import com.CharunCore.server.worldgen.feature.DripstoneGenerator;
+import com.CharunCore.server.worldgen.feature.GlowLichenGenerator;
+import com.CharunCore.server.worldgen.feature.MonsterRoomGenerator;
+import com.CharunCore.server.worldgen.feature.NetherFeatures;
+import com.CharunCore.server.worldgen.feature.OreGenerator;
+import com.CharunCore.server.worldgen.feature.SimpleTreeFeature;
+import com.CharunCore.server.worldgen.feature.SimpleTreeFeature.TreeType;
+import com.CharunCore.server.worldgen.feature.SpringGenerator;
+import com.CharunCore.server.worldgen.feature.SurfaceDecorator;
 import com.CharunCore.server.worldgen.noisechunk.NoiseChunk;
 import com.CharunCore.server.worldgen.noisechunk.NoiseSettings;
 import com.CharunCore.server.worldgen.noisechunk.QuartPos;
-import com.CharunCore.server.worldgen.noisechunk.aquifer.Aquifer;
-import com.CharunCore.server.worldgen.noisechunk.carver.CarvingMask;
-import com.CharunCore.server.worldgen.noisechunk.carver.CaveWorldCarver;
-import com.CharunCore.server.worldgen.noisechunk.carver.CanyonWorldCarver;
-import com.CharunCore.server.worldgen.biome.MultiNoiseBiomeSource;
-import com.CharunCore.server.worldgen.biome.NetherBiomeSource;
-import com.CharunCore.server.worldgen.biome.Climate;
-import com.CharunCore.server.worldgen.feature.SimpleTreeFeature.TreeType;
-import com.CharunCore.server.world.gen.NormalNoise;
-import com.CharunCore.server.world.gen.NoiseParameters;
+import com.CharunCore.server.worldgen.structure2.BiomeTagResolver;
+import com.CharunCore.server.worldgen.structure2.ConcentricRingsStructurePlacement;
+import com.CharunCore.server.worldgen.structure2.JigsawPlacement;
+import com.CharunCore.server.worldgen.structure2.NonJigsawPlacer;
+import com.CharunCore.server.worldgen.structure2.PoolElementStructurePiece;
+import com.CharunCore.server.worldgen.structure2.ProceduralStructureStart;
+import com.CharunCore.server.worldgen.structure2.StructureManager2;
+import com.CharunCore.server.worldgen.structure2.StructureMarkerProcessor;
+import com.CharunCore.server.worldgen.structure2.StructurePlacementMath;
+import com.CharunCore.server.worldgen.structure2.StructureRegistry;
+import com.CharunCore.server.worldgen.structure2.StructureSelectionEntry;
+import com.CharunCore.server.worldgen.structure2.StructureSet;
+import com.CharunCore.server.worldgen.structure2.StructureStart;
 import com.CharunCore.server.worldgen.surfacerule.NetherSurfaceRules;
 import com.CharunCore.server.worldgen.surfacerule.OverworldSurfaceRules;
 import com.CharunCore.server.worldgen.surfacerule.SurfaceRules;
@@ -338,6 +356,10 @@ public final class DensityRouterChunkGenerator {
 
             placeStructures2(level, chunk, chunkX, chunkZ, topSolidY);
 
+            // 结构自带生物(村民/铁傀儡/动物/掠夺者等): placeStructures2 过程中模板
+            // entities 列表已随 piece 收集到 level, 这里统一 flush 入 EntityManager。
+            flushStructureEntities(level);
+
             // Bug27: 要塞改走 RegisterStructuresForChunk 注册的 StrongholdPieces 分件系统,
             // 原版 moveBelowSeaLevel 由 ProceduralStructureStart 的分件引擎处理。
             // 曾直接调用 StrongholdPortalRoomGenerator(仅生成传送门房间) -> 要塞只剩一个房间。
@@ -363,6 +385,26 @@ public final class DensityRouterChunkGenerator {
         } finally {
             lock.unlock();
             featureLocks.remove(key);
+        }
+    }
+
+    /** 结构自带生物 flush: 同一 piece 会被其覆盖的每个区块各 place 一次(方块幂等, 实体不行),
+     *  用 (名字+坐标) 全局去重; 相邻区块并行 generate 由 ConcurrentHashMap.newKeySet 保证唯一。 */
+    private static final java.util.Set<String> spawnedStructureEntities = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private void flushStructureEntities(WorldGenLevel level) {
+        java.util.List<WorldGenLevel.PendingEntity> pend = level.getPendingEntities();
+        if (pend.isEmpty()) return;
+        for (WorldGenLevel.PendingEntity pe : pend) {
+            String key = pe.name() + ":" + pe.x() + "," + pe.y() + "," + pe.z();
+            if (!spawnedStructureEntities.add(key)) continue;
+            com.CharunCore.server.world.entity.MobEntity m =
+                new com.CharunCore.server.world.entity.MobEntity(
+                    com.CharunCore.server.world.entity.EntityManager.allocateId(),
+                    pe.name(), pe.x(), pe.y(), pe.z());
+            m.dim = dimensionType;
+            m.persistRequired = true; // 原版模板实体带 PersistenceRequired, 不参与自然消失
+            com.CharunCore.server.world.entity.EntityManager.addEntity(m);
         }
     }
 

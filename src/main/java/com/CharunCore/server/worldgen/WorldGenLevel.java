@@ -26,6 +26,19 @@ public class WorldGenLevel {
     private final List<StructureTemplate.DataMarker>
         dataMarkers = new ArrayList<>();
 
+    /** 结构自带生物（模板 entities 列表）——生成完成后统一 flush 到 EntityManager。 */
+    public record PendingEntity(double x, double y, double z, String name) {}
+
+    private final List<PendingEntity> pendingEntities = new ArrayList<>();
+
+    public void addPendingEntity(double x, double y, double z, String name) {
+        pendingEntities.add(new PendingEntity(x, y, z, name));
+    }
+
+    public List<PendingEntity> getPendingEntities() {
+        return pendingEntities;
+    }
+
     public WorldGenLevel(int centerCX, int centerCZ, Map<Long, Chunk> window,
                          long seed, int seaLevel, int minY, int height) {
         this.centerCX = centerCX;

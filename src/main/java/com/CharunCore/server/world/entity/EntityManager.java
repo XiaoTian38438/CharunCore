@@ -306,6 +306,7 @@ public class EntityManager {
         for (Entity e : new java.util.ArrayList<>(entities.values())) {
             if (!(e instanceof MobEntity m)) continue;
             if (m.entityName.equals("villager")) continue;
+            if (m.persistRequired) continue; // 结构模板实体(原版 PersistenceRequired) 永不消失
             double nearest = Double.MAX_VALUE;
             for (NetworkHandler p : NetworkHandler.players.values()) {
                 if (p.isDead) continue;

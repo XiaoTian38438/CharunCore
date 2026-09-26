@@ -20,6 +20,11 @@ public class StructureTemplate {
     private final int[] paletteStateIds;
     private final List<StructureBlockInfo> blocks;
     private List<JigsawBlockInfo> jigsaws;
+    /** 模板顶层 entities 列表(村民/铁傀儡/牛羊/掠夺者等), 放置时按旋转/镜像变换收集。 */
+    private final List<TemplateEntity> entities = new ArrayList<>();
+
+    /** 实体条目: blockPos 为模板相对坐标(整数格), entityName 为 nbt.id 去掉 minecraft: 前缀。 */
+    public record TemplateEntity(int bx, int by, int bz, String entityName) {}
 
     public StructureTemplate(int sizeX, int sizeY, int sizeZ,
                               int[] paletteStateIds, List<StructureBlockInfo> blocks) {
@@ -27,6 +32,8 @@ public class StructureTemplate {
         this.paletteStateIds = paletteStateIds;
         this.blocks = blocks;
     }
+
+    public List<TemplateEntity> getEntities() { return entities; }
 
     public List<StructureBlockInfo> blocks() { return blocks; }
 
@@ -131,6 +138,13 @@ public class StructureTemplate {
                 }
                 level.setBlockEntity(worldX, worldY, worldZ, beBuilder.build());
             }
+        }
+
+        // 结构自带生物: 模板 entities 列表随 piece 一起变换收集(村民/铁傀儡/动物/掠夺者等),
+        // 由 WorldGenLevel 汇总、区块生成完成后统一 flush 到 EntityManager。
+        for (TemplateEntity te : entities) {
+            int[] p = transformPosition(te.bx(), te.by(), te.bz(), rotation, mirror);
+            level.addPendingEntity(originX + p[0] + 0.5, originY + p[1], originZ + p[2] + 0.5, te.entityName());
         }
     }
 
@@ -240,7 +254,20 @@ public class StructureTemplate {
             return c != 0 ? c : Integer.compare(a.z(), b.z());
         });
 
-        return new StructureTemplate(sizeX, sizeY, sizeZ, stateIds, blocks);
+        StructureTemplate tpl = new StructureTemplate(sizeX, sizeY, sizeZ, stateIds, blocks);
+
+        List<NbtMap> entityList = template.getList("entities", NbtType.COMPOUND);
+        if (entityList != null) {
+            for (NbtMap entry : entityList) {
+                NbtMap entNbt = entry.getCompound("nbt");
+                String id = entNbt != null ? entNbt.getString("id") : null;
+                List<Integer> bp = entry.getList("blockPos", NbtType.INT);
+                if (id == null || id.isEmpty() || bp == null || bp.size() < 3) continue;
+                String name = id.startsWith("minecraft:") ? id.substring(10) : id;
+                tpl.entities.add(new TemplateEntity(bp.get(0), bp.get(1), bp.get(2), name));
+            }
+        }
+        return tpl;
     }
 
     private static int resolveWithProps(String name, NbtMap props) {

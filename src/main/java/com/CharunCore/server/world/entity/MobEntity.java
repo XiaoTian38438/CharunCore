@@ -35,6 +35,8 @@ public class MobEntity extends LivingEntity {
     private static final int BABY_MATURE = 2400;
     /** 距离最近玩家 >32 格后累计的存活刻数, 用于随机消失判定。 */
     public int despawnCounter = 0;
+    /** 模板实体(结构自带生物)持久标记: 原版模板实体 NBT 带 PersistenceRequired, 不参与自然消失。 */
+    public boolean persistRequired = false;
     /** #30 修复: 是否计入"敌对生物上限"并随敌对生物一起消失。末地末影人/下界僵尸猪灵等
      *  中立生物经敌对刷怪器生成, 原版仍占用末地/下界怪物上限且会消失; 曾仅按 isHostile()
      *  判定 -> 这类中立怪不计数也不消失 -> 末地末影人无限刷。生成时置 true。 */
@@ -72,6 +74,12 @@ public class MobEntity extends LivingEntity {
             case "squid" -> { this.maxHealth = 10.0f; }
             case "wolf" -> { this.maxHealth = 8.0f; }
             case "villager" -> { this.maxHealth = 20.0f; }
+            case "pillager", "vindicator", "evoker" -> { this.maxHealth = 24.0f; }
+            case "iron_golem" -> { this.maxHealth = 100.0f; }
+            case "cat", "ocelot" -> { this.maxHealth = 10.0f; }
+            case "horse", "donkey", "mule" -> { this.maxHealth = 22.0f; }
+            case "llama", "trader_llama" -> { this.maxHealth = 22.0f; }
+            case "shulker" -> { this.maxHealth = 30.0f; }
             default -> { this.maxHealth = 20.0f; }
         }
         this.health = this.maxHealth;
@@ -84,6 +92,11 @@ public class MobEntity extends LivingEntity {
             case "spider", "cave_spider" -> { this.width = 1.4; this.height = 0.9; }
             case "enderman" -> { this.width = 0.6; this.height = 2.9; }
             case "creeper" -> { this.width = 0.6; this.height = 1.7; }
+            case "iron_golem" -> { this.width = 1.4; this.height = 2.7; }
+            case "cat", "ocelot" -> { this.width = 0.6; this.height = 0.7; }
+            case "horse", "donkey", "mule" -> { this.width = 1.39; this.height = 1.6; }
+            case "llama", "trader_llama" -> { this.width = 0.9; this.height = 1.87; }
+            case "ravager" -> { this.width = 2.2; this.height = 2.2; }
             default -> { this.width = 0.6; this.height = 1.95; }
         }
     }

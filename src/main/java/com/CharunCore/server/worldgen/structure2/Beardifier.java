@@ -104,6 +104,33 @@ public final class Beardifier {
         minX = Math.max(minX, baseX); maxX = Math.min(maxX, baseX + 15);
         minZ = Math.max(minZ, baseZ); maxZ = Math.min(maxZ, baseZ + 15);
 
+        // B4: 桩基 —— 核函数(exp 衰减 12 格)拉不平大落差(山坡村庄 piece 高于地形 15~25 格),
+        // 这是"村庄悬空/地形被切断"的残留根因。对 beard_thin/beard_box 片段底部每 2 格一个
+        // 桩位向下填石柱直到触地(≤20 格), 观感为自然地基, 彻底消除悬空。
+        for (Rigid r : rigids) {
+            if (!r.adjustment.equals("beard_thin") && !r.adjustment.equals("beard_box")) continue;
+            int bottom = r.box.minY + r.groundLevelDelta - 1;
+            int px0 = Math.max(r.box.minX, baseX), px1 = Math.min(r.box.maxX, baseX + 15);
+            int pz0 = Math.max(r.box.minZ, baseZ), pz1 = Math.min(r.box.maxZ, baseZ + 15);
+            for (int px = px0; px <= px1; px += 2) {
+                for (int pz = pz0; pz <= pz1; pz += 2) {
+                    for (int y = bottom; y > Math.max(minY, bottom - 20); y--) {
+                        int cur = level.getBlock(px, y, pz);
+                        if (cur == 0) {
+                            level.setBlock(px, y, pz, y < 0 ? deepslate : stone);
+                            continue;
+                        }
+                        String cn = BlockStateHelper.getName(cur);
+                        if (cn != null && (cn.equals("water") || cn.equals("lava"))) {
+                            level.setBlock(px, y, pz, y < 0 ? deepslate : stone);
+                            continue;
+                        }
+                        break; // 触地(任意实体方块) —— 桩到此为止
+                    }
+                }
+            }
+        }
+
         // Bug#2: 回填的地基要"地表化" —— 原版 Beardifier 在密度层工作, 表面规则随后
         // 正常长草; 我们是方块后处理, 直接填 stone 会留下一圈灰色石壁截断观感。
         // 记录回填格, 收尾时给顶面 1 层草方块、下面 2 层泥土。

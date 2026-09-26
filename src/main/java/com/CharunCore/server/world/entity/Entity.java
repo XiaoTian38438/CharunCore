@@ -103,6 +103,13 @@ public class Entity {
             return;
         }
 
+        // 结构生物在区块生成线程提前入表: 所在区块尚未注册进 WorldManager 时
+        // getBlockState 返回空气, 实体会凭空下坠(落到地面时已掉进地形里)。
+        // 区块未加载则冻结本 tick(不积重力), 加载后自然落地。
+        if (WorldManager.getChunkCached(dim, ((int) Math.floor(x)) >> 4, ((int) Math.floor(z)) >> 4) == null) {
+            return;
+        }
+
         boolean inWater = isInFluid("water");
 
         vy -= inWater ? 0.02 : 0.08;
