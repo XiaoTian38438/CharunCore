@@ -39,13 +39,10 @@ public class SimpleTreeFeature {
         return placeTree(singleChunkLevel, x, y, z, type, random);
     }
 
-    /** 树干行进受阻判定: 树叶不阻挡(原版树干可穿过/覆盖邻近树的树叶), 实心地形才中止。
-     *  曾无条件 return false -> 密林中树干撞上邻树树冠即弃置 = 大量"断木"。 */
+    /** 树干行进受阻判定(B3): 树叶与实心地形都算阻挡。调用处区分 —— 实心地形或过矮撞叶则
+     *  放弃种树; 已长够 4 格后撞邻树叶冠则提前停高(树冠照常生成), 消除"原木穿出邻树冠"的突出。 */
     private static boolean trunkBlocked(WorldGenLevel level, int x, int y, int z) {
-        int s = level.getBlock(x, y, z);
-        if (s == 0) return false;
-        String n = BlockStateHelper.getName(s);
-        return n == null || !n.contains("leaves");
+        return level.getBlock(x, y, z) != 0;
     }
 
     public static boolean placeTree(WorldGenLevel level, int x, int y, int z, TreeType type, RandomSource random) {
@@ -67,7 +64,13 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) {
+                // B3: 已长够 4 格后撞上邻树叶冠 -> 提前停高(树冠照常), 不再穿出造成"突出原木"
+                int bs = level.getBlock(x, by, z);
+                String bn = bs == 0 ? null : BlockStateHelper.getName(bs);
+                if (dy >= 4 && bn != null && bn.contains("leaves")) break;
+                return false;
+            }
             level.setBlock(x, by, z, logId);
         }
 
@@ -137,7 +140,13 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) {
+                // B3: 已长够 4 格后撞上邻树叶冠 -> 提前停高(树冠照常), 不再穿出造成"突出原木"
+                int bs = level.getBlock(x, by, z);
+                String bn = bs == 0 ? null : BlockStateHelper.getName(bs);
+                if (dy >= 4 && bn != null && bn.contains("leaves")) break;
+                return false;
+            }
             level.setBlock(x, by, z, SPRUCE_LOG);
         }
 
@@ -252,7 +261,13 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) {
+                // B3: 已长够 4 格后撞上邻树叶冠 -> 提前停高(树冠照常), 不再穿出造成"突出原木"
+                int bs = level.getBlock(x, by, z);
+                String bn = bs == 0 ? null : BlockStateHelper.getName(bs);
+                if (dy >= 4 && bn != null && bn.contains("leaves")) break;
+                return false;
+            }
             level.setBlock(x, by, z, JUNGLE_LOG);
         }
 
@@ -329,7 +344,13 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) {
+                // B3: 已长够 4 格后撞上邻树叶冠 -> 提前停高(树冠照常), 不再穿出造成"突出原木"
+                int bs = level.getBlock(x, by, z);
+                String bn = bs == 0 ? null : BlockStateHelper.getName(bs);
+                if (dy >= 4 && bn != null && bn.contains("leaves")) break;
+                return false;
+            }
             level.setBlock(x, by, z, ACACIA_LOG);
         }
 
@@ -362,7 +383,13 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) {
+                // B3: 已长够 4 格后撞上邻树叶冠 -> 提前停高(树冠照常), 不再穿出造成"突出原木"
+                int bs = level.getBlock(x, by, z);
+                String bn = bs == 0 ? null : BlockStateHelper.getName(bs);
+                if (dy >= 4 && bn != null && bn.contains("leaves")) break;
+                return false;
+            }
             level.setBlock(x, by, z, CHERRY_LOG);
         }
 
@@ -401,7 +428,13 @@ public class SimpleTreeFeature {
 
         for (int dy = 0; dy < height; dy++) {
             int by = y + dy;
-            if (dy > 0 && trunkBlocked(level, x, by, z)) return false;
+            if (dy > 0 && trunkBlocked(level, x, by, z)) {
+                // B3: 已长够 4 格后撞上邻树叶冠 -> 提前停高(树冠照常), 不再穿出造成"突出原木"
+                int bs = level.getBlock(x, by, z);
+                String bn = bs == 0 ? null : BlockStateHelper.getName(bs);
+                if (dy >= 4 && bn != null && bn.contains("leaves")) break;
+                return false;
+            }
             level.setBlock(x, by, z, OAK_LOG);
         }
 

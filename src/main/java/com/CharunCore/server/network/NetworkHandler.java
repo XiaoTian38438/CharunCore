@@ -1175,6 +1175,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
             }
             var chatEvent = EVENTS.fire(new PlayerChatEvent(this, rawMsg));
             if (chatEvent.isCancelled()) return;
+            System.out.println("[聊天] <" + username + "> " + chatEvent.getMessage());
             // 使用 profileless_chat (0x21) 发送真正的玩家消息
             broadcastPlayerMessage(chatEvent.getMessage());
         }

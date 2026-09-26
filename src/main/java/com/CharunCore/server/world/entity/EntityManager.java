@@ -246,7 +246,14 @@ public class EntityManager {
 
     public static void tick() {
         java.util.List<Entity> toExplode = null;
+        long tickNo = Main.worldAge;
         for (Entity e : entities.values()) {
+            // B3: 远处实体降频 tick —— 距最近玩家 >32 格每 4 tick 一次, >64 格每 20 tick 一次。
+            // /tp 或大范围加载后刷怪量暴涨, 全量逐刻 tick(AI+物理+查询)是主线程卡死(假死)的直接根因。
+            if (e instanceof MobEntity m) {
+                int interval = mobTickInterval(m);
+                if (interval > 1 && (tickNo + e.id) % interval != 0) continue;
+            }
             try {
                 e.tick();
             } catch (Exception ex) {
@@ -274,13 +281,31 @@ public class EntityManager {
         if (spawnRng.nextInt(200) == 0) {
             trySpawnPassiveMobs();
         }
-        despawnMobs();
+        if (tickNo % 4 == 0) {
+            despawnMobs();
+        }
     }
 
-    /** 自然消失: 远离所有玩家的敌对生物按原版节奏消失(>128 格立即消失, 32~128 格随机消失)。 */
+    /** B3: 实体的 tick 间隔(按距最近玩家距离分级)。1=每刻, 4=远, 20=极远。 */
+    private static int mobTickInterval(MobEntity m) {
+        double nearestSq = Double.MAX_VALUE;
+        for (NetworkHandler p : NetworkHandler.players.values()) {
+            if (p.isDead || p.currentDim != m.dim) continue;
+            double dx = m.x - p.x, dy = m.y - p.y, dz = m.z - p.z;
+            double d = dx * dx + dy * dy + dz * dz;
+            if (d < nearestSq) nearestSq = d;
+        }
+        if (nearestSq > 64.0 * 64.0) return 20;
+        if (nearestSq > 32.0 * 32.0) return 4;
+        return 1;
+    }
+
+    /** 自然消失(B3 扩展到全部生物): >128 格立即消失, 32~128 格按原版节奏随机消失。
+     *  曾只 despawn 敌对生物 -> 动物/村民外被动生物无限堆积放大 tick 开销。村民保留。 */
     private static void despawnMobs() {
         for (Entity e : new java.util.ArrayList<>(entities.values())) {
-            if (!(e instanceof MobEntity m) || !countsAsHostile(m)) continue;
+            if (!(e instanceof MobEntity m)) continue;
+            if (m.entityName.equals("villager")) continue;
             double nearest = Double.MAX_VALUE;
             for (NetworkHandler p : NetworkHandler.players.values()) {
                 if (p.isDead) continue;

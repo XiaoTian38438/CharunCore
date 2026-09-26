@@ -530,7 +530,12 @@ public class WorldManager {
         }
 
         // 视野距离 + 缓冲区（多留几格避免玩家来回走时反复加载/卸载）
-        final int UNLOAD_RADIUS = 16; // VIEW_DISTANCE(12) + 4 buffer
+        final int UNLOAD_RADIUS = 20; // VIEW_DISTANCE(12) + 8 buffer
+        // B3: 新载区块保护期 —— 登录时序中先以 join 点加载初始区块、后以出生点重载,
+        // 30s 定时器会把前一批(几百个)一次性全卸 -> 透明区块/实体 desync(假死观感)。
+        // 区块落内存后 90 秒内不参与卸载。
+        final long PROTECT_MS = 90_000L;
+        final long now = System.currentTimeMillis();
 
         for (var dimEntry : dimChunks.entrySet()) {
             DimensionType dim = dimEntry.getKey();
@@ -555,7 +560,11 @@ public class WorldManager {
                         }
                     }
                 }
-                if (!inRange) toUnload.add(key);
+                if (!inRange) {
+                    Chunk c = store.get(key);
+                    if (c != null && now - c.loadedAtMs < PROTECT_MS) continue;
+                    toUnload.add(key);
+                }
             }
 
             if (toUnload.isEmpty()) continue;

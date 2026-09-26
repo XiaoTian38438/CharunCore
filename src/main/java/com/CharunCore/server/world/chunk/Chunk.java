@@ -13,6 +13,8 @@ public class Chunk {
     private final int sectionCount;
     private final Section[] sections = new Section[24];
     private final java.util.Map<Long, org.cloudburstmc.nbt.NbtMap> blockEntities = new java.util.concurrent.ConcurrentHashMap<>();
+    /** B3: 区块入内存时间戳 —— unloadDistantChunks 的保护期依据(90 秒内新载区块不卸载)。 */
+    public volatile long loadedAtMs = System.currentTimeMillis();
 
     public Chunk(int x, int z) {
         this(x, z, -64, 24);

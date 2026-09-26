@@ -195,6 +195,10 @@ public class MobEntity extends LivingEntity {
         if (deathTime == 0 && isPassive()) {
             fleeTimer = 60;
         }
+        // B3: 低血逃跑 —— 敌对生物血量 <30% 时优先逃离战场(比原版聪明, 避免无脑送死)
+        if (deathTime == 0 && isHostile() && health > 0 && health < maxHealth * 0.3f) {
+            fleeTimer = Math.max(fleeTimer, 80);
+        }
         if (deathTime == 0 && isNeutral() && "player".equals(source)) {
             angeredTimer = 240; // 被玩家攻击后约 12 秒敌对
         }
@@ -278,9 +282,10 @@ public class MobEntity extends LivingEntity {
         double nearestDistSq = 16.0 * 16.0;
 
         for (NetworkHandler player : NetworkHandler.players.values()) {
-            // #41 修复: 原版创造/旁观玩家也会被怪物索敌追击(只是攻击判定不同)。
-            // 曾跳过 gameMode 1/3 -> 创造模式测试时生物呆立不寻路。
             if (player.isDead || player.currentDim != this.dim) continue;
+            // 原版: 创造/旁观玩家不作为索敌目标(怪物不追击, 游荡行为不受影响)。
+            // 曾为调试改成追击创造 -> 追着飞走的创造玩家冲进未加载区块, 是生物系统卡死的触发器之一。
+            if (player.gameMode == 1 || player.gameMode == 3) continue;
             double dx = player.x - x;
             double dy = player.y - y;
             double dz = player.z - z;
@@ -291,7 +296,20 @@ public class MobEntity extends LivingEntity {
             }
         }
 
-        if ((isHostile() || (isNeutral() && angeredTimer > 0)) && nearestPlayer != null) {
+        // B3: 低血逃跑优先于追击 —— 敌对生物血量 <30% 时背向玩家逃离一段时间
+        if (fleeTimer > 0 && nearestPlayer != null) {
+            fleeTimer--;
+            double dx = x - nearestPlayer.x;
+            double dz = z - nearestPlayer.z;
+            double dist = Math.sqrt(dx * dx + dz * dz);
+            if (dist < 0.001) dist = 0.001;
+            vx = (dx / dist) * 0.25;
+            vz = (dz / dist) * 0.25;
+            // 逃跑面朝移动方向(远离威胁), 与追击/矿车一致用 atan2(-mvx, mvz)。
+            this.yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+            this.yaw = ((this.yaw % 360) + 360) % 360;
+            tryJumpObstacle();
+        } else if ((isHostile() || (isNeutral() && angeredTimer > 0)) && nearestPlayer != null) {
             // B2: EntityTargetEvent —— 插件可取消索敌或改写目标
             var targetEvent = com.CharunCore.server.plugin.event.EventManager.INSTANCE.fire(
                     new com.CharunCore.server.plugin.event.events.EntityTargetEvent(this, nearestPlayer, nearestPlayer));
@@ -401,10 +419,8 @@ public class MobEntity extends LivingEntity {
             if (dist < 0.001) dist = 0.001;
             vx = (dx / dist) * 0.25;
             vz = (dz / dist) * 0.25;
-            // 原版: 逃跑时应面朝移动方向(远离威胁)。dx,dz 为远离玩家方向(即速度方向),
-            // 与追击/矿车一致用 atan2(-mvx, mvz), 而非朝向威胁源(差 180°, 导致倒着跑, #41)。
             this.yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
-            this.yaw = ((this.yaw % 360) + 360) % 360; // #41 归一化, 防负角字节错误
+            this.yaw = ((this.yaw % 360) + 360) % 360;
             tryJumpObstacle();
         } else {
             if (fleeTimer > 0) fleeTimer--;
@@ -423,6 +439,11 @@ public class MobEntity extends LivingEntity {
                 }
             }
             if (vx != 0 || vz != 0) tryJumpObstacle();
+        }
+
+        // B3: 趋利避害 —— 前方是岩浆/火/仙人掌或深崖时转向绕开, 各方向都危险则停下
+        if (deathTime == 0 && (vx != 0 || vz != 0) && !isFlyingMob()) {
+            steerAroundHazard();
         }
 
         if (burnsInDaylight() && dim == DimensionType.OVERWORLD) {
@@ -512,6 +533,53 @@ public class MobEntity extends LivingEntity {
             arrow.baseDamage = getAttackDamage();
             EntityManager.addEntity(arrow);
         }
+    }
+
+    /** B3: 趋利避害 —— 前瞻位置(约 4 tick 位移)有危险时先试左右 ±60° 绕行, 都危险则原地停下。 */
+    private void steerAroundHazard() {
+        double speed = Math.sqrt(vx * vx + vz * vz);
+        if (speed < 0.001) return;
+        double nx = x + vx * 4, nz = z + vz * 4;
+        if (!isHazardAt(nx, y, nz)) return;
+        double baseYaw = Math.atan2(-vx, vz);
+        for (int sign : new int[]{1, -1, 2, -2}) {
+            double ty = baseYaw + sign * Math.toRadians(60);
+            double tx = -Math.sin(ty) * speed, tz = Math.cos(ty) * speed;
+            if (!isHazardAt(x + tx * 4, y, z + tz * 4)) {
+                vx = tx; vz = tz;
+                this.yaw = (float) Math.toDegrees(ty);
+                this.yaw = ((this.yaw % 360) + 360) % 360;
+                return;
+            }
+        }
+        vx = 0; vz = 0;
+    }
+
+    /** 前瞻格为岩浆/火/仙人掌, 或脚下 5 格内无地(深崖)时视为危险。飞行生物不调用。 */
+    private boolean isHazardAt(double wx, double wy, double wz) {
+        int bx = (int) Math.floor(wx), bz = (int) Math.floor(wz);
+        int by = (int) Math.floor(wy);
+        for (int dy = -1; dy <= 0; dy++) {
+            int s = com.CharunCore.server.world.WorldManager.getBlockStateCached(dim, bx, by + dy, bz);
+            if (s == 0) continue;
+            String n = com.CharunCore.server.utils.BlockStateHelper.getName(s);
+            if ("lava".equals(n) || "fire".equals(n) || n.endsWith("_fire") || "cactus".equals(n)
+                    || "powder_snow".equals(n)) return true;
+        }
+        boolean ground = false;
+        for (int dy = 0; dy >= -4 && !ground; dy--) {
+            int s = com.CharunCore.server.world.WorldManager.getBlockStateCached(dim, bx, by - 1 + dy, bz);
+            if (s != 0 && !"air".equals(com.CharunCore.server.utils.BlockStateHelper.getName(s))) ground = true;
+        }
+        return !ground;
+    }
+
+    /** 飞行/漂浮生物(不做地面避险)。 */
+    private boolean isFlyingMob() {
+        return entityName.equals("ghast") || entityName.equals("blaze")
+                || entityName.equals("phantom") || entityName.equals("bat")
+                || entityName.equals("allay") || entityName.equals("bee")
+                || entityName.equals("parrot") || entityName.equals("vex");
     }
 
     private void tryJumpObstacle() {

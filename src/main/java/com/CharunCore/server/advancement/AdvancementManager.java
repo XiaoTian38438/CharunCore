@@ -157,7 +157,10 @@ public final class AdvancementManager {
     private static void persist(NetworkHandler nh, String advId) {
         if (nh.data != null) {
             if (nh.data.unlockedAdvancements == null) nh.data.unlockedAdvancements = new HashSet<>();
-            nh.data.unlockedAdvancements.add(advId);
+            if (nh.data.unlockedAdvancements.add(advId)) {
+                // B3: 成就达成同步到控制台(玩家指令/聊天/成就控制台可见)
+                System.out.println("[成就] " + nh.username + " 达成了进度 " + advId);
+            }
         }
     }
 
