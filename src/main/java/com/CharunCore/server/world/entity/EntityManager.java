@@ -252,7 +252,16 @@ public class EntityManager {
             // /tp 或大范围加载后刷怪量暴涨, 全量逐刻 tick(AI+物理+查询)是主线程卡死(假死)的直接根因。
             if (e instanceof MobEntity m) {
                 int interval = mobTickInterval(m);
-                if (interval > 1 && (tickNo + e.id) % interval != 0) continue;
+                if (interval > 1 && (tickNo + e.id) % interval != 0) {
+                    // B4: 降频只降 AI, 物理照跑 —— 曾整个 tick 跳过, 32 格外的生物
+                    // 大部分时间完全静止(玩家看远处动物"站原地不动"的直接原因)。
+                    try {
+                        m.tickPhysics();
+                    } catch (Exception ex) {
+                        System.err.println("[实体] tick 异常 id=" + e.id + ": " + ex);
+                    }
+                    continue;
+                }
             }
             try {
                 e.tick();

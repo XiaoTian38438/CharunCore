@@ -12139,6 +12139,30 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private static StructureSet resolveStructureSet(String name) {
         name = name.toLowerCase();
+        // B4: 常见别名容错 —— 基岩版名/无下划线变体(用户 /locate endcity 是基岩语法,
+        // Java 版 id 是 end_city; 其余同型) 归一化到 Java 版结构 id 再 resolve。
+        name = switch (name) {
+            case "endcity" -> "end_city";
+            case "buriedtreasure" -> "buried_treasure";
+            case "pillageroutpost" -> "pillager_outpost";
+            case "bastionremnant" -> "bastion_remnant";
+            case "ruinedportal" -> "ruined_portal";
+            case "oceanruin" -> "ocean_ruin";
+            case "junglepyramid" -> "jungle_pyramid";
+            case "desertpyramid" -> "desert_pyramid";
+            case "swamp", "swamps" -> "swamp_hut";
+            case "witchhut" -> "swamp_hut";
+            case "temple", "temples" -> "jungle_pyramid";
+            case "ruins" -> "ocean_ruin";
+            case "monuments", "oceanmonument" -> "monument";
+            case "mansion", "woodlandmansion" -> "mansion";
+            case "fortresses" -> "fortress";
+            case "endcities" -> "end_city";
+            case "netherfossil" -> "nether_fossil";
+            case "bastion" -> "bastion_remnant";
+            case "pyramid" -> "desert_pyramid";
+            default -> name;
+        };
         StructureSet direct =
             StructureSet.get(name);
         if (direct != null) return direct;
@@ -12183,7 +12207,7 @@ public class NetworkHandler extends SimpleChannelInboundHandler<ByteBuf> {
         StructureSet set = resolveStructureSet(name);
         if (set == null || set.getPlacement() == null) return null;
         RandomSpreadStructurePlacement pl = set.getPlacement();
-        int maxRing = 128;
+        int maxRing = 200; // 单群系结构(desert_pyramid/mansion/monument 等)锚点×群系组合稀疏, 128 环内常无解
         for (int r = 0; r <= maxRing; r++) {
             for (int dx = -r; dx <= r; dx++) {
                 for (int dz = -r; dz <= r; dz++) {

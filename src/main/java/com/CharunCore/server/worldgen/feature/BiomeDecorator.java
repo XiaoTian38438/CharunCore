@@ -100,12 +100,17 @@ public final class BiomeDecorator {
                 hasFrozen |= isFrozenBiome(biome);
 
                 // Find water surface for lily pads
+                // B4: 记录"顶部水格"(其上为空气) —— 曾记录水底固体上方第一格,
+                // 深水列荷叶被放到海底(水底荷叶)。自上而下扫到真实水面。
                 int tsy = topSolidY[colIdx];
                 waterSurfaceY[colIdx] = -999;
                 if (tsy < 63) {
-                    int wy = tsy + 1;
-                    if (chunk.getBlock(lx, wy, lz) == water) {
-                        waterSurfaceY[colIdx] = wy;
+                    for (int wy = 63; wy > tsy; wy--) {
+                        if (chunk.getBlock(lx, wy, lz) == water
+                                && chunk.getBlock(lx, wy + 1, lz) == AIR) {
+                            waterSurfaceY[colIdx] = wy;
+                            break;
+                        }
                     }
                 }
             }
@@ -126,8 +131,8 @@ public final class BiomeDecorator {
             placeVines(chunk, chunkX, chunkZ, topSolidY, rng, true);
         }
 
-        // 3) Lily pads in swamp and river
-        if (hasSwamp || hasAnyRiver(colBiome)) {
+        // 3) Lily pads —— 原版仅沼泽/红树林沼泽水面(河流/海洋不放)
+        if (hasSwamp) {
             placeLilyPads(chunk, chunkX, chunkZ, waterSurfaceY, rng);
         }
 
@@ -275,9 +280,9 @@ public final class BiomeDecorator {
             int colIdx = lz * 16 + lx;
             int wy = waterSurfaceY[colIdx];
             if (wy < -64) continue;
-            int surfaceBlock = chunk.getBlock(lx, wy, lz);
-            if (surfaceBlock == water || surfaceBlock == AIR) {
-                chunk.setBlock(lx, wy, lz, lilyPad);
+            // 荷叶放在顶部水格之上(空气格), 且必须还是空气(冰面/已有方块不放)
+            if (chunk.getBlock(lx, wy + 1, lz) == AIR) {
+                chunk.setBlock(lx, wy + 1, lz, lilyPad);
             }
         }
     }

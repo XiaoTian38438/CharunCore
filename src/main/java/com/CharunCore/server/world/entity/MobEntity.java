@@ -45,6 +45,14 @@ public class MobEntity extends LivingEntity {
     private boolean lastFireBroadcast = false;
     /** 猪灵以物易物: 拾取金锭后倒计时(原版 120 tick=6 秒), 到 0 吐出战利品; -1=未拾取。 */
     private int barterTimer = -1;
+    // ── 随机游走(wander)状态: 每 tick 按记忆方向重设速度 ──
+    // 曾只在决策 tick 设置 vx/vz, Entity.tick 碰撞把速度清零后实体就站住不动,
+    // 直到下一次决策(10~40 tick 后) —— 这就是"生物原地站着不走"的根因。
+    private float wanderYaw = 0;
+    private boolean wanderMoving = false;
+    private boolean lastMoveBlocked = false;
+    /** 上 tick AI 输出的期望速度: 物理(super.tick)把速度碰撞清零后据此检测"卡墙"。 */
+    private double wantedVx = 0, wantedVz = 0;
 
     // ── 村民交易系统（仅 entityName=="villager" 使用）──────────────────────
     public String profession = null;      // 职业名（13 职业之一），null = 无业
@@ -228,9 +236,21 @@ public class MobEntity extends LivingEntity {
         }
     }
 
+    /** B4: 远处实体降频 tick 用的纯物理步进(无 AI)。物理照跑保持移动连续,
+     *  只省寻路/索敌/游荡决策的开销; 卡墙时仍会起跳, 不会死站。 */
+    public void tickPhysics() {
+        super.tick();
+        lastMoveBlocked = (wantedVx != 0 && vx == 0) || (wantedVz != 0 && vz == 0);
+        if (jumpCooldown > 0) jumpCooldown--;
+        if (deathTime == 0 && lastMoveBlocked && onGround) tryJumpObstacle();
+    }
+
     @Override
     public void tick() {
         super.tick();
+        // B4: 卡墙检测 —— 上 tick 有期望速度、物理后 vx/vz 被碰撞清零 = 撞墙。
+        // wander 分支据此跳/换向; 追击分支也复用(寻路失败时直接跳)。
+        lastMoveBlocked = (wantedVx != 0 && vx == 0) || (wantedVz != 0 && vz == 0);
         // #4 防卡地: 脚底陷入实心方块时上浮校正(结构方块生成于脚下/区块更新后可能被埋)。
         if (deathTime == 0 && isSolidAt(x, y + 0.1, z)) {
             int fy = (int) Math.floor(y);
@@ -441,18 +461,30 @@ public class MobEntity extends LivingEntity {
             if (aiTimer <= 0) {
                 // #41: 被动生物更活跃地游荡(原版每 5-20 tick 随机转向走动, 曾 40-120 tick 且 3/4 概率静止)。
                 aiTimer = 10 + aiRng.nextInt(30);
-                if (aiRng.nextInt(3) != 0) {
-                    float wanderYaw = aiRng.nextFloat() * 360;
-                    this.yaw = wanderYaw;
-                    double speed = isPassive() ? 0.10 : 0.12;
-                    vx = -Math.sin(Math.toRadians(wanderYaw)) * speed;
-                    vz = Math.cos(Math.toRadians(wanderYaw)) * speed;
-                } else {
-                    vx = 0; vz = 0;
-                }
+                wanderMoving = aiRng.nextInt(3) != 0;
+                wanderYaw = aiRng.nextFloat() * 360;
+                this.yaw = wanderYaw;
             }
-            if (vx != 0 || vz != 0) tryJumpObstacle();
+            if (wanderMoving) {
+                // B4: 上一 tick 输出了速度但被物理碰撞清零 -> 卡墙。
+                // 先尝试跳过障碍; 跳不了(2 格墙/头顶封闭)则立即换向, 不再傻站。
+                if (lastMoveBlocked) {
+                    if (!tryJumpObstacle()) {
+                        wanderYaw = aiRng.nextFloat() * 360;
+                        this.yaw = wanderYaw;
+                    }
+                }
+                double speed = isPassive() ? 0.10 : 0.12;
+                vx = -Math.sin(Math.toRadians(wanderYaw)) * speed;
+                vz = Math.cos(Math.toRadians(wanderYaw)) * speed;
+            } else {
+                vx = 0; vz = 0;
+            }
+            if (wanderMoving) tryJumpObstacle();
         }
+
+        // B4: 记录期望速度供下 tick 卡墙检测
+        wantedVx = vx; wantedVz = vz;
 
         // B3: 趋利避害 —— 前方是岩浆/火/仙人掌或深崖时转向绕开, 各方向都危险则停下
         if (deathTime == 0 && (vx != 0 || vz != 0) && !isFlyingMob()) {
@@ -595,8 +627,9 @@ public class MobEntity extends LivingEntity {
                 || entityName.equals("parrot") || entityName.equals("vex");
     }
 
-    private void tryJumpObstacle() {
-        if (!onGround || jumpCooldown > 0) return;
+    /** 前方 1 格障碍且上方有空间时起跳; 返回是否真正起跳(调用方据此决定换向)。 */
+    private boolean tryJumpObstacle() {
+        if (!onGround || jumpCooldown > 0) return false;
         double nx = x + Math.signum(vx) * (width / 2.0 + 0.15);
         double nz = z + Math.signum(vz) * (width / 2.0 + 0.15);
         boolean blocked = (vx != 0 && isSolidAt(nx, y + 0.2, z))
@@ -605,7 +638,9 @@ public class MobEntity extends LivingEntity {
             vy = 0.42;
             onGround = false;
             jumpCooldown = 10;
+            return true;
         }
+        return false;
     }
 
     private void explode(NetworkHandler target) {

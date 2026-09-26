@@ -1,10 +1,10 @@
 package com.CharunCore.server.worldgen.structure2;
 
+import java.util.List;
+
 import com.CharunCore.server.utils.BlockStateHelper;
 import com.CharunCore.server.world.chunk.Chunk;
 import com.CharunCore.server.worldgen.WorldGenLevel;
-
-import java.util.List;
 
 /** Bug51: 原版 Beardifier —— 结构(村庄/掠夺者前哨/远古城市/试炼密室等)对地形的增密修正。
  *  曾无任何 terrain adaptation -> 结构下方没有"地基", 村庄房屋悬空/嵌地、同一高度。
@@ -37,7 +37,8 @@ public final class Beardifier {
         double l2 = dx * (double) dx + (dy + 0.5) * (dy + 0.5) + dz * (double) dz;
         if (l2 > 12.0 * 12.0) return 0.0;
         double l = Math.sqrt(l2);
-        double d3 = -(dy + 0.5) / (l * 1.4142135623730951) * 0.5;
+        // 原版 getBeardContribution: d3 = -(dy+0.5) / (l * sqrt2), 无额外衰减系数
+        double d3 = -(dy + 0.5) / (l * 1.4142135623730951);
         return d3 * kernel(dx, dy, dz);
     }
 
@@ -105,16 +106,16 @@ public final class Beardifier {
         minZ = Math.max(minZ, baseZ); maxZ = Math.min(maxZ, baseZ + 15);
 
         // B4: 桩基 —— 核函数(exp 衰减 12 格)拉不平大落差(山坡村庄 piece 高于地形 15~25 格),
-        // 这是"村庄悬空/地形被切断"的残留根因。对 beard_thin/beard_box 片段底部每 2 格一个
-        // 桩位向下填石柱直到触地(≤20 格), 观感为自然地基, 彻底消除悬空。
+        // 这是"村庄悬空/地形被切断"的残留根因。对 beard_thin/beard_box 片段底部每格一个
+        // 桩位向下填石柱直到触地(<=28 格), 观感为自然地基, 彻底消除悬空。
         for (Rigid r : rigids) {
             if (!r.adjustment.equals("beard_thin") && !r.adjustment.equals("beard_box")) continue;
             int bottom = r.box.minY + r.groundLevelDelta - 1;
             int px0 = Math.max(r.box.minX, baseX), px1 = Math.min(r.box.maxX, baseX + 15);
             int pz0 = Math.max(r.box.minZ, baseZ), pz1 = Math.min(r.box.maxZ, baseZ + 15);
-            for (int px = px0; px <= px1; px += 2) {
-                for (int pz = pz0; pz <= pz1; pz += 2) {
-                    for (int y = bottom; y > Math.max(minY, bottom - 20); y--) {
+            for (int px = px0; px <= px1; px++) {
+                for (int pz = pz0; pz <= pz1; pz++) {
+                    for (int y = bottom; y > Math.max(minY, bottom - 28); y--) {
                         int cur = level.getBlock(px, y, pz);
                         if (cur == 0) {
                             level.setBlock(px, y, pz, y < 0 ? deepslate : stone);
